@@ -8,6 +8,7 @@ from mtg_notion_manager.config import Config, ConfigError
 from mtg_notion_manager.exceptions import MtgNotionManagerError
 from mtg_notion_manager.notion.client import NotionClient
 from mtg_notion_manager.notion.writer import NotionWriter
+from mtg_notion_manager.services.doctor import run_doctor
 from mtg_notion_manager.services.import_deck import build_import_plan, execute_import
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -19,6 +20,42 @@ def main() -> None:
     """MTG統率者デッキをNotionで管理するCLIツール。"""
 
 
+@app.command(name="doctor")
+def doctor_command() -> None:
+    """Notion認証・DB接続・スキーマの健全性を診断する。"""
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            results = run_doctor(config, client)
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    table = Table(title="doctor診断結果")
+    table.add_column("チェック項目")
+    table.add_column("結果")
+    table.add_column("詳細")
+
+    all_ok = True
+    for result in results:
+        status = "[green]OK[/green]" if result.ok else "[red]NG[/red]"
+        if not result.ok:
+            all_ok = False
+        table.add_row(result.name, status, result.message)
+
+    console.print(table)
+
+    if not all_ok:
+        console.print("[red]一部のチェックに失敗しました。[/red]")
+        raise typer.Exit(code=1)
+    console.print("[green]すべてのチェックに合格しました。[/green]")
+
+
 @app.command(name="import")
 def import_command(
     url: str = typer.Argument(
@@ -27,23 +64,28 @@ def import_command(
     dry_run: bool = typer.Option(
         False, "--dry-run", help="Notionへは書き込まず、プレビューのみ表示する"
     ),
+    deck_name: str = typer.Option(
+        None,
+        "--deck-name",
+        help="1ページに複数デッキが含まれる場合に対象デッキ名を指定する",
+    ),
 ) -> None:
     """デッキ情報を取得してNotionのMTG統率者DBに登録する。"""
     try:
         config = Config.load()
     except ConfigError as exc:
         console.print(f"[red]設定エラー:[/red] {exc}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
     try:
         with NotionClient(config.notion_api_key) as client:
             writer = NotionWriter(client, config.commander_data_source_id)
-            plan = build_import_plan(url, writer)
+            plan = build_import_plan(url, writer, deck_name)
 
             console.print("[bold]プレビュー[/bold]")
             console.print_json(json.dumps(plan.record.to_preview_dict(), ensure_ascii=False))
 
-            if plan.is_duplicate:
+            if plan.existing is not None:
                 console.print(
                     f"[yellow]同名デッキが既に存在します:[/yellow] {plan.existing.page_url}"
                 )
@@ -79,7 +121,7 @@ def import_command(
 
     except MtgNotionManagerError as exc:
         console.print(f"[red]エラー:[/red] {exc}")
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
 
 if __name__ == "__main__":

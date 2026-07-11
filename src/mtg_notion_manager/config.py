@@ -17,13 +17,15 @@ class ConfigError(MtgNotionManagerError):
 class Config:
     notion_api_key: str
     commander_data_source_id: str
+    card_data_source_id: str | None = None
 
     @classmethod
-    def load(cls, dotenv_path: Path | None = None) -> "Config":
+    def load(cls, dotenv_path: Path | None = None) -> Config:
         load_dotenv(dotenv_path=dotenv_path)
 
         api_key = os.environ.get("NOTION_API_KEY", "").strip()
         data_source_id = os.environ.get("NOTION_COMMANDER_DATA_SOURCE_ID", "").strip()
+        card_data_source_id = os.environ.get("NOTION_CARD_DATA_SOURCE_ID", "").strip() or None
 
         missing = []
         if not api_key:
@@ -36,4 +38,8 @@ class Config:
                 " (.env を確認してください。.env.example を参考に作成できます)"
             )
 
-        return cls(notion_api_key=api_key, commander_data_source_id=data_source_id)
+        return cls(
+            notion_api_key=api_key,
+            commander_data_source_id=data_source_id,
+            card_data_source_id=card_data_source_id,
+        )

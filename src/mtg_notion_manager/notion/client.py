@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import httpx
 
 from mtg_notion_manager.exceptions import NotionAPIError
@@ -25,11 +27,19 @@ class NotionClient:
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "NotionClient":
+    def __enter__(self) -> NotionClient:
         return self
 
     def __exit__(self, *exc_info: object) -> None:
         self.close()
+
+    def get_current_user(self) -> dict:
+        """トークンに紐づくbotユーザー情報を取得する(認証確認用)。"""
+        return self._request("GET", "/users/me")
+
+    def get_data_source(self, data_source_id: str) -> dict:
+        """データソースのスキーマ(プロパティ定義)を取得する。"""
+        return self._request("GET", f"/data_sources/{data_source_id}")
 
     def query_data_source_by_title(
         self, data_source_id: str, title_property: str, title: str
@@ -52,7 +62,7 @@ class NotionClient:
         }
         return self._request("POST", "/pages", json=payload)
 
-    def _request(self, method: str, path: str, **kwargs: object) -> dict:
+    def _request(self, method: str, path: str, **kwargs: Any) -> dict:
         try:
             response = self._client.request(method, path, **kwargs)
             response.raise_for_status()

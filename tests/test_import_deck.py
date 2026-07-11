@@ -16,7 +16,7 @@ class FakeFetcher:
     def matches(self, url: str) -> bool:
         return True
 
-    def fetch(self, url: str) -> RawDeckData:
+    def fetch(self, url: str, deck_name: str | None = None) -> RawDeckData:
         return self._raw
 
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
 
 import httpx
@@ -16,12 +18,16 @@ class BaseFetcher(ABC):
         """このフェッチャーが対応するサイトのURLかどうか。"""
 
     @abstractmethod
-    def parse(self, html: str, source_url: str) -> RawDeckData:
-        """取得済みのHTMLからデッキ情報(マッピング前の生データ)を抽出する。"""
+    def parse(self, html: str, source_url: str, deck_name: str | None = None) -> RawDeckData:
+        """取得済みのHTMLからデッキ情報(マッピング前の生データ)を抽出する。
 
-    def fetch(self, url: str) -> RawDeckData:
+        1ページに複数デッキが含まれる場合、deck_name で対象を指定する。
+        指定がなく複数デッキが見つかった場合は MultipleDecksFoundError を送出する。
+        """
+
+    def fetch(self, url: str, deck_name: str | None = None) -> RawDeckData:
         html = download(url)
-        return self.parse(html, url)
+        return self.parse(html, url, deck_name)
 
 
 def download(url: str) -> str:

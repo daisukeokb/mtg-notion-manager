@@ -16,6 +16,8 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "pytest-httpx>=0.30",
+    "ruff>=0.6",
+    "mypy>=1.11",
 ]
 
 [project.scripts]
@@ -30,3 +32,18 @@ packages = ["src/mtg_notion_manager"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.9"
+packages = ["mtg_notion_manager"]
+mypy_path = "src"
+ignore_missing_imports = true
+disallow_untyped_defs = true

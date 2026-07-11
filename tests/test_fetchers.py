@@ -2,7 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from mtg_notion_manager.exceptions import MultipleDecksFoundError, UnsupportedSourceError
+from mtg_notion_manager.exceptions import (
+    MultipleDecksFoundError,
+    ParseError,
+    UnsupportedSourceError,
+)
 from mtg_notion_manager.fetchers import get_fetcher
 from mtg_notion_manager.fetchers.mtg_jp import MtgJpFetcher
 from mtg_notion_manager.fetchers.wizards_official import WizardsOfficialFetcher
@@ -36,6 +40,30 @@ class TestWizardsOfficialFetcher:
         with pytest.raises(MultipleDecksFoundError):
             fetcher.parse(html, "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists")
 
+    def test_parse_multi_deck_with_deck_name_selects_target(self) -> None:
+        html = _read_fixture("wizards_multi_deck.html")
+        fetcher = WizardsOfficialFetcher()
+        result = fetcher.parse(
+            html,
+            "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists",
+            deck_name="Family Matters",
+        )
+
+        assert result.name == "Family Matters"
+        assert result.commander == "Zinnia, Valley's Voice"
+        assert result.set_raw == "BLB"
+        assert result.colors_raw == ["Blue", "Red", "White"]
+
+    def test_parse_multi_deck_with_unknown_deck_name_raises(self) -> None:
+        html = _read_fixture("wizards_multi_deck.html")
+        fetcher = WizardsOfficialFetcher()
+        with pytest.raises(ParseError):
+            fetcher.parse(
+                html,
+                "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists",
+                deck_name="存在しないデッキ",
+            )
+
 
 class TestMtgJpFetcher:
     def test_matches_mtgjp_domain(self) -> None:
@@ -58,6 +86,30 @@ class TestMtgJpFetcher:
         fetcher = MtgJpFetcher()
         with pytest.raises(MultipleDecksFoundError):
             fetcher.parse(html, "https://mtg-jp.com/reading/publicity/0038046/")
+
+    def test_parse_multi_deck_with_deck_name_selects_target(self) -> None:
+        html = _read_fixture("mtgjp_multi_deck.html")
+        fetcher = MtgJpFetcher()
+        result = fetcher.parse(
+            html,
+            "https://mtg-jp.com/reading/publicity/0038046/",
+            deck_name="家族が第一",
+        )
+
+        assert result.name == "家族が第一"
+        assert result.commander == "渓間の声、ジニア"
+        assert result.set_raw == "ブルームバロウ"
+        assert result.colors_raw == ["青", "赤", "白"]
+
+    def test_parse_multi_deck_with_unknown_deck_name_raises(self) -> None:
+        html = _read_fixture("mtgjp_multi_deck.html")
+        fetcher = MtgJpFetcher()
+        with pytest.raises(ParseError):
+            fetcher.parse(
+                html,
+                "https://mtg-jp.com/reading/publicity/0038046/",
+                deck_name="存在しないデッキ",
+            )
 
 
 class TestGetFetcher:
