@@ -1,0 +1,32 @@
+[project]
+name = "mtg-notion-manager"
+version = "0.1.0"
+description = "MTG統率者デッキをNotionで管理するCLIツール"
+requires-python = ">=3.9"
+dependencies = [
+    "typer>=0.12",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.2",
+    "python-dotenv>=1.0",
+    "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-httpx>=0.30",
+]
+
+[project.scripts]
+mtg-notion-manager = "mtg_notion_manager.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mtg_notion_manager"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

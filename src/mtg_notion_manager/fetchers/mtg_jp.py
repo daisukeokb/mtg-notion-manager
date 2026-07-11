@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import re
+from urllib.parse import urlparse
+
+from bs4 import BeautifulSoup
+
+from mtg_notion_manager.exceptions import MultipleDecksFoundError, ParseError
+from mtg_notion_manager.fetchers.base import BaseFetcher
+from mtg_notion_manager.models import RawDeckData
+
+_DECK_HEADING_RE = re.compile(r"^「(.+)」$")
+_SET_TITLE_RE = re.compile(r"『(.+?)』")
+_COLOR_CAPTION_RE = re.compile(r"^「(.+?)」\s*（([^）]+)）")
+
+
+class MtgJpFetcher(BaseFetcher):
+    """mtg-jp.com の統率者デッキ・デッキリスト記事用フェッチャー。
+
+    デッキ見出しは <h4>「デッキ名」</h4>、デッキリスト本体は
+    <table class="decklist">。色はページ上部の
+    <strong>「デッキ名」（赤緑）</strong> のような記載から取得する。
+    """
+
+    def matches(self, url: str) -> bool:
+        return urlparse(url).netloc.endswith("mtg-jp.com")
+
+    def parse(self, html: str, source_url: str) -> RawDeckData:
+        soup = BeautifulSoup(html, "lxml")
+
+        deck_tables = soup.find_all("table", class_="decklist")
+        if len(deck_tables) == 0:
+            raise ParseError(f"デッキリストが見つかりませんでした: {source_url}")
+        if len(deck_tables) > 1:
+            raise MultipleDecksFoundError(
+                f"このページには複数({len(deck_tables)}個)のデッキリストが含まれています。"
+                " 現バージョンは1ページ1デッキの記事のみ対応しています。"
+            )
+
+        heading_tag = _find_deck_heading(soup)
+        if heading_tag is None:
+            raise ParseError(f"デッキ見出し(「デッキ名」形式のh4)が見つかりませんでした: {source_url}")
+        name = _DECK_HEADING_RE.match(heading_tag.get_text(strip=True)).group(1)
+
+        set_name = _extract_set_name(soup, source_url)
+        colors_raw = _extract_colors(soup, name, source_url)
+        commander = _extract_commander(heading_tag, source_url)
+
+        return RawDeckData(
+            name=name,
+            commander=commander,
+            set_raw=set_name,
+            colors_raw=colors_raw,
+            source_url=source_url,
+        )
+
+
+def _find_deck_heading(soup: BeautifulSoup):
+    for h4 in soup.find_all("h4"):
+        if _DECK_HEADING_RE.match(h4.get_text(strip=True)):
+            return h4
+    return None
+
+
+def _extract_set_name(soup: BeautifulSoup, source_url: str) -> str:
+    for h1 in soup.find_all("h1"):
+        match = _SET_TITLE_RE.search(h1.get_text(strip=True))
+        if match:
+            return match.group(1)
+    raise ParseError(f"発売セット名(『セット名』形式の見出し)が見つかりませんでした: {source_url}")
+
+
+def _extract_colors(soup: BeautifulSoup, deck_name: str, source_url: str) -> list[str]:
+    for strong in soup.find_all("strong"):
+        text = strong.get_text(strip=True)
+        match = _COLOR_CAPTION_RE.match(text)
+        if match and match.group(1) == deck_name:
+            colors_text = match.group(2)
+            return list(colors_text)  # 「赤緑」→["赤", "緑"]
+
+    raise ParseError(f"デッキ '{deck_name}' の色情報が見つかりませんでした: {source_url}")
+
+
+def _extract_commander(heading_tag, source_url: str) -> str:
+    card_link = heading_tag.find_next("a", class_="cardPopupLink")
+    if card_link is None:
+        raise ParseError(f"統率者名を抽出できませんでした: {source_url}")
+    commander = card_link.get_text(strip=True)
+    if not commander:
+        raise ParseError(f"統率者名を抽出できませんでした: {source_url}")
+    return commander
