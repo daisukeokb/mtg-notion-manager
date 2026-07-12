@@ -19,6 +19,22 @@ REQUIRED_COMMANDER_PROPERTIES: dict[str, str] = {
     "デッキリスト": "url",
 }
 
+# Notion「MTGカードDB」でカード取り込み機能が使用する必須プロパティと型。
+REQUIRED_CARD_PROPERTIES: dict[str, str] = {
+    "カード名": "title",
+    "英語名": "rich_text",
+    "所持": "checkbox",
+    "採用デッキ": "relation",
+}
+
+# dedupe-cards機能が使用する、あれば使う(スキーマ変更で追加しうる)プロパティ。
+# 未存在の場合は import-cards 側では書き込まず内部集計にのみ使う。
+# dedupe-cards --apply-schema で追加されると number/checkbox として存在するようになる。
+OPTIONAL_CARD_PROPERTIES: dict[str, str] = {
+    "所持枚数": "number",
+    "統合済み": "checkbox",
+}
+
 
 @dataclass(frozen=True)
 class CheckResult:
@@ -41,9 +57,7 @@ def run_doctor(config: Config, client: NotionClient) -> list[CheckResult]:
 
     try:
         commander_ds = client.get_data_source(config.commander_data_source_id)
-        results.append(
-            CheckResult("MTG統率者DB接続", True, f"OK ({commander_ds.get('name', '?')})")
-        )
+        results.append(CheckResult("MTG統率者DB接続", True, f"OK ({_extract_title(commander_ds)})"))
         results.extend(_check_commander_schema(commander_ds))
     except NotionAPIError as exc:
         results.append(CheckResult("MTG統率者DB接続", False, str(exc)))
@@ -51,21 +65,26 @@ def run_doctor(config: Config, client: NotionClient) -> list[CheckResult]:
     if config.card_data_source_id:
         try:
             card_ds = client.get_data_source(config.card_data_source_id)
-            results.append(
-                CheckResult("MTGカードDB接続", True, f"OK ({card_ds.get('name', '?')})")
-            )
+            results.append(CheckResult("MTGカードDB接続", True, f"OK ({_extract_title(card_ds)})"))
+            results.extend(_check_card_schema(card_ds))
         except NotionAPIError as exc:
             results.append(CheckResult("MTGカードDB接続", False, str(exc)))
     else:
         results.append(
             CheckResult(
                 "MTGカードDB接続",
-                True,
-                "NOTION_CARD_DATA_SOURCE_ID 未設定のためスキップ(MVPでは未使用)",
+                False,
+                "NOTION_CARD_DATA_SOURCE_ID が未設定です(import-cardsコマンドに必須)",
             )
         )
 
     return results
+
+
+def _extract_title(data_source: dict) -> str:
+    parts = data_source.get("title", [])
+    text = "".join(part.get("plain_text", "") for part in parts)
+    return text or "?"
 
 
 def _check_commander_schema(data_source: dict) -> list[CheckResult]:
@@ -119,3 +138,46 @@ def _check_select_options(
         )
 
     return CheckResult(f"「{prop_name}」選択肢の整合性", True, "OK")
+
+
+def _check_card_schema(data_source: dict) -> list[CheckResult]:
+    results: list[CheckResult] = []
+    schema: dict = data_source.get("properties", {})
+
+    for prop_name, expected_type in REQUIRED_CARD_PROPERTIES.items():
+        prop = schema.get(prop_name)
+        if prop is None:
+            results.append(CheckResult(f"カードDBプロパティ「{prop_name}」", False, "存在しません"))
+        elif prop.get("type") != expected_type:
+            results.append(
+                CheckResult(
+                    f"カードDBプロパティ「{prop_name}」",
+                    False,
+                    f"型が想定と異なります(期待: {expected_type}, 実際: {prop.get('type')})",
+                )
+            )
+        else:
+            results.append(CheckResult(f"カードDBプロパティ「{prop_name}」", True, "OK"))
+
+    for prop_name, expected_type in OPTIONAL_CARD_PROPERTIES.items():
+        prop = schema.get(prop_name)
+        if prop is None:
+            results.append(
+                CheckResult(
+                    f"カードDBプロパティ「{prop_name}」(任意)",
+                    True,
+                    "存在しません(import-cardsはこの項目をNotionへ書き込みません)",
+                )
+            )
+        elif prop.get("type") != expected_type:
+            results.append(
+                CheckResult(
+                    f"カードDBプロパティ「{prop_name}」(任意)",
+                    False,
+                    f"型が想定と異なります(期待: {expected_type}, 実際: {prop.get('type')})",
+                )
+            )
+        else:
+            results.append(CheckResult(f"カードDBプロパティ「{prop_name}」(任意)", True, "OK"))
+
+    return results

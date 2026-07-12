@@ -72,9 +72,7 @@ class WizardsOfficialFetcher(BaseFetcher):
         )
 
 
-def _select_deck_tag(
-    deck_list_tags: list[Tag], deck_name: str | None, source_url: str
-) -> Tag:
+def _select_deck_tag(deck_list_tags: list[Tag], deck_name: str | None, source_url: str) -> Tag:
     if deck_name is not None:
         matched = [tag for tag in deck_list_tags if _attr(tag, "deck-title") == deck_name]
         if not matched:
@@ -104,6 +102,4 @@ def _extract_colors(soup: BeautifulSoup, deck_name: str, source_url: str) -> lis
             colors_text = match.group(1)
             return [token.strip() for token in re.split(r"[-/,]", colors_text) if token.strip()]
 
-    raise ParseError(
-        f"デッキ '{deck_name}' の色情報が見つかりませんでした: {source_url}"
-    )
+    raise ParseError(f"デッキ '{deck_name}' の色情報が見つかりませんでした: {source_url}")

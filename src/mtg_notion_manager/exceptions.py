@@ -24,3 +24,27 @@ class MappingError(MtgNotionManagerError):
 
 class NotionAPIError(MtgNotionManagerError):
     """Notion APIの呼び出しに失敗した。"""
+
+
+class DeckCardValidationError(MtgNotionManagerError):
+    """カード1件の抽出データが不正(カード名が空、枚数が1未満など)。"""
+
+
+class DeckCountMismatchError(MtgNotionManagerError):
+    """デッキの合計枚数が100枚(統率者戦の規定枚数)と一致しない。"""
+
+
+class AmbiguousCardMatchError(MtgNotionManagerError):
+    """カードDB内で複数の候補と一致し、一意に決定できない。"""
+
+
+class ConflictError(MtgNotionManagerError):
+    """重複統合時、複数レコード間で属性値が競合し自動統合できない。"""
+
+
+class RepresentativeSelectionError(MtgNotionManagerError):
+    """重複統合時、代表レコードを優先順位だけでは一意に決定できない。"""
+
+
+class SchemaMigrationError(MtgNotionManagerError):
+    """Notionデータベースのスキーマ変更に失敗した、または前提条件を満たさない。"""

@@ -21,13 +21,17 @@ def _read_fixture(name: str) -> str:
 class TestWizardsOfficialFetcher:
     def test_matches_wizards_domain(self) -> None:
         fetcher = WizardsOfficialFetcher()
-        assert fetcher.matches("https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists")
+        assert fetcher.matches(
+            "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists"
+        )
         assert not fetcher.matches("https://mtg-jp.com/reading/publicity/0038046/")
 
     def test_parse_single_deck(self) -> None:
         html = _read_fixture("wizards_single_deck.html")
         fetcher = WizardsOfficialFetcher()
-        result = fetcher.parse(html, "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists")
+        result = fetcher.parse(
+            html, "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists"
+        )
 
         assert result.name == "Animated Army"
         assert result.commander == "Bello, Bard of the Brambles"
@@ -38,7 +42,10 @@ class TestWizardsOfficialFetcher:
         html = _read_fixture("wizards_multi_deck.html")
         fetcher = WizardsOfficialFetcher()
         with pytest.raises(MultipleDecksFoundError):
-            fetcher.parse(html, "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists")
+            fetcher.parse(
+                html,
+                "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists",
+            )
 
     def test_parse_multi_deck_with_deck_name_selects_target(self) -> None:
         html = _read_fixture("wizards_multi_deck.html")
@@ -69,7 +76,9 @@ class TestMtgJpFetcher:
     def test_matches_mtgjp_domain(self) -> None:
         fetcher = MtgJpFetcher()
         assert fetcher.matches("https://mtg-jp.com/reading/publicity/0038046/")
-        assert not fetcher.matches("https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists")
+        assert not fetcher.matches(
+            "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists"
+        )
 
     def test_parse_single_deck(self) -> None:
         html = _read_fixture("mtgjp_single_deck.html")

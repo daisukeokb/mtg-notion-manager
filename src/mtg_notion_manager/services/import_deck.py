@@ -24,9 +24,7 @@ class ImportPlan:
         return self.existing is not None
 
 
-def build_import_plan(
-    url: str, writer: NotionWriter, deck_name: str | None = None
-) -> ImportPlan:
+def build_import_plan(url: str, writer: NotionWriter, deck_name: str | None = None) -> ImportPlan:
     """URLからデッキ情報を取得・正規化し、Notion上の重複状況まで確認する。
 
     1ページに複数デッキが含まれる場合は deck_name で対象を指定する。

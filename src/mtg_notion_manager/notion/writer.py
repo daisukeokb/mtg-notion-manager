@@ -59,9 +59,7 @@ def _extract_comparable_values(properties: dict) -> dict[str, object]:
         if prop_type == "title":
             values[key] = "".join(t.get("plain_text", "") for t in prop.get("title", []))
         elif prop_type == "rich_text":
-            values[key] = "".join(
-                t.get("plain_text", "") for t in prop.get("rich_text", [])
-            )
+            values[key] = "".join(t.get("plain_text", "") for t in prop.get("rich_text", []))
         elif prop_type == "select":
             select = prop.get("select")
             values[key] = select.get("name") if select else None
