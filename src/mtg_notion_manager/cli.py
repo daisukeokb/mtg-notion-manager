@@ -24,6 +24,8 @@ from mtg_notion_manager.preview import (
     print_dedupe_schema_plan,
     print_plan_detail,
     print_plan_summary,
+    print_verify_import_detail,
+    print_verify_import_summary,
 )
 from mtg_notion_manager.services.apply_dedupe_plan import (
     STATUS_APPLIED,
@@ -88,6 +90,11 @@ from mtg_notion_manager.services.review_duplicate_conflicts import (
     REVIEW_CATEGORY_LABELS,
     review_duplicate_conflicts,
     write_review_reports,
+)
+from mtg_notion_manager.services.verify_import import (
+    VERIFICATION_VERIFIED,
+    build_verify_import_plan,
+    write_verify_report,
 )
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
@@ -976,6 +983,66 @@ def import_article_command(
         entry.apply_result is not None and entry.apply_result.failed for entry in plan.entries
     )
     if counts[ARTICLE_STATUS_ERROR] or has_apply_failures:
+        raise typer.Exit(code=1)
+
+
+@app.command(name="verify-import")
+def verify_import_command(
+    url: str = typer.Argument(..., help="検証対象の統率者デッキ紹介記事のURL"),
+    include_deck: list[str] = typer.Option(
+        None, "--include-deck", help="このデッキ名だけを検証対象にする(複数指定可)"
+    ),
+    show_detail: bool = typer.Option(
+        False, "--detail/--no-detail", help="デッキごとの差分カード詳細も表示する"
+    ),
+    output_dir: str = typer.Option(
+        "reports", "--output-dir", help="検証レポートの出力先ディレクトリ"
+    ),
+) -> None:
+    """記事から抽出できるカード・relationが、Notion上に既に正しく登録されているかを検証する。
+
+    import-articleの取り込み前チェック(--dry-run)とは異なり、取り込み済みのはずの
+    デッキが実際にその通りに登録されているかを確認する読み取り専用コマンド
+    (database query / page retrieve / relation property read のみ行う。
+    Notionへの書き込みは一切行わず、--applyに相当するオプションも存在しない)。
+
+    終了コード: 0=全デッキ検証成功 / 1=登録状態に差分あり / 2=入力・設定・記事取得・
+    Notion読取などの実行エラー。
+    """
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=2)
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            writer = NotionWriter(client, config.commander_data_source_id)
+            card_repo = CardRepository(
+                client, config.card_data_source_id, overrides=load_card_match_overrides()
+            )
+
+            report = build_verify_import_plan(
+                url, client, writer, card_repo, include_deck_names=include_deck or []
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+    print_verify_import_summary(console, report)
+    console.print()
+    if show_detail:
+        print_verify_import_detail(console, report)
+
+    paths = write_verify_report(report, output_dir=Path(output_dir))
+    console.print("レポートを出力しました:")
+    console.print(f"  - {paths.json_path}")
+
+    if report.verification_status != VERIFICATION_VERIFIED:
         raise typer.Exit(code=1)
 
 

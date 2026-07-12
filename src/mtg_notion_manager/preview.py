@@ -12,6 +12,7 @@ from mtg_notion_manager.services.import_article import (
     ArticleImportPlan,
 )
 from mtg_notion_manager.services.import_cards import ImportCardsPlan, ImportCardsResult
+from mtg_notion_manager.services.verify_import import ArticleVerifyReport
 
 
 def print_plan_summary(console: Console, plan: ImportCardsPlan) -> None:
@@ -242,3 +243,64 @@ def print_article_apply_result(console: Console, plan: ArticleImportPlan) -> Non
                 entry.deck_name, STATUS_LABELS[entry.status], "-", "-", "-", "-", entry.reason
             )
     console.print(table)
+
+
+def print_verify_import_summary(console: Console, report: ArticleVerifyReport) -> None:
+    summary = report.summary
+    console.print(f"検出デッキ数: {len(report.all_deck_names)}")
+    console.print(f"対象デッキ数: {summary['selected_deck_count']}")
+    console.print(f"成功数: {summary['verified_deck_count']}")
+    console.print(f"失敗数: {summary['mismatch_deck_count']}")
+    console.print(f"新規カード数: {summary['total_new_card_count']}")
+    console.print(f"曖昧一致数: {summary['total_ambiguous_match_count']}")
+    console.print(f"不足relation数: {summary['total_missing_relation_count']}")
+    console.print(f"余分relation数: {summary['total_unexpected_relation_count']}")
+    console.print(f"エラー数: {summary['total_error_count']}")
+    console.print()
+
+    table = Table(title="デッキ別検証結果")
+    table.add_column("デッキ名")
+    table.add_column("結果")
+    table.add_column("抽出枚数", justify="right")
+    table.add_column("ユニーク", justify="right")
+    table.add_column("新規", justify="right")
+    table.add_column("曖昧一致", justify="right")
+    table.add_column("不足relation", justify="right")
+    table.add_column("余分relation", justify="right")
+    table.add_column("備考")
+
+    for entry in report.entries:
+        result_label = "OK" if entry.is_verified else "NG"
+        table.add_row(
+            entry.deck_name,
+            result_label,
+            str(entry.extracted_card_count) if entry.extracted_card_count is not None else "-",
+            str(entry.unique_card_count) if entry.unique_card_count is not None else "-",
+            str(entry.new_card_count) if entry.new_card_count is not None else "-",
+            str(entry.ambiguous_match_count) if entry.ambiguous_match_count is not None else "-",
+            str(len(entry.missing_relation_page_ids)),
+            str(len(entry.unexpected_relation_page_ids)),
+            "; ".join(entry.verification_errors),
+        )
+    console.print(table)
+
+
+def print_verify_import_detail(console: Console, report: ArticleVerifyReport) -> None:
+    for entry in report.entries:
+        result_label = "OK" if entry.is_verified else "NG"
+        console.print(f"[bold]デッキ: {entry.deck_name}[/bold] ({result_label})")
+        for error in entry.verification_errors:
+            console.print(f"  - {error}")
+        if entry.missing_relation_cards:
+            console.print("  不足relation:")
+            for card in entry.missing_relation_cards:
+                console.print(
+                    f"    - {card['page_id']} ({card['name_ja'] or card['name_en'] or '?'})"
+                )
+        if entry.unexpected_relation_cards:
+            console.print("  余分relation:")
+            for card in entry.unexpected_relation_cards:
+                console.print(
+                    f"    - {card['page_id']} ({card['name_ja'] or card['name_en'] or '?'})"
+                )
+        console.print()
