@@ -56,6 +56,7 @@ class CardRepository:
         self._data_source_id = data_source_id
         self._by_english_name: dict[str, list[ExistingCard]] = {}
         self._by_japanese_name: dict[str, list[ExistingCard]] = {}
+        self._by_page_id: dict[str, ExistingCard] = {}
         self._loaded = False
         self._overrides = overrides or CardMatchOverrides(
             by_japanese_name={}, by_english_name={}
@@ -78,7 +79,14 @@ class CardRepository:
                 self._by_japanese_name.setdefault(normalize_card_name(name_ja), []).append(existing)
             if name_en:
                 self._by_english_name.setdefault(normalize_card_name(name_en), []).append(existing)
+            self._by_page_id[existing.page_id] = existing
         self._loaded = True
+
+    def get_by_page_id(self, page_id: str) -> ExistingCard | None:
+        """load()済みの索引からpage_idで既存カードを引く(追加のAPI呼び出しなし)。"""
+        if not self._loaded:
+            raise RuntimeError("CardRepository.load() を先に呼んでください")
+        return self._by_page_id.get(page_id)
 
     def candidates_by_english_name(self, name: str) -> list[ExistingCard]:
         """指定した英語名(未正規化)に完全一致する候補一覧を返す(doctorの検証用)。"""
@@ -138,20 +146,9 @@ class CardRepository:
 
     def get_deck_relation_ids(self, existing: ExistingCard) -> list[str]:
         """「採用デッキ」リレーションの全ページIDを取得する(25件超はページングして取得)。"""
-        prop = existing.properties.get(DECKS_RELATION_PROPERTY, {})
-        relation = prop.get("relation", [])
-        if not prop.get("has_more"):
-            return [item["id"] for item in relation]
-
-        property_id = prop.get("id")
-        if not property_id:
-            return [item["id"] for item in relation]
-        items = self._client.get_page_property_item(existing.page_id, property_id)
-        return [
-            item["relation"]["id"]
-            for item in items
-            if item.get("type") == "relation" and "relation" in item
-        ]
+        return self._client.read_relation_ids(
+            existing.properties, existing.page_id, DECKS_RELATION_PROPERTY
+        )
 
     def is_owned(self, existing: ExistingCard) -> bool:
         prop = existing.properties.get(OWNED_PROPERTY, {})

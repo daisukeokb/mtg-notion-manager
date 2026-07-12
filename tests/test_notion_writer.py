@@ -79,6 +79,36 @@ class TestFindExistingDeck:
         assert existing.page_url == "https://www.notion.so/existing-page-id"
 
 
+class TestFindExistingDecks:
+    def test_returns_empty_list_when_no_results(self) -> None:
+        client = FakeNotionClient(query_results=[])
+        writer = NotionWriter(client, DATA_SOURCE_ID)
+
+        assert writer.find_existing_decks("存在しないデッキ") == []
+
+    def test_returns_all_matches(self) -> None:
+        page_a = _existing_page()
+        page_b = {**_existing_page(), "id": "second-page-id", "url": "https://www.notion.so/second"}
+        client = FakeNotionClient(query_results=[page_a, page_b])
+        writer = NotionWriter(client, DATA_SOURCE_ID)
+
+        results = writer.find_existing_decks("動き出した兵隊")
+
+        assert len(results) == 2
+        assert {r.page_id for r in results} == {"existing-page-id", "second-page-id"}
+
+    def test_find_existing_deck_returns_first_of_multiple(self) -> None:
+        page_a = _existing_page()
+        page_b = {**_existing_page(), "id": "second-page-id", "url": "https://www.notion.so/second"}
+        client = FakeNotionClient(query_results=[page_a, page_b])
+        writer = NotionWriter(client, DATA_SOURCE_ID)
+
+        existing = writer.find_existing_deck("動き出した兵隊")
+
+        assert existing is not None
+        assert existing.page_id == "existing-page-id"
+
+
 class TestDiffAgainst:
     def test_no_diff_when_identical(self) -> None:
         client = FakeNotionClient()

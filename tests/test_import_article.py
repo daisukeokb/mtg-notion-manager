@@ -460,7 +460,7 @@ class TestCardMatchOverrideFlowsThroughDeck:
         )
         applied = import_article.execute_article_import(plan, card_repo)
 
-        paths = import_article.write_strixhaven_deck_logs(
+        paths = import_article.write_article_deck_logs(
             applied, output_dir=tmp_path, timestamp="20260101-000000"
         )
         assert len(paths) == 1
@@ -472,7 +472,7 @@ class TestCardMatchOverrideFlowsThroughDeck:
         assert data["delete_count"] == 0
 
 
-class TestWriteStrixhavenDeckLogs:
+class TestWriteArticleDeckLogs:
     def test_writes_one_file_per_deck_with_slugified_name(self, tmp_path: Path) -> None:
         entries = [
             import_article.DeckArticleEntry(
@@ -494,14 +494,14 @@ class TestWriteStrixhavenDeckLogs:
             entries=entries,
         )
 
-        paths = import_article.write_strixhaven_deck_logs(
+        paths = import_article.write_article_deck_logs(
             plan, output_dir=tmp_path, timestamp="20260101-000000"
         )
 
         assert len(paths) == 5
         for path in paths:
             assert path.exists()
-            assert path.name.startswith("strixhaven-import-20260101-000000-")
+            assert path.name.startswith("article-deck-import-20260101-000000-")
             data = json.loads(path.read_text(encoding="utf-8"))
             assert data["delete_count"] == 0
             assert "api_key" not in json.dumps(data).lower()
@@ -517,7 +517,7 @@ class TestWriteStrixhavenDeckLogs:
             entries=[entry],
         )
 
-        paths = import_article.write_strixhaven_deck_logs(
+        paths = import_article.write_article_deck_logs(
             plan, output_dir=tmp_path, timestamp="20260101-000000"
         )
 
