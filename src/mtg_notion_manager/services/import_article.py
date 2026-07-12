@@ -34,6 +34,7 @@ from pathlib import Path
 from mtg_notion_manager.exceptions import MtgNotionManagerError
 from mtg_notion_manager.fetchers import get_fetcher
 from mtg_notion_manager.fetchers.base import download
+from mtg_notion_manager.models import CardDecision
 from mtg_notion_manager.notion.card_repository import CardRepository
 from mtg_notion_manager.notion.writer import NotionWriter
 from mtg_notion_manager.services.import_cards import (
@@ -295,32 +296,45 @@ def _entry_to_dict(entry: DeckArticleEntry) -> dict:
     return result
 
 
-# --- デッキ単位のログ出力(reports/strixhaven-import-*) ------------------------
+# --- デッキ単位のログ出力(reports/article-deck-import-*) ---------------------
 #
+# セット名・記事に依存しない汎用処理(任意の統率者デッキ記事で利用可能)。
 # 秘密情報(APIキー等)はここでは一切扱わないため、出力にも含まれない。
 
 
 _SLUG_UNSAFE_RE = re.compile(r"[\\/:*?\"<>|\s]+")
 
 
-def _slugify_deck_name(name: str) -> str:
+def slugify_deck_name(name: str) -> str:
     """ファイル名として安全な形に整形する(日本語自体は変換せずそのまま使う)。"""
     slug = _SLUG_UNSAFE_RE.sub("-", name).strip("-")
     return slug or "deck"
 
 
-def write_strixhaven_deck_logs(
+def overrides_used_from_decisions(decisions: list[CardDecision]) -> list[dict]:
+    """カード照合オーバーライドが適用されたカードの一覧を返す(ログ・レポート共通)。"""
+    return [
+        {"card": d.card.display_name, "reason": d.override_used}
+        for d in decisions
+        if d.override_used
+    ]
+
+
+def write_article_deck_logs(
     plan: ArticleImportPlan, output_dir: Path, timestamp: str | None = None
 ) -> list[Path]:
-    """デッキごとに reports/strixhaven-import-{timestamp}-{deck-slug}.json を出力する。"""
+    """デッキごとに reports/article-deck-import-{timestamp}-{deck-slug}.json を出力する。
+
+    Strixhaven等の特定セットに限らず、任意の統率者デッキ記事に利用できる。
+    """
     timestamp = timestamp or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     paths: list[Path] = []
     for entry in plan.entries:
-        slug = _slugify_deck_name(entry.deck_name)
-        path = output_dir / f"strixhaven-import-{timestamp}-{slug}.json"
+        slug = slugify_deck_name(entry.deck_name)
+        path = output_dir / f"article-deck-import-{timestamp}-{slug}.json"
         log = _deck_log_dict(entry)
         path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
         paths.append(path)
@@ -358,11 +372,7 @@ def _deck_log_dict(entry: DeckArticleEntry) -> dict:
 
     result["extracted_quantity"] = parsed.total_quantity
     result["unique_card_count"] = len(parsed.cards)
-    result["overrides_used"] = [
-        {"card": d.card.display_name, "reason": d.override_used}
-        for d in decisions
-        if d.override_used
-    ]
+    result["overrides_used"] = overrides_used_from_decisions(decisions)
     result["ambiguous_count"] = sum(1 for d in decisions if d.action == "ambiguous")
     result["owned_updated_count"] = sum(1 for d in decisions if d.owned_will_change)
 

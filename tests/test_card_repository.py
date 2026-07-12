@@ -40,6 +40,21 @@ class FakeNotionClient:
     def set_property_items(self, page_id: str, property_id: str, items: list[dict]) -> None:
         self._property_items[(page_id, property_id)] = items
 
+    def read_relation_ids(self, properties: dict, page_id: str, property_name: str) -> list[str]:
+        prop = properties.get(property_name, {})
+        relation = prop.get("relation", [])
+        if not prop.get("has_more"):
+            return [item["id"] for item in relation]
+        property_id = prop.get("id")
+        if not property_id:
+            return [item["id"] for item in relation]
+        items = self.get_page_property_item(page_id, property_id)
+        return [
+            item["relation"]["id"]
+            for item in items
+            if item.get("type") == "relation" and "relation" in item
+        ]
+
 
 def _card_page(
     page_id: str,

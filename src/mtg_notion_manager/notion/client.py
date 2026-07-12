@@ -108,6 +108,28 @@ class NotionClient:
             cursor = response.get("next_cursor")
         return results
 
+    def read_relation_ids(self, properties: dict, page_id: str, property_name: str) -> list[str]:
+        """ページのプロパティ辞書からrelationの全ページIDを取得する(25件超はページングして取得)。
+
+        properties はページ取得・クエリ結果にすでに含まれる`properties`辞書を渡す
+        (ページ本体の値は25件で打ち切られる`has_more`のため、超える場合のみ
+        get_page_property_item で追加取得する)。
+        """
+        prop = properties.get(property_name, {})
+        relation = prop.get("relation", [])
+        if not prop.get("has_more"):
+            return [item["id"] for item in relation]
+
+        property_id = prop.get("id")
+        if not property_id:
+            return [item["id"] for item in relation]
+        items = self.get_page_property_item(page_id, property_id)
+        return [
+            item["relation"]["id"]
+            for item in items
+            if item.get("type") == "relation" and "relation" in item
+        ]
+
     def update_page(self, page_id: str, properties: dict) -> dict:
         payload = {"properties": properties}
         return self._request("PATCH", f"/pages/{page_id}", json=payload)

@@ -23,17 +23,22 @@ class NotionWriter:
         self._data_source_id = data_source_id
 
     def find_existing_deck(self, name: str) -> ExistingDeck | None:
+        matches = self.find_existing_decks(name)
+        return matches[0] if matches else None
+
+    def find_existing_decks(self, name: str) -> list[ExistingDeck]:
+        """名前(完全一致)に該当する全デッキレコードを返す(重複検出用)。"""
         results = self._client.query_data_source_by_title(
             self._data_source_id, TITLE_PROPERTY, name
         )
-        if not results:
-            return None
-        page = results[0]
-        return ExistingDeck(
-            page_id=page["id"],
-            page_url=page.get("url", ""),
-            properties=page.get("properties", {}),
-        )
+        return [
+            ExistingDeck(
+                page_id=page["id"],
+                page_url=page.get("url", ""),
+                properties=page.get("properties", {}),
+            )
+            for page in results
+        ]
 
     def diff_against(self, existing: ExistingDeck, record: DeckRecord) -> list[DiffEntry]:
         existing_values = _extract_comparable_values(existing.properties)
