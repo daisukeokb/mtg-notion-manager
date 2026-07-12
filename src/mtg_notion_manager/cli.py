@@ -30,6 +30,28 @@ from mtg_notion_manager.services.apply_dedupe_plan import (
     select_target_groups,
     write_apply_log,
 )
+from mtg_notion_manager.services.apply_price_link_dedupe import (
+    STATUS_APPLIED as PRICE_STATUS_APPLIED,
+)
+from mtg_notion_manager.services.apply_price_link_dedupe import (
+    STATUS_FAILED as PRICE_STATUS_FAILED,
+)
+from mtg_notion_manager.services.apply_price_link_dedupe import (
+    STATUS_PLANNED as PRICE_STATUS_PLANNED,
+)
+from mtg_notion_manager.services.apply_price_link_dedupe import (
+    STATUS_SKIPPED_NOT_DUPLICATE as PRICE_STATUS_SKIPPED_NOT_DUPLICATE,
+)
+from mtg_notion_manager.services.apply_price_link_dedupe import (
+    STATUS_SKIPPED_STALE as PRICE_STATUS_SKIPPED_STALE,
+)
+from mtg_notion_manager.services.apply_price_link_dedupe import (
+    apply_price_link_targets,
+    load_price_link_targets,
+    select_canary_targets,
+    select_remaining_batch,
+    write_price_link_apply_log,
+)
 from mtg_notion_manager.services.audit_duplicates import (
     CATEGORY_AUTO,
     CATEGORY_EXCLUDED,
@@ -44,6 +66,13 @@ from mtg_notion_manager.services.dedupe_cards import build_dedupe_plan, execute_
 from mtg_notion_manager.services.doctor import run_doctor
 from mtg_notion_manager.services.import_cards import build_import_cards_plan, execute_import_cards
 from mtg_notion_manager.services.import_deck import build_import_plan, execute_import
+from mtg_notion_manager.services.review_duplicate_conflicts import (
+    CATEGORY_MANUAL,
+    CATEGORY_PRICE_ONLY,
+    REVIEW_CATEGORY_LABELS,
+    review_duplicate_conflicts,
+    write_review_reports,
+)
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
@@ -544,6 +573,249 @@ def apply_dedupe_plan_command(
         raise typer.Exit(code=0)
 
     if counts[STATUS_FAILED]:
+        raise typer.Exit(code=1)
+
+
+@app.command(name="review-duplicate-conflicts")
+def review_duplicate_conflicts_command(
+    card_name: str = typer.Option(
+        None, "--card-name", help="対象カード名を1件に絞り込む(省略時は要確認・手動指定の全件)"
+    ),
+    category: str = typer.Option(
+        None,
+        "--category",
+        help=(
+            "詳細分類で絞り込む "
+            "(price-only / special-version / identity-conflict / other / manual-representative)"
+        ),
+    ),
+    output_dir: str = typer.Option(
+        "reports", "--output-dir", help="レポート(JSON/CSV/Markdown)の出力先ディレクトリ"
+    ),
+) -> None:
+    """「要確認」グループをさらに詳細分類する(価格差異のみ/特殊仕様/同一性競合/その他/手動指定)。
+
+    Notionへは一切書き込まない(読み取り専用)。
+    """
+    category_map = {
+        "price-only": "price_only",
+        "special-version": "special_version",
+        "identity-conflict": "identity_conflict",
+        "other": "other",
+        "manual-representative": "manual_representative",
+    }
+    internal_category = None
+    if category is not None:
+        internal_category = category_map.get(category)
+        if internal_category is None:
+            console.print(
+                f"[red]エラー:[/red] 不明な --category '{category}' です。"
+                f" 指定可能な値: {', '.join(category_map)}"
+            )
+            raise typer.Exit(code=1)
+
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=1)
+
+    exclusions = load_exclusions()
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            repo = DedupeRepository(client, config.card_data_source_id)
+            reviews = review_duplicate_conflicts(
+                repo, card_name=card_name, category=internal_category, exclusions=exclusions
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    paths = write_review_reports(reviews, Path(output_dir))
+
+    counts = {cat: 0 for cat in REVIEW_CATEGORY_LABELS}
+    for review in reviews:
+        counts[review.review_category] += 1
+
+    console.print(f"対象グループ数: {len(reviews)}")
+    for cat, label in REVIEW_CATEGORY_LABELS.items():
+        console.print(f"{label}: {counts[cat]}")
+    console.print()
+    console.print("レポートを出力しました:")
+    console.print(f"  - {paths.json_path}")
+    console.print(f"  - {paths.csv_path}")
+    console.print(f"  - {paths.markdown_path}")
+
+
+@app.command(name="apply-price-link-dedupe")
+def apply_price_link_dedupe_command(
+    targets_report: str = typer.Option(
+        ..., "--targets-report", help="review-duplicate-conflicts が出力したJSONレポートのパス"
+    ),
+    scope: str = typer.Option(
+        "remaining",
+        "--scope",
+        help=(
+            "対象範囲(canary: カナリア3件 / remaining: カナリア以外のA分類 /"
+            " manual: 手動代表指定グループ)"
+        ),
+    ),
+    manual_representative_page_id: str = typer.Option(
+        None,
+        "--manual-representative-page-id",
+        help="--scope manual のときに使う代表ページID(必須)",
+    ),
+    limit: int = typer.Option(
+        None, "--limit", help="--scope remaining のとき、適用する最大グループ数"
+    ),
+    offset: int = typer.Option(0, "--offset", help="--scope remaining のとき、切り出し開始位置"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="計画の表示のみ行い、Notionへは書き込まない"
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="実際にNotionへ統合を書き込む(指定しない限り書き込まない)"
+    ),
+    output_dir: str = typer.Option("reports", "--output-dir", help="実行ログの出力先ディレクトリ"),
+) -> None:
+    """review-duplicate-conflicts の price_only / manual_representative グループを段階適用する。
+
+    適用直前に対象カード名を現在のNotion状態で再監査し、分類やページ構成が
+    レポート作成時から変化していればそのグループをスキップする(削除APIは一切使用しない)。
+    代表ページの販売価格・販売リンクは上書きせず、統合元の情報はメモへ履歴として追記する。
+    """
+    if scope not in ("canary", "remaining", "manual"):
+        console.print(
+            f"[red]エラー:[/red] 不明な --scope '{scope}' です。"
+            " canary/remaining/manual のいずれかを指定してください。"
+        )
+        raise typer.Exit(code=1)
+
+    if scope == "manual" and not manual_representative_page_id:
+        console.print(
+            "[red]エラー:[/red] --scope manual では --manual-representative-page-id が必須です。"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=1)
+
+    try:
+        report_path = Path(targets_report)
+        overrides = {}
+        if manual_representative_page_id:
+            all_targets_preview = load_price_link_targets(report_path)
+            manual_names = [
+                t.card_name for t in all_targets_preview if t.review_category == CATEGORY_MANUAL
+            ]
+            overrides = {name: manual_representative_page_id for name in manual_names}
+        all_targets = load_price_link_targets(
+            report_path, manual_representative_overrides=overrides
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]エラー:[/red] レポートを読み込めませんでした: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    price_only_targets = [t for t in all_targets if t.review_category == CATEGORY_PRICE_ONLY]
+
+    if scope == "canary":
+        targets = select_canary_targets(price_only_targets, limit=3)
+    elif scope == "manual":
+        targets = [t for t in all_targets if t.review_category == CATEGORY_MANUAL]
+    else:
+        canary = select_canary_targets(price_only_targets, limit=3)
+        canary_names = {t.card_name for t in canary}
+        remaining = [t for t in price_only_targets if t.card_name not in canary_names]
+        targets = select_remaining_batch(remaining, limit=limit, offset=offset)
+
+    console.print(f"対象グループ数: {len(targets)}")
+    table = Table(title=f"適用対象(scope={scope})")
+    table.add_column("カード名")
+    table.add_column("分類")
+    table.add_column("重複件数", justify="right")
+    table.add_column("代表ページID(手動指定)")
+    for group in targets:
+        table.add_row(
+            group.card_name,
+            group.review_category,
+            str(len(group.page_ids)),
+            group.representative_page_id or "",
+        )
+    console.print(table)
+
+    if not targets:
+        console.print("対象がありません。")
+        raise typer.Exit(code=0)
+
+    exclusions = load_exclusions()
+    do_apply = apply and not dry_run
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            repo = DedupeRepository(client, config.card_data_source_id)
+            outcomes = apply_price_link_targets(
+                repo, targets, apply=do_apply, exclusions=exclusions
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print()
+    result_table = Table(title="適用結果")
+    result_table.add_column("カード名")
+    result_table.add_column("結果")
+    result_table.add_column("代表ページID")
+    result_table.add_column("詳細/エラー")
+    for outcome in outcomes:
+        result_table.add_row(
+            outcome.card_name,
+            outcome.status,
+            outcome.representative_page_id or "",
+            outcome.error or outcome.reason,
+        )
+    console.print(result_table)
+
+    counts = {
+        PRICE_STATUS_APPLIED: 0,
+        PRICE_STATUS_PLANNED: 0,
+        PRICE_STATUS_SKIPPED_STALE: 0,
+        PRICE_STATUS_SKIPPED_NOT_DUPLICATE: 0,
+        PRICE_STATUS_FAILED: 0,
+    }
+    for outcome in outcomes:
+        counts[outcome.status] += 1
+
+    console.print()
+    console.print(f"適用: {counts[PRICE_STATUS_APPLIED]}件")
+    console.print(f"計画のみ(dry-run): {counts[PRICE_STATUS_PLANNED]}件")
+    console.print(f"スキップ(鮮度不一致): {counts[PRICE_STATUS_SKIPPED_STALE]}件")
+    console.print(f"スキップ(重複解消済み): {counts[PRICE_STATUS_SKIPPED_NOT_DUPLICATE]}件")
+    console.print(f"失敗: {counts[PRICE_STATUS_FAILED]}件")
+
+    log_paths = write_price_link_apply_log(
+        outcomes, targets_report_path=targets_report, output_dir=Path(output_dir), applied=do_apply
+    )
+    console.print()
+    console.print(f"実行ログ: {log_paths.json_path}")
+
+    if not do_apply:
+        console.print(
+            "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません。[/cyan]"
+        )
+        raise typer.Exit(code=0)
+
+    if counts[PRICE_STATUS_FAILED]:
         raise typer.Exit(code=1)
 
 

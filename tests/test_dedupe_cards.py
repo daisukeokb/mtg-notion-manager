@@ -51,6 +51,9 @@ def _page(
     created_time: str = "2024-01-01T00:00:00.000Z",
     last_edited_time: str = "2024-01-01T00:00:00.000Z",
     note: str = "",
+    price: float | None = None,
+    link: str | None = None,
+    commander_tags: list[str] | None = None,
 ) -> dict:
     properties: dict = {
         "カード名": {"type": "title", "title": [{"plain_text": name}]},
@@ -75,6 +78,15 @@ def _page(
         }
     if quantity is not None:
         properties["所持枚数"] = {"type": "number", "number": quantity}
+    if price is not None:
+        properties["販売価格"] = {"type": "number", "number": price}
+    if link is not None:
+        properties["販売リンク"] = {"type": "url", "url": link}
+    if commander_tags is not None:
+        properties["統率者"] = {
+            "type": "multi_select",
+            "multi_select": [{"name": t} for t in commander_tags],
+        }
 
     return {
         "id": page_id,
@@ -333,3 +345,103 @@ class TestExecuteDedupePlan:
         # p1のみアクティブなので重複グループは存在しない
         assert plan2.merge_plans == []
         assert len(client.updated_pages) == updated_count_before  # 追加の書き込みなし
+
+
+class TestPriceLinkMergeHistoryNote:
+    def test_price_difference_is_recorded_in_history(self) -> None:
+        duplicate_pages = [_page("p2", "沼", price=1800, commander_tags=["ディサ"])]
+
+        note = dedupe_cards.build_merge_history_note(
+            duplicate_pages, existing_note=None, today="2026-07-12"
+        )
+
+        assert note is not None
+        assert "[重複統合履歴 2026-07-12]" in note
+        assert "1,800円" in note
+        assert "元ページID: p2" in note
+        assert "ディサ" in note
+
+    def test_link_difference_is_recorded_in_history(self) -> None:
+        duplicate_pages = [_page("p2", "沼", link="https://example.com/a")]
+
+        note = dedupe_cards.build_merge_history_note(
+            duplicate_pages, existing_note=None, today="2026-07-12"
+        )
+
+        assert note is not None
+        assert "https://example.com/a" in note
+
+    def test_missing_price_and_link_render_as_unknown_or_none(self) -> None:
+        duplicate_pages = [_page("p2", "沼")]
+
+        note = dedupe_cards.build_merge_history_note(
+            duplicate_pages, existing_note=None, today="2026-07-12"
+        )
+
+        assert note is not None
+        assert "販売価格: 不明" in note
+        assert "販売リンク: なし" in note
+
+    def test_existing_note_is_preserved_not_overwritten(self) -> None:
+        pages = [
+            _page("p1", "沼", english_name="Swamp", note="既存の手動メモ"),
+            _page("p2", "沼", price=1800),
+        ]
+        repo, client = _repo(pages)
+        plan = dedupe_cards.build_dedupe_plan(repo)
+
+        dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        p1_update = next(props for page_id, props in client.updated_pages if page_id == "p1")
+        note_text = p1_update["メモ"]["rich_text"][0]["text"]["content"]
+        assert note_text.startswith("既存の手動メモ")
+        assert "[重複統合履歴" in note_text
+
+    def test_same_duplicate_id_history_is_not_appended_twice(self) -> None:
+        existing_note = "[重複統合履歴 2026-07-12]\n統合元:\n- ページ: url\n  元ページID: p2\n  ..."
+        duplicate_pages = [_page("p2", "沼", price=1800)]
+
+        note = dedupe_cards.build_merge_history_note(
+            duplicate_pages, existing_note=existing_note, today="2026-07-12"
+        )
+
+        assert note is None
+
+    def test_representative_price_and_link_are_never_overwritten(self) -> None:
+        pages = [
+            _page(
+                "p1",
+                "沼",
+                english_name="Swamp",
+                price=3500,
+                link="https://example.com/rep",
+            ),
+            _page("p2", "沼", price=1800, link="https://example.com/dup"),
+        ]
+        repo, client = _repo(pages)
+        plan = dedupe_cards.build_dedupe_plan(repo)
+
+        dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        p1_update = next(props for page_id, props in client.updated_pages if page_id == "p1")
+        assert "販売価格" not in p1_update
+        assert "販売リンク" not in p1_update
+
+    def test_rerun_after_full_merge_appends_no_additional_history(self) -> None:
+        pages = [
+            _page("p1", "沼", english_name="Swamp", price=3500),
+            _page("p2", "沼", price=1800),
+        ]
+        repo, client = _repo(pages)
+        plan = dedupe_cards.build_dedupe_plan(repo)
+        dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        # p2に統合済みフラグが立った状態を模擬(execute側の更新結果を反映)
+        client.pages[1]["properties"]["統合済み"]["checkbox"] = True
+        updated_count_before = len(client.updated_pages)
+
+        repo2 = DedupeRepository(client, DATA_SOURCE_ID)
+        plan2 = dedupe_cards.build_dedupe_plan(repo2)
+        dedupe_cards.execute_dedupe_plan(plan2, repo2)
+
+        assert len(client.updated_pages) == updated_count_before

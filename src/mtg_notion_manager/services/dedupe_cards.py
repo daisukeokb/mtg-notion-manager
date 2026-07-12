@@ -365,6 +365,67 @@ def _plain_text(page: dict, prop_name: str) -> str | None:
     return text or None
 
 
+def _url_value(page: dict, prop_name: str) -> str | None:
+    prop = page.get("properties", {}).get(prop_name)
+    if prop is None:
+        return None
+    return prop.get("url") or None
+
+
+def _multi_select_names(page: dict, prop_name: str) -> list[str]:
+    prop = page.get("properties", {}).get(prop_name, {})
+    return [opt.get("name") for opt in prop.get("multi_select", []) if opt.get("name")]
+
+
+def _format_price(value: float | None) -> str:
+    if value is None:
+        return "不明"
+    if float(value).is_integer():
+        return f"{int(value):,}円"
+    return f"{value:,}円"
+
+
+def _history_entry_marker(page_id: str) -> str:
+    return f"元ページID: {page_id}"
+
+
+def build_merge_history_note(
+    duplicate_pages: list[dict], existing_note: str | None, today: str | None = None
+) -> str | None:
+    """統合される側のページの価格・リンク・旧統率者タグを履歴として整形する。
+
+    既存メモに同じ元ページIDの履歴が既に含まれる場合、そのページは除外する
+    (再実行時に同じ履歴を重複追記しないための冪等性チェック)。
+    新規に追記すべきページが1件もなければ None を返す(メモを一切更新しない)。
+    """
+    entries: list[str] = []
+    for page in duplicate_pages:
+        page_id = page["id"]
+        marker = _history_entry_marker(page_id)
+        if existing_note and marker in existing_note:
+            continue
+        price = _number(page, "販売価格")
+        link = _url_value(page, "販売リンク")
+        tags = _multi_select_names(page, "統率者")
+        entries.append(
+            "\n".join(
+                [
+                    f"- ページ: {page.get('url', page_id)}",
+                    f"  {marker}",
+                    f"  販売価格: {_format_price(price)}",
+                    f"  販売リンク: {link if link else 'なし'}",
+                    f"  旧統率者タグ: {'、'.join(tags) if tags else 'なし'}",
+                ]
+            )
+        )
+
+    if not entries:
+        return None
+
+    today = today or _today()
+    return "\n".join([f"[重複統合履歴 {today}]", "統合元:", *entries])
+
+
 def build_representative_update(plan: MergePlan) -> dict:
     """代表レコードへ適用するNotionプロパティ更新差分を作る。"""
     properties: dict = {
@@ -390,12 +451,11 @@ def build_representative_update(plan: MergePlan) -> dict:
             properties[prop_name] = {"multi_select": [{"name": v} for v in values]}
 
     existing_note = _plain_text(plan.representative.page, NOTE_PROPERTY)
-    merged_ids_note = ", ".join(p["id"] for p in plan.duplicate_pages)
-    migration_note = (
-        f"[統合] {_today()}: 重複ページ{len(plan.duplicate_pages)}件を統合({merged_ids_note})"
-    )
-    combined_note = f"{existing_note}\n{migration_note}" if existing_note else migration_note
-    properties[NOTE_PROPERTY] = {"rich_text": [{"text": {"content": combined_note}}]}
+    history_block = build_merge_history_note(plan.duplicate_pages, existing_note)
+    if history_block is not None:
+        combined_note = f"{existing_note}\n{history_block}" if existing_note else history_block
+        properties[NOTE_PROPERTY] = {"rich_text": [{"text": {"content": combined_note}}]}
+    # 販売価格・販売リンクは意図的に含めない(代表ページの既存値を保持するため)。
 
     return properties
 

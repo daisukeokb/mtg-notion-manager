@@ -57,6 +57,16 @@ class DedupeRepository:
             raise RuntimeError("DedupeRepository.load() を先に呼んでください")
         return [page for page in self._pages if not _is_merged(page)]
 
+    def all_pages(self) -> list[dict]:
+        """統合済みも含む全ページ一覧(バックアップ用)。"""
+        if not self._loaded:
+            raise RuntimeError("DedupeRepository.load() を先に呼んでください")
+        return list(self._pages)
+
+    def fetch_all_pages_fresh(self) -> list[dict]:
+        """キャッシュを使わずNotionから全件を再取得する(バックアップ件数の独立検証用)。"""
+        return self._client.query_data_source_all(self._data_source_id)
+
     def find_duplicate_groups(self, card_name: str | None = None) -> dict[str, list[dict]]:
         """正規化カード名でグループ化し、2件以上のグループのみ返す。"""
         groups: dict[str, list[dict]] = {}
