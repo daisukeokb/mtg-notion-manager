@@ -8,6 +8,7 @@ from typer.testing import CliRunner
 from mtg_notion_manager import cli
 from mtg_notion_manager.config import Config
 from mtg_notion_manager.services.review_duplicate_conflicts import (
+    CATEGORY_INTENTIONAL,
     CATEGORY_PRICE_ONLY,
     DetailedGroupReview,
     ReviewReportPaths,
@@ -68,6 +69,7 @@ def _patch_common(monkeypatch: pytest.MonkeyPatch, client: object | None = None)
     monkeypatch.setattr(cli, "NotionClient", lambda api_key: client or FakeNotionClientCtx())
     monkeypatch.setattr(cli, "DedupeRepository", lambda client, data_source_id: object())
     monkeypatch.setattr(cli, "load_exclusions", lambda: object())
+    monkeypatch.setattr(cli, "load_intentional_duplicates", lambda: object())
 
 
 def test_writes_reports_and_prints_category_counts(
@@ -82,6 +84,7 @@ def test_writes_reports_and_prints_category_counts(
         card_name: str | None = None,
         category: str | None = None,
         exclusions: object = None,
+        intentional_duplicates: object = None,
     ) -> list:
         captured["card_name"] = card_name
         captured["category"] = category
@@ -127,6 +130,7 @@ def test_card_name_filter_is_passed_through(
         card_name: str | None = None,
         category: str | None = None,
         exclusions: object = None,
+        intentional_duplicates: object = None,
     ) -> list:
         captured["card_name"] = card_name
         return []
@@ -169,6 +173,7 @@ def test_category_option_maps_to_internal_value(
         card_name: str | None = None,
         category: str | None = None,
         exclusions: object = None,
+        intentional_duplicates: object = None,
     ) -> list:
         captured["category"] = category
         return []
@@ -243,11 +248,16 @@ def test_command_never_touches_notion_client_write_methods(
             raise AssertionError("update_data_source_schema must not be called")
 
     _patch_common(monkeypatch, client=StrictFakeClient())
-    monkeypatch.setattr(
-        cli,
-        "review_duplicate_conflicts",
-        lambda repo, card_name=None, category=None, exclusions=None: [],
-    )
+    def _fake_review_empty(
+        repo: object,
+        card_name: object = None,
+        category: object = None,
+        exclusions: object = None,
+        intentional_duplicates: object = None,
+    ) -> list:
+        return []
+
+    monkeypatch.setattr(cli, "review_duplicate_conflicts", _fake_review_empty)
     monkeypatch.setattr(
         cli,
         "write_review_reports",
@@ -263,3 +273,70 @@ def test_command_never_touches_notion_client_write_methods(
     )
 
     assert result.exit_code == 0
+
+
+def test_intentional_duplicate_count_and_detail_are_shown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _patch_common(monkeypatch)
+
+    intentional_review = DetailedGroupReview(
+        card_name="苦渋の破棄",
+        pages=[
+            {
+                "id": "78a2b136-bef4-487a-9b46-ec08bdf8d4cb",
+                "properties": {
+                    "英語名": {"rich_text": [{"plain_text": "Anguished Unmaking"}]},
+                },
+            },
+            {"id": "28ef458e-b1f4-4226-98d8-cc6c3c144d2a", "properties": {}},
+        ],
+        review_category=CATEGORY_INTENTIONAL,
+        representative_candidate_id=None,
+        representative_reasons=[],
+        prices=[],
+        links=[],
+        conflicts=[],
+        role_conflict=False,
+        special_flags=[],
+        merged_deck_relation_count=0,
+        merged_commander_tags=[],
+        estimated_quantity=2,
+        recommended_price_link_handling="(意図的に保持する重複のため対応不要)",
+        integrable=False,
+        risks=[],
+        intentional_duplicate_reason="通常版とショーケース版を別レコードとして保持する",
+    )
+
+    def _fake_review_intentional(
+        repo: object,
+        card_name: object = None,
+        category: object = None,
+        exclusions: object = None,
+        intentional_duplicates: object = None,
+    ) -> list:
+        return [intentional_review]
+
+    monkeypatch.setattr(cli, "review_duplicate_conflicts", _fake_review_intentional)
+    monkeypatch.setattr(
+        cli,
+        "write_review_reports",
+        lambda reviews, output_dir, timestamp=None: ReviewReportPaths(
+            json_path=output_dir / "r.json",
+            csv_path=output_dir / "r.csv",
+            markdown_path=output_dir / "r.md",
+        ),
+    )
+
+    result = runner.invoke(
+        cli.app, ["review-duplicate-conflicts", "--output-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0
+    assert "対象グループ数: 0" in result.stdout
+    assert "意図的に保持する重複: 1グループ" in result.stdout
+    assert "苦渋の破棄 / Anguished Unmaking" in result.stdout
+    assert "ページ数: 2" in result.stdout
+    assert "理由: 通常版とショーケース版を別レコードとして保持する" in result.stdout
+    assert "状態: intentional_duplicate" in result.stdout
+    assert "対応要否: 不要" in result.stdout

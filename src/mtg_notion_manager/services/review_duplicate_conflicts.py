@@ -20,10 +20,13 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
+from mtg_notion_manager.intentional_duplicates import IntentionalDuplicateConfig
+from mtg_notion_manager.notion.dedupe_repository import ENGLISH_NAME_PROPERTY, DedupeRepository
 from mtg_notion_manager.services.audit_duplicates import (
+    CATEGORY_INTENTIONAL_DUPLICATE,
     CATEGORY_MANUAL_REPRESENTATIVE,
     CATEGORY_NEEDS_REVIEW,
+    INTENTIONAL_DUPLICATE_SOURCE,
     AttributeConflict,
     ExclusionList,
     GroupAudit,
@@ -40,6 +43,7 @@ CATEGORY_SPECIAL_VERSION = "special_version"
 CATEGORY_IDENTITY_CONFLICT = "identity_conflict"
 CATEGORY_OTHER = "other"
 CATEGORY_MANUAL = "manual_representative"
+CATEGORY_INTENTIONAL = "intentional_duplicates"
 
 REVIEW_CATEGORY_LABELS: dict[str, str] = {
     CATEGORY_PRICE_ONLY: "A: 価格・販売リンク差異のみ",
@@ -48,6 +52,8 @@ REVIEW_CATEGORY_LABELS: dict[str, str] = {
     CATEGORY_OTHER: "D: その他の要確認",
     CATEGORY_MANUAL: "E: 手動代表指定が必要",
 }
+
+INTENTIONAL_DUPLICATE_LABEL = "意図的に保持する重複"
 
 # 特殊仕様の疑いを検出する拡張キーワード一覧(audit_duplicates.pyの基本セットより広い)。
 EXPANDED_SPECIAL_KEYWORDS = (
@@ -91,6 +97,7 @@ class DetailedGroupReview:
     recommended_price_link_handling: str
     integrable: bool
     risks: list[str] = field(default_factory=list)
+    intentional_duplicate_reason: str | None = None
 
 
 def review_duplicate_conflicts(
@@ -98,20 +105,56 @@ def review_duplicate_conflicts(
     card_name: str | None = None,
     category: str | None = None,
     exclusions: ExclusionList | None = None,
+    intentional_duplicates: IntentionalDuplicateConfig | None = None,
 ) -> list[DetailedGroupReview]:
-    """needs_review / manual_representative のグループを詳細分類する(読み取りのみ)。"""
-    base_audits = audit_duplicate_groups(repo, card_name=card_name, exclusions=exclusions)
+    """needs_review / manual_representative のグループを詳細分類する(読み取りのみ)。
+
+    intentional_duplicates を指定した場合、audit_duplicate_groups() の判定をそのまま
+    再利用し、意図的重複と判定されたグループは専用カテゴリ(CATEGORY_INTENTIONAL)として
+    結果に含める(通常の要確認・手動対応グループの件数には含めない)。
+    """
+    base_audits = audit_duplicate_groups(
+        repo,
+        card_name=card_name,
+        exclusions=exclusions,
+        intentional_duplicates=intentional_duplicates,
+    )
 
     reviews: list[DetailedGroupReview] = []
     for audit in base_audits:
-        if audit.category not in (CATEGORY_NEEDS_REVIEW, CATEGORY_MANUAL_REPRESENTATIVE):
+        if audit.category == CATEGORY_INTENTIONAL_DUPLICATE:
+            review = _build_intentional_duplicate_review(audit)
+        elif audit.category in (CATEGORY_NEEDS_REVIEW, CATEGORY_MANUAL_REPRESENTATIVE):
+            review = _build_detailed_review(audit)
+        else:
             continue  # auto / excluded はこのレポートの対象外
-        review = _build_detailed_review(audit)
         if category is not None and review.review_category != category:
             continue
         reviews.append(review)
 
     return reviews
+
+
+def _build_intentional_duplicate_review(audit: GroupAudit) -> DetailedGroupReview:
+    return DetailedGroupReview(
+        card_name=audit.card_name,
+        pages=audit.pages,
+        review_category=CATEGORY_INTENTIONAL,
+        representative_candidate_id=None,
+        representative_reasons=[],
+        prices=[],
+        links=[],
+        conflicts=[],
+        role_conflict=False,
+        special_flags=[],
+        merged_deck_relation_count=audit.merged_deck_relation_count,
+        merged_commander_tags=_union_multi_select(audit.pages, "統率者"),
+        estimated_quantity=audit.estimated_quantity,
+        recommended_price_link_handling="(意図的に保持する重複のため対応不要)",
+        integrable=False,
+        risks=[],
+        intentional_duplicate_reason=audit.intentional_duplicate_reason,
+    )
 
 
 def _build_detailed_review(audit: GroupAudit) -> DetailedGroupReview:
@@ -335,10 +378,12 @@ def write_review_reports(
 
 
 def _review_to_dict(review: DetailedGroupReview) -> dict:
-    return {
+    result: dict = {
         "card_name": review.card_name,
         "review_category": review.review_category,
-        "review_category_label": REVIEW_CATEGORY_LABELS[review.review_category],
+        "review_category_label": REVIEW_CATEGORY_LABELS.get(
+            review.review_category, INTENTIONAL_DUPLICATE_LABEL
+        ),
         "duplicate_count": len(review.pages),
         "representative_candidate_id": review.representative_candidate_id,
         "representative_reasons": review.representative_reasons,
@@ -353,8 +398,19 @@ def _review_to_dict(review: DetailedGroupReview) -> dict:
         "recommended_price_link_handling": review.recommended_price_link_handling,
         "integrable": review.integrable,
         "risks": review.risks,
+        "action_required": review.review_category != CATEGORY_INTENTIONAL,
         "pages": [_page_summary(p) for p in review.pages],
     }
+    if review.review_category == CATEGORY_INTENTIONAL:
+        result["card_name_en"] = (
+            _plain_text(review.pages[0], ENGLISH_NAME_PROPERTY) if review.pages else None
+        )
+        result["card_name_ja"] = review.card_name
+        result["page_ids"] = [p["id"] for p in review.pages]
+        result["reason"] = review.intentional_duplicate_reason
+        result["status"] = "intentional_duplicate"
+        result["source"] = INTENTIONAL_DUPLICATE_SOURCE
+    return result
 
 
 _CSV_FIELDNAMES = [
@@ -370,6 +426,10 @@ _CSV_FIELDNAMES = [
     "integrable",
     "recommended_price_link_handling",
     "risks",
+    "action_required",
+    "intentional_duplicate_reason",
+    "status",
+    "source",
 ]
 
 
@@ -378,6 +438,7 @@ def _write_csv(reviews: list[DetailedGroupReview], path: Path) -> None:
         writer = csv.DictWriter(f, fieldnames=_CSV_FIELDNAMES)
         writer.writeheader()
         for review in reviews:
+            is_intentional = review.review_category == CATEGORY_INTENTIONAL
             writer.writerow(
                 {
                     "card_name": review.card_name,
@@ -394,25 +455,33 @@ def _write_csv(reviews: list[DetailedGroupReview], path: Path) -> None:
                     "integrable": review.integrable,
                     "recommended_price_link_handling": review.recommended_price_link_handling,
                     "risks": "; ".join(review.risks),
+                    "action_required": not is_intentional,
+                    "intentional_duplicate_reason": review.intentional_duplicate_reason or "",
+                    "status": "intentional_duplicate" if is_intentional else "",
+                    "source": INTENTIONAL_DUPLICATE_SOURCE if is_intentional else "",
                 }
             )
 
 
 def _write_markdown(reviews: list[DetailedGroupReview], path: Path) -> None:
+    regular_reviews = [r for r in reviews if r.review_category in REVIEW_CATEGORY_LABELS]
+    intentional_reviews = [r for r in reviews if r.review_category == CATEGORY_INTENTIONAL]
+
     counts = {cat: 0 for cat in REVIEW_CATEGORY_LABELS}
-    for review in reviews:
+    for review in regular_reviews:
         counts[review.review_category] += 1
 
     lines = [
         "# 要確認グループ詳細分類レポート",
         "",
-        f"- 要確認総数(A〜E対象): {len(reviews)}",
+        f"- 要確認総数(A〜E対象): {len(regular_reviews)}",
         f"- {REVIEW_CATEGORY_LABELS[CATEGORY_PRICE_ONLY]}: {counts[CATEGORY_PRICE_ONLY]}",
         f"- {REVIEW_CATEGORY_LABELS[CATEGORY_SPECIAL_VERSION]}: {counts[CATEGORY_SPECIAL_VERSION]}",
         f"- {REVIEW_CATEGORY_LABELS[CATEGORY_IDENTITY_CONFLICT]}: "
         f"{counts[CATEGORY_IDENTITY_CONFLICT]}",
         f"- {REVIEW_CATEGORY_LABELS[CATEGORY_OTHER]}: {counts[CATEGORY_OTHER]}",
         f"- {REVIEW_CATEGORY_LABELS[CATEGORY_MANUAL]}: {counts[CATEGORY_MANUAL]}",
+        f"- {INTENTIONAL_DUPLICATE_LABEL}: {len(intentional_reviews)}",
         "",
         f"価格・リンク差異のみで統合可能な件数: {counts[CATEGORY_PRICE_ONLY]}",
         f"特殊仕様により統合対象外候補となる件数: {counts[CATEGORY_SPECIAL_VERSION]}",
@@ -437,7 +506,7 @@ def _write_markdown(reviews: list[DetailedGroupReview], path: Path) -> None:
     ):
         lines.append(f"### {REVIEW_CATEGORY_LABELS[category]}")
         lines.append("")
-        group_list = [r for r in reviews if r.review_category == category]
+        group_list = [r for r in regular_reviews if r.review_category == category]
         if not group_list:
             lines.append("(該当なし)")
             lines.append("")
@@ -461,6 +530,21 @@ def _write_markdown(reviews: list[DetailedGroupReview], path: Path) -> None:
             lines.append(f"- 推奨価格・リンク処理: {review.recommended_price_link_handling}")
             lines.append(f"- 統合可能か: {'可能' if review.integrable else '不可(要判断)'}")
             lines.append(f"- リスク: {'; '.join(review.risks) or 'なし'}")
+            lines.append("")
+
+    lines.append(f"### {INTENTIONAL_DUPLICATE_LABEL}")
+    lines.append("")
+    if not intentional_reviews:
+        lines.append("(該当なし)")
+        lines.append("")
+    else:
+        for review in intentional_reviews:
+            lines.append(f"#### {review.card_name}")
+            lines.append(f"- ページ数: {len(review.pages)}")
+            lines.append(f"- 理由: {review.intentional_duplicate_reason}")
+            lines.append("- 状態: intentional_duplicate")
+            lines.append("- 対応要否: 不要")
+            lines.append(f"- ページID: {', '.join(p['id'] for p in review.pages)}")
             lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")

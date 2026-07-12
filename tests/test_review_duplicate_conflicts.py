@@ -4,11 +4,22 @@ import csv
 import json
 from pathlib import Path
 
+from mtg_notion_manager.intentional_duplicates import (
+    IntentionalDuplicateConfig,
+    IntentionalDuplicateGroup,
+    load_intentional_duplicates,
+)
 from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
+from mtg_notion_manager.services import audit_duplicates as audit_mod
 from mtg_notion_manager.services import review_duplicate_conflicts as review_mod
+from mtg_notion_manager.services.apply_price_link_dedupe import load_price_link_targets
 from mtg_notion_manager.services.audit_duplicates import ExclusionList
 
 DATA_SOURCE_ID = "81eec501-574b-4222-ad69-87a6f68fdf2b"
+
+REAL_INTENTIONAL_DUPLICATES_PATH = Path("config/intentional_duplicate_cards.json")
+SHOWCASE_PAGE_ID = "78a2b136-bef4-487a-9b46-ec08bdf8d4cb"
+NORMAL_PAGE_ID = "28ef458e-b1f4-4226-98d8-cc6c3c144d2a"
 
 
 class FakeNotionClient:
@@ -104,6 +115,26 @@ def _page(
 def _repo(pages: list[dict]) -> DedupeRepository:
     client = FakeNotionClient(pages)
     return DedupeRepository(client, DATA_SOURCE_ID)
+
+
+def _intentional_config(
+    page_ids: frozenset[str],
+    card_name_ja: str = "苦渋の破棄",
+    card_name_en: str = "Anguished Unmaking",
+    reason: str = "通常版とショーケース版を別レコードとして保持する",
+    enabled: bool = True,
+) -> IntentionalDuplicateConfig:
+    return IntentionalDuplicateConfig(
+        groups=[
+            IntentionalDuplicateGroup(
+                card_name_en=card_name_en,
+                card_name_ja=card_name_ja,
+                page_ids=page_ids,
+                reason=reason,
+                enabled=enabled,
+            )
+        ]
+    )
 
 
 class TestPriceOnlyClassification:
@@ -309,3 +340,305 @@ class TestWriteReviewReports:
         markdown_text = paths.markdown_path.read_text(encoding="utf-8")
         assert "要確認グループ詳細分類レポート" in markdown_text
         assert "所持コピーDB" in markdown_text
+
+
+class TestIntentionalDuplicateClassification:
+    def test_exact_match_is_classified_intentional(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", note="ショーケース"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert len(reviews) == 1
+        assert reviews[0].review_category == review_mod.CATEGORY_INTENTIONAL
+
+    def test_page_id_order_does_not_matter(self) -> None:
+        pages = [
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p2", "p1"}))
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert reviews[0].review_category == review_mod.CATEGORY_INTENTIONAL
+
+    def test_english_name_match_is_recognized(self) -> None:
+        pages = [
+            _page("p1", "沼2", english_name="Anguished Unmaking"),
+            _page("p2", "沼2", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(
+            frozenset({"p1", "p2"}), card_name_ja="別名", card_name_en="Anguished Unmaking"
+        )
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert reviews[0].review_category == review_mod.CATEGORY_INTENTIONAL
+
+    def test_japanese_name_match_is_recognized(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Different English Name"),
+            _page("p2", "苦渋の破棄", english_name="Different English Name"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(
+            frozenset({"p1", "p2"}), card_name_ja="苦渋の破棄", card_name_en="別の英語名"
+        )
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert reviews[0].review_category == review_mod.CATEGORY_INTENTIONAL
+
+    def test_not_counted_as_needs_review_or_manual(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", price=100),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert [r for r in reviews if r.review_category == review_mod.CATEGORY_PRICE_ONLY] == []
+        assert [r for r in reviews if r.review_category == review_mod.CATEGORY_MANUAL] == []
+
+    def test_action_required_is_false_in_json(self, tmp_path: Path) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        paths = review_mod.write_review_reports(reviews, tmp_path, timestamp="20260101-000000")
+        data = json.loads(paths.json_path.read_text(encoding="utf-8"))
+
+        assert data[0]["action_required"] is False
+
+    def test_json_report_has_dedicated_fields(self, tmp_path: Path) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        paths = review_mod.write_review_reports(reviews, tmp_path, timestamp="20260101-000000")
+        entry = json.loads(paths.json_path.read_text(encoding="utf-8"))[0]
+
+        assert entry["review_category"] == "intentional_duplicates"
+        assert entry["card_name_en"] == "Anguished Unmaking"
+        assert entry["card_name_ja"] == "苦渋の破棄"
+        assert set(entry["page_ids"]) == {"p1", "p2"}
+        assert entry["reason"] == "通常版とショーケース版を別レコードとして保持する"
+        assert entry["status"] == "intentional_duplicate"
+        assert entry["source"] == "config/intentional_duplicate_cards.json"
+
+    def test_csv_report_has_required_info(self, tmp_path: Path) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        paths = review_mod.write_review_reports(reviews, tmp_path, timestamp="20260101-000000")
+        with paths.csv_path.open(encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+
+        assert rows[0]["review_category"] == "intentional_duplicates"
+        assert rows[0]["action_required"] == "False"
+        assert rows[0]["intentional_duplicate_reason"] == (
+            "通常版とショーケース版を別レコードとして保持する"
+        )
+        assert rows[0]["status"] == "intentional_duplicate"
+
+    def test_markdown_report_has_required_info(self, tmp_path: Path) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        paths = review_mod.write_review_reports(reviews, tmp_path, timestamp="20260101-000000")
+        markdown_text = paths.markdown_path.read_text(encoding="utf-8")
+
+        assert "意図的に保持する重複" in markdown_text
+        assert "苦渋の破棄" in markdown_text
+        assert "通常版とショーケース版を別レコードとして保持する" in markdown_text
+        assert "対応要否: 不要" in markdown_text
+
+    def test_disabled_config_falls_through_to_normal_classification(self) -> None:
+        pages = [
+            _page(
+                "p1",
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                price=100,
+                last_edited_time="2024-01-01T00:00:00.000Z",
+            ),
+            _page(
+                "p2",
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                price=200,
+                last_edited_time="2024-06-01T00:00:00.000Z",
+            ),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}), enabled=False)
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert reviews[0].review_category == review_mod.CATEGORY_PRICE_ONLY
+
+    def test_card_not_in_config_falls_through_to_normal_classification(self) -> None:
+        pages = [
+            _page("p1", "沼", price=100),
+            _page("p2", "沼", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"other-1", "other-2"}))
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert reviews[0].review_category == review_mod.CATEGORY_PRICE_ONLY
+
+    def test_config_two_pages_actual_three_pages_does_not_match(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", price=100),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+            _page("p3", "苦渋の破棄", english_name="Anguished Unmaking", price=300),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert len(reviews) == 1
+        assert reviews[0].review_category == review_mod.CATEGORY_PRICE_ONLY
+
+    def test_config_three_pages_actual_two_pages_does_not_match(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", price=100),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2", "p3"}))
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert len(reviews) == 1
+        assert reviews[0].review_category == review_mod.CATEGORY_PRICE_ONLY
+
+    def test_partial_page_id_overlap_does_not_match(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", price=100),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p9"}))
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert len(reviews) == 1
+        assert reviews[0].review_category == review_mod.CATEGORY_PRICE_ONLY
+
+    def test_name_mismatch_does_not_match(self) -> None:
+        pages = [
+            _page("p1", "沼", english_name="Swamp", price=100),
+            _page("p2", "沼", english_name="Swamp", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(
+            frozenset({"p1", "p2"}), card_name_ja="苦渋の破棄", card_name_en="Anguished Unmaking"
+        )
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert reviews[0].review_category != review_mod.CATEGORY_INTENTIONAL
+
+
+class TestAuditReviewConsistency:
+    def test_same_group_gets_same_classification_in_both_commands(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", note="ショーケース"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+        ]
+        repo_for_audit = _repo(pages)
+        repo_for_review = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        audits = audit_mod.audit_duplicate_groups(
+            repo_for_audit, intentional_duplicates=intentional
+        )
+        reviews = review_mod.review_duplicate_conflicts(
+            repo_for_review, intentional_duplicates=intentional
+        )
+
+        assert audits[0].category == audit_mod.CATEGORY_INTENTIONAL_DUPLICATE
+        assert reviews[0].review_category == review_mod.CATEGORY_INTENTIONAL
+
+
+class TestRealConfigRegression:
+    def test_anguished_unmaking_real_config_is_classified_intentional(self) -> None:
+        """苦渋の破棄(Anguished Unmaking)の実設定ファイルを使った回帰テスト。"""
+        intentional = load_intentional_duplicates(REAL_INTENTIONAL_DUPLICATES_PATH)
+        pages = [
+            _page(
+                SHOWCASE_PAGE_ID,
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                note="ショーケース",
+                price=150,
+            ),
+            _page(
+                NORMAL_PAGE_ID,
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                note="ショーケース",
+                price=200,
+                link="https://www.hareruyamtg.com/ja/products/detail/154784?lang=JP",
+            ),
+        ]
+        repo = _repo(pages)
+
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+
+        assert len(reviews) == 1
+        assert reviews[0].review_category == review_mod.CATEGORY_INTENTIONAL
+        assert reviews[0].intentional_duplicate_reason == (
+            "通常版とショーケース版を別レコードとして保持する"
+        )
+
+
+class TestDownstreamSafety:
+    def test_intentional_duplicate_entries_are_excluded_from_price_link_targets(
+        self, tmp_path: Path
+    ) -> None:
+        """意図的重複だけのレポートを後続処理(apply-price-link-dedupe)へ渡しても0件になる。"""
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+        reviews = review_mod.review_duplicate_conflicts(repo, intentional_duplicates=intentional)
+        assert reviews[0].review_category == review_mod.CATEGORY_INTENTIONAL
+
+        paths = review_mod.write_review_reports(reviews, tmp_path, timestamp="20260101-000000")
+        targets = load_price_link_targets(paths.json_path)
+
+        assert targets == []

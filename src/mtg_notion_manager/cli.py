@@ -82,6 +82,7 @@ from mtg_notion_manager.services.import_article import (
 from mtg_notion_manager.services.import_cards import build_import_cards_plan, execute_import_cards
 from mtg_notion_manager.services.import_deck import build_import_plan, execute_import
 from mtg_notion_manager.services.review_duplicate_conflicts import (
+    CATEGORY_INTENTIONAL,
     CATEGORY_MANUAL,
     CATEGORY_PRICE_ONLY,
     REVIEW_CATEGORY_LABELS,
@@ -674,12 +675,21 @@ def review_duplicate_conflicts_command(
         raise typer.Exit(code=1)
 
     exclusions = load_exclusions()
+    try:
+        intentional_duplicates = load_intentional_duplicates()
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     try:
         with NotionClient(config.notion_api_key) as client:
             repo = DedupeRepository(client, config.card_data_source_id)
             reviews = review_duplicate_conflicts(
-                repo, card_name=card_name, category=internal_category, exclusions=exclusions
+                repo,
+                card_name=card_name,
+                category=internal_category,
+                exclusions=exclusions,
+                intentional_duplicates=intentional_duplicates,
             )
     except MtgNotionManagerError as exc:
         console.print(f"[red]エラー:[/red] {exc}")
@@ -687,13 +697,29 @@ def review_duplicate_conflicts_command(
 
     paths = write_review_reports(reviews, Path(output_dir))
 
+    regular_reviews = [r for r in reviews if r.review_category in REVIEW_CATEGORY_LABELS]
+    intentional_reviews = [r for r in reviews if r.review_category == CATEGORY_INTENTIONAL]
+
     counts = {cat: 0 for cat in REVIEW_CATEGORY_LABELS}
-    for review in reviews:
+    for review in regular_reviews:
         counts[review.review_category] += 1
 
-    console.print(f"対象グループ数: {len(reviews)}")
+    console.print(f"対象グループ数: {len(regular_reviews)}")
     for cat, label in REVIEW_CATEGORY_LABELS.items():
         console.print(f"{label}: {counts[cat]}")
+    console.print(f"意図的に保持する重複: {len(intentional_reviews)}グループ")
+
+    if intentional_reviews:
+        console.print()
+        console.print("[bold]意図的に保持する重複の詳細[/bold]")
+        for review in intentional_reviews:
+            name_en = _english_name_from_pages(review.pages)
+            console.print(f"{review.card_name} / {name_en or '(英語名不明)'}")
+            console.print(f"  ページ数: {len(review.pages)}")
+            console.print(f"  理由: {review.intentional_duplicate_reason}")
+            console.print("  状態: intentional_duplicate")
+            console.print("  対応要否: 不要")
+
     console.print()
     console.print("レポートを出力しました:")
     console.print(f"  - {paths.json_path}")
