@@ -4,10 +4,34 @@ import csv
 import json
 from pathlib import Path
 
+from mtg_notion_manager.intentional_duplicates import (
+    IntentionalDuplicateConfig,
+    IntentionalDuplicateGroup,
+)
 from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
 from mtg_notion_manager.services import audit_duplicates as audit_mod
 
 DATA_SOURCE_ID = "81eec501-574b-4222-ad69-87a6f68fdf2b"
+
+
+def _intentional_config(
+    page_ids: frozenset[str],
+    card_name_ja: str = "苦渋の破棄",
+    card_name_en: str = "Anguished Unmaking",
+    reason: str = "通常版とショーケース版を別レコードとして保持する",
+    enabled: bool = True,
+) -> IntentionalDuplicateConfig:
+    return IntentionalDuplicateConfig(
+        groups=[
+            IntentionalDuplicateGroup(
+                card_name_en=card_name_en,
+                card_name_ja=card_name_ja,
+                page_ids=page_ids,
+                reason=reason,
+                enabled=enabled,
+            )
+        ]
+    )
 
 
 class FakeNotionClient:
@@ -314,3 +338,168 @@ class TestAuditDoesNotWrite:
 
         assert client.update_calls == []
         assert client.schema_update_calls == []
+
+
+class TestIntentionalDuplicates:
+    def test_exact_page_id_match_is_classified_intentional(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", note="ショーケース"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+
+        assert len(audits) == 1
+        assert audits[0].category == audit_mod.CATEGORY_INTENTIONAL_DUPLICATE
+
+    def test_page_id_order_does_not_matter(self) -> None:
+        pages = [
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        # 設定側は逆順で登録
+        intentional = _intentional_config(frozenset({"p2", "p1"}))
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+
+        assert audits[0].category == audit_mod.CATEGORY_INTENTIONAL_DUPLICATE
+
+    def test_intentional_duplicate_not_counted_as_needs_review(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking", price=100),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking", price=200),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+
+        needs_review = [a for a in audits if a.category == audit_mod.CATEGORY_NEEDS_REVIEW]
+        assert needs_review == []
+
+    def test_intentional_duplicate_appears_in_json_report_with_dedicated_fields(
+        self, tmp_path: Path
+    ) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+        paths = audit_mod.write_audit_reports(audits, tmp_path, timestamp="20260101-000000")
+
+        data = json.loads(paths.json_path.read_text(encoding="utf-8"))
+        assert len(data) == 1
+        entry = data[0]
+        assert entry["category"] == "intentional_duplicates"
+        assert entry["card_name_en"] == "Anguished Unmaking"
+        assert entry["card_name_ja"] == "苦渋の破棄"
+        assert set(entry["page_ids"]) == {"p1", "p2"}
+        assert entry["reason"] == "通常版とショーケース版を別レコードとして保持する"
+        assert entry["status"] == "intentional_duplicate"
+        assert entry["source"] == "config/intentional_duplicate_cards.json"
+
+    def test_reason_is_included_in_group_audit(self) -> None:
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(
+            frozenset({"p1", "p2"}), reason="カスタム理由テキスト"
+        )
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+
+        assert audits[0].intentional_duplicate_reason == "カスタム理由テキスト"
+
+    def test_disabled_config_does_not_apply(self) -> None:
+        pages = [
+            _page(
+                "p1",
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                price=100,
+                last_edited_time="2024-01-01T00:00:00.000Z",
+            ),
+            _page(
+                "p2",
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                price=200,
+                last_edited_time="2024-06-01T00:00:00.000Z",
+            ),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}), enabled=False)
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+
+        assert audits[0].category == audit_mod.CATEGORY_NEEDS_REVIEW
+
+    def test_anguished_unmaking_two_pages_classified_intentional(self) -> None:
+        """苦渋の破棄(Anguished Unmaking)の実データに近い形の回帰テスト。"""
+        pages = [
+            _page(
+                "78a2b136-bef4-487a-9b46-ec08bdf8d4cb",
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                note="ショーケース",
+                price=150,
+            ),
+            _page(
+                "28ef458e-b1f4-4226-98d8-cc6c3c144d2a",
+                "苦渋の破棄",
+                english_name="Anguished Unmaking",
+                note="ショーケース",
+                price=200,
+                link="https://www.hareruyamtg.com/ja/products/detail/154784?lang=JP",
+            ),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(
+            frozenset(
+                {
+                    "78a2b136-bef4-487a-9b46-ec08bdf8d4cb",
+                    "28ef458e-b1f4-4226-98d8-cc6c3c144d2a",
+                }
+            )
+        )
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+
+        assert len(audits) == 1
+        assert audits[0].category == audit_mod.CATEGORY_INTENTIONAL_DUPLICATE
+
+    def test_extra_page_in_group_is_not_treated_as_intentional(self) -> None:
+        # 監査候補が3件あるが設定は2件のみ → 適用しない(部分一致は不可)
+        pages = [
+            _page("p1", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p2", "苦渋の破棄", english_name="Anguished Unmaking"),
+            _page("p3", "苦渋の破棄", english_name="Anguished Unmaking"),
+        ]
+        repo = _repo(pages)
+        intentional = _intentional_config(frozenset({"p1", "p2"}))
+
+        audits = audit_mod.audit_duplicate_groups(repo, intentional_duplicates=intentional)
+
+        assert audits[0].category != audit_mod.CATEGORY_INTENTIONAL_DUPLICATE
+
+    def test_existing_classification_unchanged_without_intentional_config(self) -> None:
+        pages = [
+            _page("p1", "沼", english_name="Swamp", card_type="土地", deck_ids=["d1"]),
+            _page("p2", "沼", english_name="Swamp", card_type="土地", deck_ids=["d1", "d2"]),
+        ]
+        repo = _repo(pages)
+
+        without_param = audit_mod.audit_duplicate_groups(repo)
+        with_empty_config = audit_mod.audit_duplicate_groups(
+            repo, intentional_duplicates=IntentionalDuplicateConfig(groups=[])
+        )
+
+        assert without_param[0].category == with_empty_config[0].category == audit_mod.CATEGORY_AUTO

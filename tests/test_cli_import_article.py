@@ -49,7 +49,9 @@ class FakeNotionClientCtx:
 
 def _patch_notion(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
-    monkeypatch.setattr(cli, "CardRepository", lambda client, data_source_id: object())
+    monkeypatch.setattr(
+        cli, "CardRepository", lambda client, data_source_id, overrides=None: object()
+    )
     monkeypatch.setattr(cli, "NotionWriter", lambda client, data_source_id: object())
 
 
@@ -86,6 +88,20 @@ def _sample_plan(entries: list[DeckArticleEntry] | None = None) -> ArticleImport
     )
 
 
+def _patch_build_plan(monkeypatch: pytest.MonkeyPatch, plan: ArticleImportPlan) -> None:
+    def _fake_build_plan(
+        url: str,
+        writer: object,
+        card_repo: object,
+        exclude_deck_names: list[str] | None = None,
+        include_deck_names: list[str] | None = None,
+        allow_count_mismatch: bool = False,
+    ) -> ArticleImportPlan:
+        return plan
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+
 def _patch_write_log(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         cli,
@@ -100,13 +116,7 @@ def test_dry_run_shows_summary_and_does_not_apply(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion(monkeypatch)
     _patch_write_log(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "build_article_import_plan",
-        lambda url, writer, card_repo, exclude_deck_names=None, allow_count_mismatch=False: (
-            _sample_plan()
-        ),
-    )
+    _patch_build_plan(monkeypatch, _sample_plan())
     executed = {"value": False}
     monkeypatch.setattr(
         cli,
@@ -126,13 +136,7 @@ def test_without_apply_flag_does_not_write(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion(monkeypatch)
     _patch_write_log(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "build_article_import_plan",
-        lambda url, writer, card_repo, exclude_deck_names=None, allow_count_mismatch=False: (
-            _sample_plan()
-        ),
-    )
+    _patch_build_plan(monkeypatch, _sample_plan())
     executed = {"value": False}
     monkeypatch.setattr(
         cli,
@@ -150,13 +154,7 @@ def test_apply_executes_and_reports_result(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion(monkeypatch)
     _patch_write_log(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "build_article_import_plan",
-        lambda url, writer, card_repo, exclude_deck_names=None, allow_count_mismatch=False: (
-            _sample_plan()
-        ),
-    )
+    _patch_build_plan(monkeypatch, _sample_plan())
 
     applied_entry = DeckArticleEntry(
         deck_name="デッキA",
@@ -198,6 +196,7 @@ def test_exclude_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
         writer: object,
         card_repo: object,
         exclude_deck_names: list[str] | None = None,
+        include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
     ) -> ArticleImportPlan:
         captured["exclude_deck_names"] = exclude_deck_names
@@ -213,18 +212,40 @@ def test_exclude_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
     assert captured["exclude_deck_names"] == ["デッキB"]
 
 
+def test_include_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    captured: dict[str, object] = {}
+
+    def _fake_build_plan(
+        url: str,
+        writer: object,
+        card_repo: object,
+        exclude_deck_names: list[str] | None = None,
+        include_deck_names: list[str] | None = None,
+        allow_count_mismatch: bool = False,
+    ) -> ArticleImportPlan:
+        captured["include_deck_names"] = include_deck_names
+        return _sample_plan([_ready_entry("プリズマリの技巧")])
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    result = runner.invoke(
+        cli.app, ["import-article", URL, "--include-deck", "プリズマリの技巧", "--dry-run"]
+    )
+
+    assert result.exit_code == 0
+    assert captured["include_deck_names"] == ["プリズマリの技巧"]
+
+
 def test_error_status_exits_nonzero_after_apply(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion(monkeypatch)
     _patch_write_log(monkeypatch)
     error_entry = DeckArticleEntry(deck_name="デッキC", status="error", reason="解析エラー")
-    monkeypatch.setattr(
-        cli,
-        "build_article_import_plan",
-        lambda url, writer, card_repo, exclude_deck_names=None, allow_count_mismatch=False: (
-            _sample_plan([error_entry])
-        ),
-    )
+    _patch_build_plan(monkeypatch, _sample_plan([error_entry]))
     monkeypatch.setattr(cli, "execute_article_import", lambda plan, repo, note="": plan)
 
     result = runner.invoke(cli.app, ["import-article", URL, "--apply"])
@@ -237,13 +258,7 @@ def test_needs_review_only_does_not_fail_exit_code(monkeypatch: pytest.MonkeyPat
     _patch_notion(monkeypatch)
     _patch_write_log(monkeypatch)
     review_entry = DeckArticleEntry(deck_name="デッキD", status="needs_review", reason="曖昧一致")
-    monkeypatch.setattr(
-        cli,
-        "build_article_import_plan",
-        lambda url, writer, card_repo, exclude_deck_names=None, allow_count_mismatch=False: (
-            _sample_plan([review_entry])
-        ),
-    )
+    _patch_build_plan(monkeypatch, _sample_plan([review_entry]))
     monkeypatch.setattr(cli, "execute_article_import", lambda plan, repo, note="": plan)
 
     result = runner.invoke(cli.app, ["import-article", URL, "--apply"])

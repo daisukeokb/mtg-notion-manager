@@ -38,6 +38,14 @@ class AmbiguousCardMatchError(MtgNotionManagerError):
     """カードDB内で複数の候補と一致し、一意に決定できない。"""
 
 
+class CardMatchOverrideError(MtgNotionManagerError):
+    """card_match_overrides.jsonの設定が不正、または指定page_idが候補内に存在しない。"""
+
+
+class IntentionalDuplicateConfigError(MtgNotionManagerError):
+    """intentional_duplicate_cards.jsonの設定が不正(JSON不正・必須キー欠落・矛盾する設定など)。"""
+
+
 class ConflictError(MtgNotionManagerError):
     """重複統合時、複数レコード間で属性値が競合し自動統合できない。"""
 

@@ -129,3 +129,5 @@ class CardDecision:
     action: str
     existing: ExistingCard | None = None
     detail: str = ""
+    owned_will_change: bool = False
+    override_used: str | None = None

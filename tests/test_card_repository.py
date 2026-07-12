@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+from mtg_notion_manager.card_match_overrides import CardMatchOverrides, OverrideEntry
+from mtg_notion_manager.exceptions import CardMatchOverrideError
 from mtg_notion_manager.models import DeckCard
 from mtg_notion_manager.notion.card_repository import CardRepository
 
@@ -277,3 +281,155 @@ class TestCreateCard:
         _, properties = client.created_pages[0]
         assert properties["英語名"]["rich_text"][0]["text"]["content"] == "New Card"
         assert properties["メモ"]["rich_text"][0]["text"]["content"] == "吸血鬼の血統プレコン由来"
+
+
+class TestFindMatchWithOverrides:
+    def test_override_resolves_ambiguous_match_by_japanese_name(self) -> None:
+        pages = [
+            _card_page("p1", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p2", "苦渋の破棄", name_en="Anguished Unmaking"),
+        ]
+        client = FakeNotionClient(pages)
+        overrides = CardMatchOverrides(
+            by_japanese_name={
+                "苦渋の破棄": OverrideEntry(canonical_page_id="p1", reason="ショーケース版を保持")
+            },
+            by_english_name={},
+        )
+        repo = CardRepository(client, DATA_SOURCE_ID, overrides=overrides)
+        repo.load()
+
+        match = repo.find_match(_deck_card(name_ja="苦渋の破棄", name_en="Anguished Unmaking"))
+
+        assert match.card is not None
+        assert match.card.page_id == "p1"
+        assert not match.is_ambiguous
+        assert match.override_reason == "ショーケース版を保持"
+
+    def test_override_resolves_ambiguous_match_by_english_name(self) -> None:
+        pages = [
+            _card_page("p1", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p2", "苦渋の破棄", name_en="Anguished Unmaking"),
+        ]
+        client = FakeNotionClient(pages)
+        overrides = CardMatchOverrides(
+            by_japanese_name={},
+            by_english_name={
+                "anguished unmaking": OverrideEntry(
+                    canonical_page_id="p1", reason="ショーケース版を保持"
+                )
+            },
+        )
+        repo = CardRepository(client, DATA_SOURCE_ID, overrides=overrides)
+        repo.load()
+
+        match = repo.find_match(_deck_card(name_ja="苦渋の破棄", name_en="Anguished Unmaking"))
+
+        assert match.card is not None
+        assert match.card.page_id == "p1"
+
+    def test_japanese_and_english_overrides_select_same_page(self) -> None:
+        pages = [
+            _card_page("p1", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p2", "苦渋の破棄", name_en="Anguished Unmaking"),
+        ]
+        overrides = CardMatchOverrides(
+            by_japanese_name={
+                "苦渋の破棄": OverrideEntry(canonical_page_id="p1", reason="日本語名から")
+            },
+            by_english_name={
+                "anguished unmaking": OverrideEntry(canonical_page_id="p1", reason="英語名から")
+            },
+        )
+
+        client_ja = FakeNotionClient(pages)
+        repo_ja = CardRepository(client_ja, DATA_SOURCE_ID, overrides=overrides)
+        repo_ja.load()
+        match_ja = repo_ja.find_match(_deck_card(name_ja="苦渋の破棄"))
+
+        client_en = FakeNotionClient(pages)
+        repo_en = CardRepository(client_en, DATA_SOURCE_ID, overrides=overrides)
+        repo_en.load()
+        match_en = repo_en.find_match(_deck_card(name_en="Anguished Unmaking"))
+
+        assert match_ja.card is not None
+        assert match_en.card is not None
+        assert match_ja.card.page_id == match_en.card.page_id == "p1"
+
+    def test_override_page_id_not_in_candidates_raises(self) -> None:
+        pages = [
+            _card_page("p1", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p2", "苦渋の破棄", name_en="Anguished Unmaking"),
+        ]
+        client = FakeNotionClient(pages)
+        overrides = CardMatchOverrides(
+            by_japanese_name={
+                "苦渋の破棄": OverrideEntry(
+                    canonical_page_id="p999-does-not-exist", reason="誤設定"
+                )
+            },
+            by_english_name={},
+        )
+        repo = CardRepository(client, DATA_SOURCE_ID, overrides=overrides)
+        repo.load()
+
+        with pytest.raises(CardMatchOverrideError):
+            repo.find_match(_deck_card(name_ja="苦渋の破棄", name_en="Anguished Unmaking"))
+
+    def test_merged_override_target_is_not_in_candidates_and_raises(self) -> None:
+        # 統合済みページはインデックスから除外されるため、そこを指すオーバーライドは
+        # 「候補内に見つからない」エラーになる(統合済みページを勝手に統合済みのまま
+        # 使うことはしない)。
+        pages = [
+            _card_page("p1", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p2", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p3", "苦渋の破棄", name_en="Anguished Unmaking", merged=True),
+        ]
+        client = FakeNotionClient(pages)
+        overrides = CardMatchOverrides(
+            by_japanese_name={
+                "苦渋の破棄": OverrideEntry(canonical_page_id="p3", reason="誤って統合済みを指定")
+            },
+            by_english_name={},
+        )
+        repo = CardRepository(client, DATA_SOURCE_ID, overrides=overrides)
+        repo.load()
+
+        with pytest.raises(CardMatchOverrideError):
+            repo.find_match(_deck_card(name_ja="苦渋の破棄", name_en="Anguished Unmaking"))
+
+    def test_no_override_configured_falls_back_to_ambiguous(self) -> None:
+        pages = [
+            _card_page("p1", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p2", "苦渋の破棄", name_en="Anguished Unmaking"),
+        ]
+        client = FakeNotionClient(pages)
+        repo = CardRepository(client, DATA_SOURCE_ID)  # overrides未指定
+        repo.load()
+
+        match = repo.find_match(_deck_card(name_ja="苦渋の破棄", name_en="Anguished Unmaking"))
+
+        assert match.card is None
+        assert match.is_ambiguous
+        assert len(match.ambiguous_candidates) == 2
+
+    def test_override_never_selects_first_candidate_automatically(self) -> None:
+        """曖昧一致で最初の候補を自動選択しないことの回帰テスト。"""
+        pages = [
+            _card_page("p1", "苦渋の破棄", name_en="Anguished Unmaking"),
+            _card_page("p2", "苦渋の破棄", name_en="Anguished Unmaking"),
+        ]
+        client = FakeNotionClient(pages)
+        overrides = CardMatchOverrides(
+            by_japanese_name={
+                "苦渋の破棄": OverrideEntry(canonical_page_id="p2", reason="2番目を明示指定")
+            },
+            by_english_name={},
+        )
+        repo = CardRepository(client, DATA_SOURCE_ID, overrides=overrides)
+        repo.load()
+
+        match = repo.find_match(_deck_card(name_ja="苦渋の破棄", name_en="Anguished Unmaking"))
+
+        assert match.card is not None
+        assert match.card.page_id == "p2"  # p1(リスト先頭)ではなく明示指定したp2

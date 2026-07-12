@@ -1,12 +1,15 @@
 import json
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from mtg_notion_manager.card_match_overrides import load_card_match_overrides
 from mtg_notion_manager.config import Config, ConfigError
 from mtg_notion_manager.exceptions import MtgNotionManagerError
+from mtg_notion_manager.intentional_duplicates import load_intentional_duplicates
 from mtg_notion_manager.notion.card_repository import CardRepository
 from mtg_notion_manager.notion.client import NotionClient
 from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
@@ -58,6 +61,7 @@ from mtg_notion_manager.services.apply_price_link_dedupe import (
 from mtg_notion_manager.services.audit_duplicates import (
     CATEGORY_AUTO,
     CATEGORY_EXCLUDED,
+    CATEGORY_INTENTIONAL_DUPLICATE,
     CATEGORY_LABELS,
     CATEGORY_MANUAL_REPRESENTATIVE,
     CATEGORY_NEEDS_REVIEW,
@@ -87,6 +91,15 @@ from mtg_notion_manager.services.review_duplicate_conflicts import (
 
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 console = Console()
+
+
+def _english_name_from_pages(pages: list) -> Optional[str]:
+    if not pages:
+        return None
+    prop = pages[0].get("properties", {}).get("英語名")
+    if prop is None:
+        return None
+    return "".join(t.get("plain_text", "") for t in prop.get("rich_text", [])) or None
 
 
 @app.callback()
@@ -264,7 +277,9 @@ def import_cards_command(
                     raise typer.Exit(code=1)
                 resolved_deck_page_id = existing_deck.page_id
 
-            card_repo = CardRepository(client, config.card_data_source_id)
+            card_repo = CardRepository(
+                client, config.card_data_source_id, overrides=load_card_match_overrides()
+            )
             plan = build_import_cards_plan(
                 url,
                 resolved_deck_page_id,
@@ -428,11 +443,21 @@ def audit_duplicates_command(
         raise typer.Exit(code=1)
 
     exclusions = load_exclusions()
+    try:
+        intentional_duplicates = load_intentional_duplicates()
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
 
     try:
         with NotionClient(config.notion_api_key) as client:
             repo = DedupeRepository(client, config.card_data_source_id)
-            audits = audit_duplicate_groups(repo, card_name=card_name, exclusions=exclusions)
+            audits = audit_duplicate_groups(
+                repo,
+                card_name=card_name,
+                exclusions=exclusions,
+                intentional_duplicates=intentional_duplicates,
+            )
     except MtgNotionManagerError as exc:
         console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -451,6 +476,19 @@ def audit_duplicates_command(
         f"{counts[CATEGORY_MANUAL_REPRESENTATIVE]}"
     )
     console.print(f"{CATEGORY_LABELS[CATEGORY_EXCLUDED]}: {counts[CATEGORY_EXCLUDED]}")
+    console.print(f"意図的に保持する重複: {counts[CATEGORY_INTENTIONAL_DUPLICATE]}グループ")
+
+    intentional_audits = [a for a in audits if a.category == CATEGORY_INTENTIONAL_DUPLICATE]
+    if intentional_audits:
+        console.print()
+        console.print("[bold]意図的に保持する重複の詳細[/bold]")
+        for audit in intentional_audits:
+            name_en = _english_name_from_pages(audit.pages)
+            console.print(f"{audit.card_name} / {name_en or '(英語名不明)'}")
+            console.print(f"  ページ数: {len(audit.pages)}")
+            console.print(f"  理由: {audit.intentional_duplicate_reason}")
+            console.print("  状態: intentional_duplicate")
+
     console.print()
     console.print("レポートを出力しました:")
     console.print(f"  - {paths.json_path}")
@@ -836,6 +874,9 @@ def import_article_command(
     exclude_deck: list[str] = typer.Option(
         None, "--exclude-deck", help="処理から除外するデッキ名(複数指定可)"
     ),
+    include_deck: list[str] = typer.Option(
+        None, "--include-deck", help="このデッキ名だけを処理対象にする(複数指定可)"
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="取得・解析・照合・差分表示のみ行い、Notionへは書き込まない"
     ),
@@ -869,10 +910,16 @@ def import_article_command(
     try:
         with NotionClient(config.notion_api_key) as client:
             writer = NotionWriter(client, config.commander_data_source_id)
-            card_repo = CardRepository(client, config.card_data_source_id)
+            card_repo = CardRepository(
+                client, config.card_data_source_id, overrides=load_card_match_overrides()
+            )
 
             plan = build_article_import_plan(
-                url, writer, card_repo, exclude_deck_names=exclude_deck or []
+                url,
+                writer,
+                card_repo,
+                exclude_deck_names=exclude_deck or [],
+                include_deck_names=include_deck or [],
             )
 
             print_article_plan_summary(console, plan)

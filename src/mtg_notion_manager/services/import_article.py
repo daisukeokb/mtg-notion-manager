@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,15 +86,23 @@ def build_article_import_plan(
     writer: NotionWriter,
     card_repo: CardRepository,
     exclude_deck_names: list[str] | None = None,
+    include_deck_names: list[str] | None = None,
     allow_count_mismatch: bool = False,
 ) -> ArticleImportPlan:
-    """記事HTMLを1回だけ取得し、記事内の全デッキを解析・検証する(Notionへの書き込みなし)。"""
+    """記事HTMLを1回だけ取得し、記事内の全デッキを解析・検証する(Notionへの書き込みなし)。
+
+    include_deck_names を指定した場合、そのデッキ名だけを対象にする
+    (exclude_deck_names と併用可能。両方指定された場合は両方の条件を満たす必要がある)。
+    """
     exclude_deck_names = exclude_deck_names or []
+    include_deck_names = include_deck_names or []
     html = download(url)
     fetcher = get_fetcher(url)
     all_deck_names = fetcher.list_deck_names(html, url)
 
     target_names = [name for name in all_deck_names if name not in exclude_deck_names]
+    if include_deck_names:
+        target_names = [name for name in target_names if name in include_deck_names]
 
     card_repo.load()
 
@@ -283,4 +292,95 @@ def _entry_to_dict(entry: DeckArticleEntry) -> dict:
                 if r.action == "failed"
             ],
         }
+    return result
+
+
+# --- デッキ単位のログ出力(reports/strixhaven-import-*) ------------------------
+#
+# 秘密情報(APIキー等)はここでは一切扱わないため、出力にも含まれない。
+
+
+_SLUG_UNSAFE_RE = re.compile(r"[\\/:*?\"<>|\s]+")
+
+
+def _slugify_deck_name(name: str) -> str:
+    """ファイル名として安全な形に整形する(日本語自体は変換せずそのまま使う)。"""
+    slug = _SLUG_UNSAFE_RE.sub("-", name).strip("-")
+    return slug or "deck"
+
+
+def write_strixhaven_deck_logs(
+    plan: ArticleImportPlan, output_dir: Path, timestamp: str | None = None
+) -> list[Path]:
+    """デッキごとに reports/strixhaven-import-{timestamp}-{deck-slug}.json を出力する。"""
+    timestamp = timestamp or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    paths: list[Path] = []
+    for entry in plan.entries:
+        slug = _slugify_deck_name(entry.deck_name)
+        path = output_dir / f"strixhaven-import-{timestamp}-{slug}.json"
+        log = _deck_log_dict(entry)
+        path.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+def _deck_log_dict(entry: DeckArticleEntry) -> dict:
+    result: dict = {
+        "deck_name": entry.deck_name,
+        "status": entry.status,
+        "reason": entry.reason,
+        "deck_page_id": entry.deck_page_id,
+        "delete_count": 0,
+    }
+
+    if entry.cards_plan is None:
+        result.update(
+            {
+                "extracted_quantity": None,
+                "unique_card_count": None,
+                "new_card_count": None,
+                "relation_added_count": None,
+                "owned_updated_count": None,
+                "unchanged_count": None,
+                "ambiguous_count": None,
+                "error_count": None,
+                "overrides_used": [],
+                "api_update_count": 0,
+            }
+        )
+        return result
+
+    parsed = entry.cards_plan.parsed
+    decisions = entry.cards_plan.decisions
+
+    result["extracted_quantity"] = parsed.total_quantity
+    result["unique_card_count"] = len(parsed.cards)
+    result["overrides_used"] = [
+        {"card": d.card.display_name, "reason": d.override_used}
+        for d in decisions
+        if d.override_used
+    ]
+    result["ambiguous_count"] = sum(1 for d in decisions if d.action == "ambiguous")
+    result["owned_updated_count"] = sum(1 for d in decisions if d.owned_will_change)
+
+    if entry.apply_result is not None:
+        results = entry.apply_result.results
+        result["new_card_count"] = sum(1 for r in results if r.action == "created")
+        result["relation_added_count"] = sum(1 for r in results if r.action == "relation_updated")
+        result["unchanged_count"] = sum(1 for r in results if r.action == "unchanged")
+        result["error_count"] = sum(1 for r in results if r.action == "failed")
+        result["api_update_count"] = sum(
+            1 for r in results if r.action in ("created", "relation_updated")
+        )
+    else:
+        counts = entry.cards_plan.summary
+        result["new_card_count"] = counts.get("create", 0)
+        result["relation_added_count"] = counts.get("relation_update", 0)
+        result["unchanged_count"] = counts.get("unchanged", 0)
+        result["error_count"] = counts.get("error", 0)
+        result["api_update_count"] = 0
+
     return result

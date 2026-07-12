@@ -104,7 +104,9 @@ def _decide(card: DeckCard, deck_page_id: str, card_repo: CardRepository) -> Car
     already_owned = card_repo.is_owned(existing)
 
     if already_related and already_owned:
-        return CardDecision(card=card, action="unchanged", existing=existing)
+        return CardDecision(
+            card=card, action="unchanged", existing=existing, override_used=match.override_reason
+        )
 
     detail_parts = []
     if not already_related:
@@ -113,7 +115,12 @@ def _decide(card: DeckCard, deck_page_id: str, card_repo: CardRepository) -> Car
         detail_parts.append("所持=trueへ更新")
 
     return CardDecision(
-        card=card, action="relation_update", existing=existing, detail="・".join(detail_parts)
+        card=card,
+        action="relation_update",
+        existing=existing,
+        detail="・".join(detail_parts),
+        owned_will_change=not already_owned,
+        override_used=match.override_reason,
     )
 
 

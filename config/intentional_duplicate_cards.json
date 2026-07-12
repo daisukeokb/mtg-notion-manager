@@ -1,0 +1,14 @@
+{
+  "groups": [
+    {
+      "card_name_en": "Anguished Unmaking",
+      "card_name_ja": "苦渋の破棄",
+      "page_ids": [
+        "78a2b136-bef4-487a-9b46-ec08bdf8d4cb",
+        "28ef458e-b1f4-4226-98d8-cc6c3c144d2a"
+      ],
+      "reason": "通常版とショーケース版を別レコードとして保持する",
+      "enabled": true
+    }
+  ]
+}

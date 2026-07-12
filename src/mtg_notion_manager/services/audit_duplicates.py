@@ -15,6 +15,10 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from mtg_notion_manager.intentional_duplicates import (
+    IntentionalDuplicateConfig,
+    IntentionalDuplicateGroup,
+)
 from mtg_notion_manager.notion.dedupe_repository import (
     DECKS_RELATION_PROPERTY,
     ENGLISH_NAME_PROPERTY,
@@ -28,13 +32,17 @@ CATEGORY_AUTO = "auto"
 CATEGORY_NEEDS_REVIEW = "needs_review"
 CATEGORY_MANUAL_REPRESENTATIVE = "manual_representative"
 CATEGORY_EXCLUDED = "excluded"
+CATEGORY_INTENTIONAL_DUPLICATE = "intentional_duplicates"
 
 CATEGORY_LABELS: dict[str, str] = {
     CATEGORY_AUTO: "自動統合可能",
     CATEGORY_NEEDS_REVIEW: "要確認",
     CATEGORY_MANUAL_REPRESENTATIVE: "手動代表指定が必要",
     CATEGORY_EXCLUDED: "統合対象外",
+    CATEGORY_INTENTIONAL_DUPLICATE: "意図的に保持する重複",
 }
+
+INTENTIONAL_DUPLICATE_SOURCE = "config/intentional_duplicate_cards.json"
 
 # 自動統合可否を判定する属性競合の対象(仕様どおり: 英語名/タイプ/シンボル)。
 _CONFLICT_SINGLE_PROPERTIES = (ENGLISH_NAME_PROPERTY, "タイプ")
@@ -89,24 +97,57 @@ class GroupAudit:
     risks: list[str]
     recommended_action: str
     excluded_reason: str | None = None
+    intentional_duplicate_reason: str | None = None
 
 
 def audit_duplicate_groups(
     repo: DedupeRepository,
     card_name: str | None = None,
     exclusions: ExclusionList | None = None,
+    intentional_duplicates: IntentionalDuplicateConfig | None = None,
 ) -> list[GroupAudit]:
-    """重複グループを検出し、各グループを4分類のいずれかに監査する(読み取りのみ)。"""
+    """重複グループを検出し、各グループを分類する(読み取りのみ)。
+
+    intentional_duplicates を指定しない場合は空扱い(既存の分類結果は一切変わらない)。
+    """
     repo.load()
     exclusions = exclusions or ExclusionList()
+    intentional_duplicates = intentional_duplicates or IntentionalDuplicateConfig(groups=[])
     groups = repo.find_duplicate_groups(card_name)
-    return [_audit_one_group(repo, pages, exclusions) for pages in groups.values()]
+    return [
+        _audit_one_group(repo, pages, exclusions, intentional_duplicates)
+        for pages in groups.values()
+    ]
 
 
 def _audit_one_group(
-    repo: DedupeRepository, pages: list[dict], exclusions: ExclusionList
+    repo: DedupeRepository,
+    pages: list[dict],
+    exclusions: ExclusionList,
+    intentional_duplicates: IntentionalDuplicateConfig,
 ) -> GroupAudit:
     display_name = _plain_text(pages[0], TITLE_PROPERTY) or "(不明)"
+
+    intentional_match = _check_intentional_duplicate(pages, intentional_duplicates)
+    if intentional_match is not None:
+        return GroupAudit(
+            card_name=display_name,
+            pages=pages,
+            category=CATEGORY_INTENTIONAL_DUPLICATE,
+            recommended_representative_id=None,
+            representative_reasons=[],
+            conflicts=[],
+            special_version_flags=[],
+            price_link_differs=False,
+            merged_deck_relation_count=0,
+            estimated_quantity=len(pages),
+            risks=[],
+            recommended_action=(
+                "意図的に別レコードとして保持されています"
+                f"({INTENTIONAL_DUPLICATE_SOURCE})。統合・代表指定は行いません。"
+            ),
+            intentional_duplicate_reason=intentional_match.reason,
+        )
 
     excluded_reason = _check_exclusion(display_name, pages, exclusions)
     if excluded_reason is not None:
@@ -177,6 +218,16 @@ def _audit_one_group(
         risks=risks,
         recommended_action=action,
     )
+
+
+def _check_intentional_duplicate(
+    pages: list[dict], config: IntentionalDuplicateConfig
+) -> IntentionalDuplicateGroup | None:
+    """ページID集合とカード名が、意図的重複設定と完全一致する場合のみそのグループを返す。"""
+    page_ids = frozenset(p["id"] for p in pages)
+    name_ja = _plain_text(pages[0], TITLE_PROPERTY)
+    name_en = _plain_text(pages[0], ENGLISH_NAME_PROPERTY)
+    return config.find_matching_group(page_ids, name_ja, name_en)
 
 
 def _check_exclusion(display_name: str, pages: list[dict], exclusions: ExclusionList) -> str | None:
@@ -337,7 +388,7 @@ def _page_summary(page: dict) -> dict:
 
 
 def _audit_to_dict(audit: GroupAudit) -> dict:
-    return {
+    result: dict = {
         "card_name": audit.card_name,
         "category": audit.category,
         "category_label": CATEGORY_LABELS[audit.category],
@@ -354,6 +405,16 @@ def _audit_to_dict(audit: GroupAudit) -> dict:
         "excluded_reason": audit.excluded_reason,
         "pages": [_page_summary(p) for p in audit.pages],
     }
+    if audit.category == CATEGORY_INTENTIONAL_DUPLICATE:
+        result["card_name_en"] = (
+            _plain_text(audit.pages[0], ENGLISH_NAME_PROPERTY) if audit.pages else None
+        )
+        result["card_name_ja"] = audit.card_name
+        result["page_ids"] = [p["id"] for p in audit.pages]
+        result["reason"] = audit.intentional_duplicate_reason
+        result["status"] = "intentional_duplicate"
+        result["source"] = INTENTIONAL_DUPLICATE_SOURCE
+    return result
 
 
 _CSV_FIELDNAMES = [
@@ -370,6 +431,7 @@ _CSV_FIELDNAMES = [
     "risks",
     "recommended_action",
     "excluded_reason",
+    "intentional_duplicate_reason",
 ]
 
 
@@ -395,6 +457,7 @@ def _write_csv(audits: list[GroupAudit], path: Path) -> None:
                     "risks": "; ".join(audit.risks),
                     "recommended_action": audit.recommended_action,
                     "excluded_reason": audit.excluded_reason or "",
+                    "intentional_duplicate_reason": audit.intentional_duplicate_reason or "",
                 }
             )
 
@@ -412,6 +475,7 @@ def _write_markdown(audits: list[GroupAudit], path: Path) -> None:
         f"- 要確認: {counts[CATEGORY_NEEDS_REVIEW]}",
         f"- 手動代表指定が必要: {counts[CATEGORY_MANUAL_REPRESENTATIVE]}",
         f"- 統合対象外: {counts[CATEGORY_EXCLUDED]}",
+        f"- 意図的に保持する重複: {counts[CATEGORY_INTENTIONAL_DUPLICATE]}",
         "",
     ]
 
@@ -420,6 +484,7 @@ def _write_markdown(audits: list[GroupAudit], path: Path) -> None:
         CATEGORY_NEEDS_REVIEW,
         CATEGORY_MANUAL_REPRESENTATIVE,
         CATEGORY_EXCLUDED,
+        CATEGORY_INTENTIONAL_DUPLICATE,
     ):
         lines.append(f"## {CATEGORY_LABELS[category]}")
         lines.append("")
@@ -444,6 +509,10 @@ def _write_markdown(audits: list[GroupAudit], path: Path) -> None:
             lines.append(f"- 推奨アクション: {audit.recommended_action}")
             if audit.excluded_reason:
                 lines.append(f"- 除外理由: {audit.excluded_reason}")
+            if audit.intentional_duplicate_reason:
+                lines.append(f"- 保持理由: {audit.intentional_duplicate_reason}")
+                lines.append("- 状態: intentional_duplicate")
+                lines.append(f"- ページID: {', '.join(p['id'] for p in audit.pages)}")
             lines.append("")
 
     path.write_text("\n".join(lines), encoding="utf-8")

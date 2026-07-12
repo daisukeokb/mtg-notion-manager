@@ -393,3 +393,134 @@ class TestWriteArticleImportLog:
         assert data["source_url"] == SOURCE_URL
         assert data["decks"][0]["deck_name"] == DECK_NAMES[0]
         assert data["decks"][0]["extracted_quantity"] == 100
+
+
+class TestCardMatchOverrideFlowsThroughDeck:
+    def test_override_resolved_card_is_applied_and_recorded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """曖昧一致がオーバーライドで解決された場合、そのページだけが更新され、
+        決定(CardDecision)にオーバーライド理由が記録されることを確認する
+        (特殊仕様側の候補ページは一切触れられない)。
+        """
+        card = _card("Anguished Unmaking")
+        parse_map = {DECK_NAMES[0]: _parsed(DECK_NAMES[0], [card])}
+        _patch_common(monkeypatch, [DECK_NAMES[0]], parse_map)
+        writer = FakeWriter({DECK_NAMES[0]: _existing_deck(DECK_NAMES[0], "deck-0")})
+
+        resolved = _existing_card("p1-normal")
+        card_repo = FakeCardRepository(
+            matches={
+                "Anguished Unmaking": CardMatch(
+                    card=resolved,
+                    ambiguous_candidates=[],
+                    override_reason="ショーケース版を別レコードとして保持するため",
+                )
+            },
+            deck_relation_ids={"p1-normal": []},
+            owned={"p1-normal": True},
+        )
+
+        plan = import_article.build_article_import_plan(
+            SOURCE_URL, writer, card_repo, allow_count_mismatch=True
+        )
+        applied = import_article.execute_article_import(plan, card_repo)
+
+        entry = applied.entries[0]
+        assert entry.status == import_article.STATUS_READY
+        decision = entry.cards_plan.decisions[0]
+        assert decision.override_used == "ショーケース版を別レコードとして保持するため"
+
+        # p1-normal(通常版)以外への書き込みが一切ないこと
+        assert len(card_repo.relation_updates) == 1
+        assert card_repo.relation_updates[0][0] == "p1-normal"
+        assert card_repo.created == []
+
+    def test_deck_log_records_override_usage(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        card = _card("Anguished Unmaking")
+        parse_map = {DECK_NAMES[0]: _parsed(DECK_NAMES[0], [card])}
+        _patch_common(monkeypatch, [DECK_NAMES[0]], parse_map)
+        writer = FakeWriter({DECK_NAMES[0]: _existing_deck(DECK_NAMES[0], "deck-0")})
+
+        resolved = _existing_card("p1-normal")
+        card_repo = FakeCardRepository(
+            matches={
+                "Anguished Unmaking": CardMatch(
+                    card=resolved, ambiguous_candidates=[], override_reason="ショーケース版を保持"
+                )
+            },
+            deck_relation_ids={"p1-normal": []},
+            owned={"p1-normal": True},
+        )
+
+        plan = import_article.build_article_import_plan(
+            SOURCE_URL, writer, card_repo, allow_count_mismatch=True
+        )
+        applied = import_article.execute_article_import(plan, card_repo)
+
+        paths = import_article.write_strixhaven_deck_logs(
+            applied, output_dir=tmp_path, timestamp="20260101-000000"
+        )
+        assert len(paths) == 1
+        data = json.loads(paths[0].read_text(encoding="utf-8"))
+
+        assert data["overrides_used"] == [
+            {"card": "Anguished Unmaking", "reason": "ショーケース版を保持"}
+        ]
+        assert data["delete_count"] == 0
+
+
+class TestWriteStrixhavenDeckLogs:
+    def test_writes_one_file_per_deck_with_slugified_name(self, tmp_path: Path) -> None:
+        entries = [
+            import_article.DeckArticleEntry(
+                deck_name=name,
+                status=import_article.STATUS_READY,
+                deck_page_id=f"deck-{i}",
+                cards_plan=import_cards_module.ImportCardsPlan(
+                    parsed=_parsed(name, [_card(f"{name}-c", 100)]),
+                    deck_page_id=f"deck-{i}",
+                    decisions=[],
+                ),
+            )
+            for i, name in enumerate(DECK_NAMES)
+        ]
+        plan = import_article.ArticleImportPlan(
+            source_url=SOURCE_URL,
+            all_deck_names=DECK_NAMES,
+            excluded_deck_names=[],
+            entries=entries,
+        )
+
+        paths = import_article.write_strixhaven_deck_logs(
+            plan, output_dir=tmp_path, timestamp="20260101-000000"
+        )
+
+        assert len(paths) == 5
+        for path in paths:
+            assert path.exists()
+            assert path.name.startswith("strixhaven-import-20260101-000000-")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            assert data["delete_count"] == 0
+            assert "api_key" not in json.dumps(data).lower()
+
+    def test_no_delete_field_is_always_zero(self, tmp_path: Path) -> None:
+        entry = import_article.DeckArticleEntry(
+            deck_name="エラーデッキ", status=import_article.STATUS_ERROR, reason="解析失敗"
+        )
+        plan = import_article.ArticleImportPlan(
+            source_url=SOURCE_URL,
+            all_deck_names=["エラーデッキ"],
+            excluded_deck_names=[],
+            entries=[entry],
+        )
+
+        paths = import_article.write_strixhaven_deck_logs(
+            plan, output_dir=tmp_path, timestamp="20260101-000000"
+        )
+
+        data = json.loads(paths[0].read_text(encoding="utf-8"))
+        assert data["delete_count"] == 0
+        assert data["status"] == import_article.STATUS_ERROR

@@ -64,7 +64,9 @@ class FakeNotionClientCtx:
 
 def _patch_notion_client(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
-    monkeypatch.setattr(cli, "CardRepository", lambda client, data_source_id: object())
+    monkeypatch.setattr(
+        cli, "CardRepository", lambda client, data_source_id, overrides=None: object()
+    )
 
 
 def test_dry_run_shows_summary_and_does_not_apply(monkeypatch: pytest.MonkeyPatch) -> None:

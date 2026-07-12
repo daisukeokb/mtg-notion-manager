@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from mtg_notion_manager.card_match_overrides import CardMatchOverrides
+from mtg_notion_manager.exceptions import CardMatchOverrideError
 from mtg_notion_manager.models import DeckCard, ExistingCard
 from mtg_notion_manager.notion.client import NotionClient
 from mtg_notion_manager.parsers.card_names import normalize_card_name
@@ -31,6 +33,7 @@ class CardMatch:
 
     card: ExistingCard | None
     ambiguous_candidates: list[ExistingCard]
+    override_reason: str | None = None
 
     @property
     def is_ambiguous(self) -> bool:
@@ -43,12 +46,20 @@ class CardRepository:
     100回個別検索する代わりに、load() で全件を1度だけ取得してインデックスを作る。
     """
 
-    def __init__(self, client: NotionClient, data_source_id: str) -> None:
+    def __init__(
+        self,
+        client: NotionClient,
+        data_source_id: str,
+        overrides: CardMatchOverrides | None = None,
+    ) -> None:
         self._client = client
         self._data_source_id = data_source_id
         self._by_english_name: dict[str, list[ExistingCard]] = {}
         self._by_japanese_name: dict[str, list[ExistingCard]] = {}
         self._loaded = False
+        self._overrides = overrides or CardMatchOverrides(
+            by_japanese_name={}, by_english_name={}
+        )
 
     def load(self) -> None:
         if self._loaded:
@@ -69,10 +80,24 @@ class CardRepository:
                 self._by_english_name.setdefault(normalize_card_name(name_en), []).append(existing)
         self._loaded = True
 
+    def candidates_by_english_name(self, name: str) -> list[ExistingCard]:
+        """指定した英語名(未正規化)に完全一致する候補一覧を返す(doctorの検証用)。"""
+        if not self._loaded:
+            raise RuntimeError("CardRepository.load() を先に呼んでください")
+        return list(self._by_english_name.get(normalize_card_name(name), []))
+
+    def candidates_by_japanese_name(self, name: str) -> list[ExistingCard]:
+        """指定した日本語名(未正規化)に完全一致する候補一覧を返す(doctorの検証用)。"""
+        if not self._loaded:
+            raise RuntimeError("CardRepository.load() を先に呼んでください")
+        return list(self._by_japanese_name.get(normalize_card_name(name), []))
+
     def find_match(self, card: DeckCard) -> CardMatch:
         """英語名→日本語名の順で完全一致を検索する。
 
         英語名で一致すれば日本語名は見ない(仕様どおり英語名を第一候補とする)。
+        複数候補になった場合は card_match_overrides を確認し、指定page_idが
+        候補内にあればそれを採用する(fuzzy matchや自動選択は一切行わない)。
         """
         if not self._loaded:
             raise RuntimeError("CardRepository.load() を先に呼んでください")
@@ -82,16 +107,34 @@ class CardRepository:
             if len(candidates) == 1:
                 return CardMatch(card=candidates[0], ambiguous_candidates=[])
             if len(candidates) > 1:
-                return CardMatch(card=None, ambiguous_candidates=candidates)
+                return self._resolve_ambiguous(card, candidates)
 
         if card.name_ja:
             candidates = self._by_japanese_name.get(normalize_card_name(card.name_ja), [])
             if len(candidates) == 1:
                 return CardMatch(card=candidates[0], ambiguous_candidates=[])
             if len(candidates) > 1:
-                return CardMatch(card=None, ambiguous_candidates=candidates)
+                return self._resolve_ambiguous(card, candidates)
 
         return CardMatch(card=None, ambiguous_candidates=[])
+
+    def _resolve_ambiguous(self, card: DeckCard, candidates: list[ExistingCard]) -> CardMatch:
+        override = self._overrides.resolve(card.name_ja, card.name_en)
+        if override is None:
+            return CardMatch(card=None, ambiguous_candidates=candidates)
+
+        matched = next(
+            (c for c in candidates if c.page_id == override.canonical_page_id), None
+        )
+        if matched is None:
+            candidate_ids = [c.page_id for c in candidates]
+            raise CardMatchOverrideError(
+                f"カード '{card.display_name}' のオーバーライド指定"
+                f" page_id '{override.canonical_page_id}' が曖昧一致の候補内に"
+                f" 見つかりません(候補: {candidate_ids})。"
+                " config/card_match_overrides.json を確認してください。"
+            )
+        return CardMatch(card=matched, ambiguous_candidates=[], override_reason=override.reason)
 
     def get_deck_relation_ids(self, existing: ExistingCard) -> list[str]:
         """「採用デッキ」リレーションの全ページIDを取得する(25件超はページングして取得)。"""

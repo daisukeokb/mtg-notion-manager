@@ -62,10 +62,16 @@ def test_audit_writes_reports_and_does_not_call_notion_writes(
     monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
     monkeypatch.setattr(cli, "DedupeRepository", lambda client, data_source_id: object())
     monkeypatch.setattr(cli, "load_exclusions", lambda: object())
+    monkeypatch.setattr(cli, "load_intentional_duplicates", lambda: object())
 
     captured: dict[str, object] = {}
 
-    def fake_audit(repo: object, card_name: str | None = None, exclusions: object = None) -> list:
+    def fake_audit(
+        repo: object,
+        card_name: str | None = None,
+        exclusions: object = None,
+        intentional_duplicates: object = None,
+    ) -> list:
         captured["card_name"] = card_name
         return _sample_audits()
 
@@ -97,10 +103,16 @@ def test_audit_with_card_name_filter(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
     monkeypatch.setattr(cli, "DedupeRepository", lambda client, data_source_id: object())
     monkeypatch.setattr(cli, "load_exclusions", lambda: object())
+    monkeypatch.setattr(cli, "load_intentional_duplicates", lambda: object())
 
     captured: dict[str, object] = {}
 
-    def fake_audit(repo: object, card_name: str | None = None, exclusions: object = None) -> list:
+    def fake_audit(
+        repo: object,
+        card_name: str | None = None,
+        exclusions: object = None,
+        intentional_duplicates: object = None,
+    ) -> list:
         captured["card_name"] = card_name
         return []
 
@@ -154,8 +166,70 @@ def test_audit_command_never_touches_notion_client_write_methods(
     monkeypatch.setattr(cli, "NotionClient", lambda api_key: StrictFakeClient())
     monkeypatch.setattr(cli, "DedupeRepository", lambda client, data_source_id: object())
     monkeypatch.setattr(cli, "load_exclusions", lambda: object())
+    monkeypatch.setattr(cli, "load_intentional_duplicates", lambda: object())
+    def fake_audit_empty(
+        repo: object,
+        card_name: object = None,
+        exclusions: object = None,
+        intentional_duplicates: object = None,
+    ) -> list:
+        return []
+
+    monkeypatch.setattr(cli, "audit_duplicate_groups", fake_audit_empty)
     monkeypatch.setattr(
-        cli, "audit_duplicate_groups", lambda repo, card_name=None, exclusions=None: []
+        cli,
+        "write_audit_reports",
+        lambda audits, output_dir, timestamp=None: AuditReportPaths(
+            json_path=output_dir / "a.json",
+            csv_path=output_dir / "a.csv",
+            markdown_path=output_dir / "a.md",
+        ),
+    )
+
+    result = runner.invoke(cli.app, ["audit-duplicates", "--output-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+
+
+def test_intentional_duplicate_count_and_detail_are_shown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
+    monkeypatch.setattr(cli, "DedupeRepository", lambda client, data_source_id: object())
+    monkeypatch.setattr(cli, "load_exclusions", lambda: object())
+    monkeypatch.setattr(cli, "load_intentional_duplicates", lambda: object())
+
+    intentional_audit = GroupAudit(
+        card_name="苦渋の破棄",
+        pages=[
+            {
+                "id": "78a2b136-bef4-487a-9b46-ec08bdf8d4cb",
+                "properties": {
+                    "英語名": {"rich_text": [{"plain_text": "Anguished Unmaking"}]},
+                },
+            },
+            {"id": "28ef458e-b1f4-4226-98d8-cc6c3c144d2a", "properties": {}},
+        ],
+        category="intentional_duplicates",
+        recommended_representative_id=None,
+        representative_reasons=[],
+        conflicts=[],
+        special_version_flags=[],
+        price_link_differs=False,
+        merged_deck_relation_count=0,
+        estimated_quantity=2,
+        risks=[],
+        recommended_action="意図的に別レコードとして保持されています",
+        intentional_duplicate_reason="通常版とショーケース版を別レコードとして保持する",
+    )
+
+    monkeypatch.setattr(
+        cli,
+        "audit_duplicate_groups",
+        lambda repo, card_name=None, exclusions=None, intentional_duplicates=None: [
+            intentional_audit
+        ],
     )
     monkeypatch.setattr(
         cli,
@@ -170,3 +244,9 @@ def test_audit_command_never_touches_notion_client_write_methods(
     result = runner.invoke(cli.app, ["audit-duplicates", "--output-dir", str(tmp_path)])
 
     assert result.exit_code == 0
+    assert "意図的に保持する重複: 1グループ" in result.stdout
+    assert "要確認: 0" in result.stdout
+    assert "苦渋の破棄 / Anguished Unmaking" in result.stdout
+    assert "ページ数: 2" in result.stdout
+    assert "理由: 通常版とショーケース版を別レコードとして保持する" in result.stdout
+    assert "状態: intentional_duplicate" in result.stdout

@@ -1,0 +1,14 @@
+{
+  "by_japanese_name": {
+    "苦渋の破棄": {
+      "canonical_page_id": "78a2b136-bef4-487a-9b46-ec08bdf8d4cb",
+      "reason": "ショーケース版を別レコードとして保持するため(通常版として使用: エドガー・マルコフ, ¥150, ハイブリッドマナシンボル設定済み, 2024-07-03作成)"
+    }
+  },
+  "by_english_name": {
+    "Anguished Unmaking": {
+      "canonical_page_id": "78a2b136-bef4-487a-9b46-ec08bdf8d4cb",
+      "reason": "ショーケース版を別レコードとして保持するため(日本語名・英語名どちらの照合でも同じ代表ページを使う)"
+    }
+  }
+}
