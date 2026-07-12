@@ -19,6 +19,17 @@ from mtg_notion_manager.preview import (
     print_plan_detail,
     print_plan_summary,
 )
+from mtg_notion_manager.services.apply_dedupe_plan import (
+    STATUS_APPLIED,
+    STATUS_FAILED,
+    STATUS_PLANNED,
+    STATUS_SKIPPED_NOT_DUPLICATE,
+    STATUS_SKIPPED_STALE,
+    apply_dedupe_batch,
+    load_audit_report,
+    select_target_groups,
+    write_apply_log,
+)
 from mtg_notion_manager.services.audit_duplicates import (
     CATEGORY_AUTO,
     CATEGORY_EXCLUDED,
@@ -405,6 +416,135 @@ def audit_duplicates_command(
     console.print(f"  - {paths.json_path}")
     console.print(f"  - {paths.csv_path}")
     console.print(f"  - {paths.markdown_path}")
+
+
+@app.command(name="apply-dedupe-plan")
+def apply_dedupe_plan_command(
+    audit_report: str = typer.Option(..., "--audit-report", help="監査レポートJSONのパス"),
+    classification: str = typer.Option(
+        "auto", "--classification", help="対象とする分類(現在は auto のみ対応)"
+    ),
+    limit: int = typer.Option(
+        None, "--limit", help="適用する最大グループ数(低リスク順に上から切り出す)"
+    ),
+    offset: int = typer.Option(0, "--offset", help="低リスク順ソート後の開始位置"),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="計画の表示のみ行い、Notionへは書き込まない"
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="実際にNotionへ統合を書き込む(指定しない限り書き込まない)"
+    ),
+    output_dir: str = typer.Option(
+        "reports", "--output-dir", help="実行ログの出力先ディレクトリ"
+    ),
+) -> None:
+    """監査レポートの「自動統合可能」グループだけを、鮮度チェックのうえ段階適用する。
+
+    適用直前に対象カード名を現在のNotion状態で再監査し、分類やページ構成が
+    変化していればそのグループをスキップする(削除APIは一切使用しない)。
+    """
+    if classification != CATEGORY_AUTO:
+        console.print(
+            "[red]エラー:[/red] 現在は --classification auto のみサポートしています。"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=1)
+
+    try:
+        groups = load_audit_report(Path(audit_report), classification=classification)
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]エラー:[/red] 監査レポートを読み込めませんでした: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    targets = select_target_groups(groups, limit=limit, offset=offset)
+
+    console.print(f"対象グループ数: {len(targets)}")
+    table = Table(title="適用対象(低リスク順)")
+    table.add_column("カード名")
+    table.add_column("重複件数", justify="right")
+    table.add_column("採用デッキ件数(監査時)", justify="right")
+    table.add_column("推奨代表ページID")
+    for group in targets:
+        table.add_row(
+            group.card_name,
+            str(group.duplicate_count),
+            str(group.merged_deck_relation_count),
+            group.recommended_representative_id or "",
+        )
+    console.print(table)
+
+    if not targets:
+        console.print("対象がありません。")
+        raise typer.Exit(code=0)
+
+    exclusions = load_exclusions()
+    do_apply = apply and not dry_run
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            repo = DedupeRepository(client, config.card_data_source_id)
+            outcomes = apply_dedupe_batch(repo, targets, apply=do_apply, exclusions=exclusions)
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print()
+    result_table = Table(title="適用結果")
+    result_table.add_column("カード名")
+    result_table.add_column("結果")
+    result_table.add_column("代表ページID")
+    result_table.add_column("詳細/エラー")
+    for outcome in outcomes:
+        result_table.add_row(
+            outcome.card_name,
+            outcome.status,
+            outcome.representative_page_id or "",
+            outcome.error or outcome.reason,
+        )
+    console.print(result_table)
+
+    counts = {
+        STATUS_APPLIED: 0,
+        STATUS_PLANNED: 0,
+        STATUS_SKIPPED_STALE: 0,
+        STATUS_SKIPPED_NOT_DUPLICATE: 0,
+        STATUS_FAILED: 0,
+    }
+    for outcome in outcomes:
+        counts[outcome.status] += 1
+
+    console.print()
+    console.print(f"適用: {counts[STATUS_APPLIED]}件")
+    console.print(f"計画のみ(dry-run): {counts[STATUS_PLANNED]}件")
+    console.print(
+        f"スキップ(鮮度不一致): {counts[STATUS_SKIPPED_STALE]}件"
+    )
+    console.print(f"スキップ(重複解消済み): {counts[STATUS_SKIPPED_NOT_DUPLICATE]}件")
+    console.print(f"失敗: {counts[STATUS_FAILED]}件")
+
+    log_paths = write_apply_log(
+        outcomes, audit_report_path=audit_report, output_dir=Path(output_dir), applied=do_apply
+    )
+    console.print()
+    console.print(f"実行ログ: {log_paths.json_path}")
+
+    if not do_apply:
+        console.print(
+            "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません。[/cyan]"
+        )
+        raise typer.Exit(code=0)
+
+    if counts[STATUS_FAILED]:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":
