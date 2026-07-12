@@ -25,6 +25,21 @@ class MtgJpFetcher(BaseFetcher):
     def matches(self, url: str) -> bool:
         return urlparse(url).netloc.endswith("mtg-jp.com")
 
+    def list_deck_names(self, html: str, source_url: str) -> list[str]:
+        """記事内の全デッキ名を返す(MultipleDecksFoundErrorは送出しない)。"""
+        soup = BeautifulSoup(html, "lxml")
+        headings = _find_deck_headings(soup)
+        if not headings:
+            raise ParseError(
+                f"デッキ見出し(「デッキ名」形式のh4)が見つかりませんでした: {source_url}"
+            )
+        names = []
+        for h4 in headings:
+            match = _DECK_HEADING_RE.match(h4.get_text(strip=True))
+            assert match is not None
+            names.append(match.group(1))
+        return names
+
     def parse(self, html: str, source_url: str, deck_name: str | None = None) -> RawDeckData:
         soup = BeautifulSoup(html, "lxml")
 

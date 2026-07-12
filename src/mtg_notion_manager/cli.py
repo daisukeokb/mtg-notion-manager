@@ -13,6 +13,9 @@ from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
 from mtg_notion_manager.notion.writer import NotionWriter
 from mtg_notion_manager.preview import (
     print_apply_result,
+    print_article_apply_result,
+    print_article_deck_detail,
+    print_article_plan_summary,
     print_dedupe_apply_result,
     print_dedupe_plan,
     print_dedupe_schema_plan,
@@ -64,6 +67,14 @@ from mtg_notion_manager.services.audit_duplicates import (
 )
 from mtg_notion_manager.services.dedupe_cards import build_dedupe_plan, execute_dedupe_plan
 from mtg_notion_manager.services.doctor import run_doctor
+from mtg_notion_manager.services.import_article import (
+    STATUS_ERROR as ARTICLE_STATUS_ERROR,
+)
+from mtg_notion_manager.services.import_article import (
+    build_article_import_plan,
+    execute_article_import,
+    write_article_import_log,
+)
 from mtg_notion_manager.services.import_cards import build_import_cards_plan, execute_import_cards
 from mtg_notion_manager.services.import_deck import build_import_plan, execute_import
 from mtg_notion_manager.services.review_duplicate_conflicts import (
@@ -816,6 +827,82 @@ def apply_price_link_dedupe_command(
         raise typer.Exit(code=0)
 
     if counts[PRICE_STATUS_FAILED]:
+        raise typer.Exit(code=1)
+
+
+@app.command(name="import-article")
+def import_article_command(
+    url: str = typer.Argument(..., help="複数デッキを含む統率者デッキ紹介記事のURL"),
+    exclude_deck: list[str] = typer.Option(
+        None, "--exclude-deck", help="処理から除外するデッキ名(複数指定可)"
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="取得・解析・照合・差分表示のみ行い、Notionへは書き込まない"
+    ),
+    apply: bool = typer.Option(
+        False, "--apply", help="実際にNotionへ書き込む(指定しない限り書き込まない)"
+    ),
+    show_detail: bool = typer.Option(
+        False, "--detail/--no-detail", help="デッキごとのカード別詳細テーブルも表示する"
+    ),
+    output_dir: str = typer.Option("reports", "--output-dir", help="実行ログの出力先ディレクトリ"),
+) -> None:
+    """記事内の複数統率者デッキのカード一式を、まとめてMTGカードDBへ登録する。
+
+    各デッキはMTG統率者DBの既存デッキと完全一致で照合する(一致しないデッキは新規作成せず
+    要確認として扱う)。カードDBは記事全体で1回だけ取得して索引化し、全デッキで共有する。
+    曖昧一致など未解決のカードが1件でもあるデッキはそのデッキだけを止め、他の安全な
+    デッキの処理は継続する。削除APIは一切使用しない。
+    """
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=1)
+
+    do_apply = apply and not dry_run
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            writer = NotionWriter(client, config.commander_data_source_id)
+            card_repo = CardRepository(client, config.card_data_source_id)
+
+            plan = build_article_import_plan(
+                url, writer, card_repo, exclude_deck_names=exclude_deck or []
+            )
+
+            print_article_plan_summary(console, plan)
+            console.print()
+            if show_detail:
+                print_article_deck_detail(console, plan)
+
+            if do_apply:
+                plan = execute_article_import(plan, card_repo, note="import-article由来")
+                console.print()
+                print_article_apply_result(console, plan)
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    log_paths = write_article_import_log(plan, output_dir=Path(output_dir), applied=do_apply)
+    console.print()
+    console.print(f"実行ログ: {log_paths.json_path}")
+
+    if not do_apply:
+        console.print(
+            "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません。[/cyan]"
+        )
+        raise typer.Exit(code=0)
+
+    counts = plan.counts
+    has_apply_failures = any(
+        entry.apply_result is not None and entry.apply_result.failed for entry in plan.entries
+    )
+    if counts[ARTICLE_STATUS_ERROR] or has_apply_failures:
         raise typer.Exit(code=1)
 
 

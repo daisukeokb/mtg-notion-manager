@@ -28,14 +28,20 @@ from mtg_notion_manager.fetchers.wizards_official import _attr, _select_deck_tag
 from mtg_notion_manager.models import DeckCard, ParsedDeckList
 from mtg_notion_manager.parsers.card_names import normalize_card_name
 
-_WIZARDS_LINE_RE = re.compile(r"^(\d+)\s+(.+?)\s*(?:\[[^\]]*\])?\s*$")
+_WIZARDS_LINE_RE = re.compile(r"^(?:(\d+)\s+)?(.+?)\s*(?:\[[^\]]*\])?\s*$")
 
 COMMANDER_DECK_SIZE = 100
 
 
-def parse_decklist(url: str, deck_name: str | None = None) -> ParsedDeckList:
-    """URLからデッキ概要のURL判定を行い、対応するサイトのパーサーへ振り分ける。"""
-    html = download(url)
+def parse_decklist(
+    url: str, deck_name: str | None = None, html: str | None = None
+) -> ParsedDeckList:
+    """URLからデッキ概要のURL判定を行い、対応するサイトのパーサーへ振り分ける。
+
+    html を渡した場合はダウンロードを省略して再利用する
+    (1記事に複数デッキがある場合、記事全体で1回だけ取得すれば済むようにするため)。
+    """
+    html = html if html is not None else download(url)
     netloc = urlparse(url).netloc
     if netloc.endswith("mtg-jp.com"):
         return parse_mtg_jp_decklist(html, url, deck_name)
@@ -141,10 +147,18 @@ def _extract_preceding_quantity(anchor: Tag, source_url: str) -> int:
 
 
 def _parse_wizards_line(line: str, source_url: str) -> tuple[int, str]:
+    """デッキリスト1行を(枚数, カード名)に分解する。
+
+    公式ページの機械可読フォーマットには、全行に枚数が付く旧形式("1 Sol Ring")と、
+    枚数1のカードは省略され基本土地など複数枚のみ枚数が付く新形式("Sol Ring" /
+    "8 Plains [cardid]")の両方が存在するため、先頭の枚数は省略可能として扱う
+    (省略時は1枚として扱う)。
+    """
     match = _WIZARDS_LINE_RE.match(line)
     if match is None:
         raise ParseError(f"デッキリストの行を解析できませんでした: '{line}' ({source_url})")
-    return int(match.group(1)), match.group(2).strip()
+    quantity = int(match.group(1)) if match.group(1) is not None else 1
+    return quantity, match.group(2).strip()
 
 
 def _aggregate_cards(

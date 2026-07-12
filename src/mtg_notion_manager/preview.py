@@ -6,6 +6,11 @@ from rich.console import Console
 from rich.table import Table
 
 from mtg_notion_manager.services.dedupe_cards import DedupeApplyResult, DedupePlan
+from mtg_notion_manager.services.import_article import (
+    STATUS_LABELS,
+    STATUS_READY,
+    ArticleImportPlan,
+)
 from mtg_notion_manager.services.import_cards import ImportCardsPlan, ImportCardsResult
 
 
@@ -138,3 +143,102 @@ def print_dedupe_apply_result(console: Console, result: DedupeApplyResult) -> No
             "[red]失敗したグループがあります。同じコマンドを再実行してください"
             "(既に統合済みのページは再処理されません)。[/red]"
         )
+
+
+def print_article_plan_summary(console: Console, plan: ArticleImportPlan) -> None:
+    counts = plan.counts
+    console.print(f"検出デッキ数: {len(plan.all_deck_names)}")
+    if plan.excluded_deck_names:
+        console.print(f"除外デッキ: {', '.join(plan.excluded_deck_names)}")
+    console.print(f"処理可能: {counts[STATUS_READY]}")
+    console.print(f"要確認: {counts['needs_review']}")
+    console.print(f"エラー: {counts['error']}")
+    console.print()
+
+    table = Table(title="デッキ別サマリー")
+    table.add_column("デッキ名")
+    table.add_column("状態")
+    table.add_column("抽出枚数", justify="right")
+    table.add_column("ユニーク", justify="right")
+    table.add_column("既存", justify="right")
+    table.add_column("新規", justify="right")
+    table.add_column("リレーション追加", justify="right")
+    table.add_column("変更なし", justify="right")
+    table.add_column("曖昧一致", justify="right")
+    table.add_column("エラー", justify="right")
+    table.add_column("備考")
+
+    for entry in plan.entries:
+        if entry.cards_plan is not None:
+            counts_by_action = entry.cards_plan.summary
+            parsed = entry.cards_plan.parsed
+            existing = counts_by_action.get("relation_update", 0) + counts_by_action.get(
+                "unchanged", 0
+            )
+            table.add_row(
+                entry.deck_name,
+                STATUS_LABELS[entry.status],
+                str(parsed.total_quantity),
+                str(len(parsed.cards)),
+                str(existing),
+                str(counts_by_action.get("create", 0)),
+                str(counts_by_action.get("relation_update", 0)),
+                str(counts_by_action.get("unchanged", 0)),
+                str(counts_by_action.get("ambiguous", 0)),
+                str(counts_by_action.get("error", 0)),
+                entry.reason,
+            )
+        else:
+            table.add_row(
+                entry.deck_name,
+                STATUS_LABELS[entry.status],
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                entry.reason,
+            )
+    console.print(table)
+
+
+def print_article_deck_detail(console: Console, plan: ArticleImportPlan) -> None:
+    for entry in plan.entries:
+        console.print(f"[bold]デッキ: {entry.deck_name}[/bold] ({STATUS_LABELS[entry.status]})")
+        if entry.reason:
+            console.print(f"  理由: {entry.reason}")
+        if entry.cards_plan is not None:
+            print_plan_detail(console, entry.cards_plan)
+        console.print()
+
+
+def print_article_apply_result(console: Console, plan: ArticleImportPlan) -> None:
+    table = Table(title="デッキ別適用結果")
+    table.add_column("デッキ名")
+    table.add_column("状態")
+    table.add_column("作成")
+    table.add_column("リレーション追加")
+    table.add_column("変更なし")
+    table.add_column("失敗")
+    table.add_column("備考")
+
+    for entry in plan.entries:
+        if entry.apply_result is not None:
+            results = entry.apply_result.results
+            table.add_row(
+                entry.deck_name,
+                STATUS_LABELS[entry.status],
+                str(sum(1 for r in results if r.action == "created")),
+                str(sum(1 for r in results if r.action == "relation_updated")),
+                str(sum(1 for r in results if r.action == "unchanged")),
+                str(sum(1 for r in results if r.action == "failed")),
+                entry.reason,
+            )
+        else:
+            table.add_row(
+                entry.deck_name, STATUS_LABELS[entry.status], "-", "-", "-", "-", entry.reason
+            )
+    console.print(table)

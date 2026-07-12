@@ -71,6 +71,28 @@ class TestWizardsOfficialFetcher:
                 deck_name="存在しないデッキ",
             )
 
+    def test_list_deck_names_returns_all_without_raising(self) -> None:
+        html = _read_fixture("wizards_multi_deck.html")
+        fetcher = WizardsOfficialFetcher()
+
+        names = fetcher.list_deck_names(
+            html,
+            "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists",
+        )
+
+        assert names == ["Animated Army", "Family Matters"]
+
+    def test_list_deck_names_single_deck(self) -> None:
+        html = _read_fixture("wizards_single_deck.html")
+        fetcher = WizardsOfficialFetcher()
+
+        names = fetcher.list_deck_names(
+            html,
+            "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists",
+        )
+
+        assert names == ["Animated Army"]
+
 
 class TestMtgJpFetcher:
     def test_matches_mtgjp_domain(self) -> None:
@@ -119,6 +141,22 @@ class TestMtgJpFetcher:
                 "https://mtg-jp.com/reading/publicity/0038046/",
                 deck_name="存在しないデッキ",
             )
+
+    def test_list_deck_names_returns_all_without_raising(self) -> None:
+        html = _read_fixture("mtgjp_multi_deck.html")
+        fetcher = MtgJpFetcher()
+
+        names = fetcher.list_deck_names(html, "https://mtg-jp.com/reading/publicity/0038046/")
+
+        assert names == ["動き出した兵隊", "家族が第一"]
+
+    def test_list_deck_names_single_deck(self) -> None:
+        html = _read_fixture("mtgjp_single_deck.html")
+        fetcher = MtgJpFetcher()
+
+        names = fetcher.list_deck_names(html, "https://mtg-jp.com/reading/publicity/0038046/")
+
+        assert names == ["動き出した兵隊"]
 
 
 class TestGetFetcher:

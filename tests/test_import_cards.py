@@ -75,7 +75,9 @@ def _existing(page_id: str) -> ExistingCard:
 class TestBuildImportCardsPlan:
     def test_new_card_is_classified_as_create(self, monkeypatch: pytest.MonkeyPatch) -> None:
         card = _card("新カード")
-        monkeypatch.setattr(import_cards, "parse_decklist", lambda url, deck_name: _parsed([card]))
+        monkeypatch.setattr(
+            import_cards, "parse_decklist", lambda url, deck_name, html=None: _parsed([card])
+        )
         repo = FakeCardRepository()
 
         plan = import_cards.build_import_cards_plan(
@@ -91,7 +93,9 @@ class TestBuildImportCardsPlan:
     ) -> None:
         card = _card("既存カード")
         existing = _existing("p1")
-        monkeypatch.setattr(import_cards, "parse_decklist", lambda url, deck_name: _parsed([card]))
+        monkeypatch.setattr(
+            import_cards, "parse_decklist", lambda url, deck_name, html=None: _parsed([card])
+        )
         repo = FakeCardRepository(
             matches={"既存カード": CardMatch(card=existing, ambiguous_candidates=[])},
             deck_relation_ids={"p1": [DECK_PAGE_ID]},
@@ -109,7 +113,9 @@ class TestBuildImportCardsPlan:
     ) -> None:
         card = _card("既存カード")
         existing = _existing("p1")
-        monkeypatch.setattr(import_cards, "parse_decklist", lambda url, deck_name: _parsed([card]))
+        monkeypatch.setattr(
+            import_cards, "parse_decklist", lambda url, deck_name, html=None: _parsed([card])
+        )
         repo = FakeCardRepository(
             matches={"既存カード": CardMatch(card=existing, ambiguous_candidates=[])},
             deck_relation_ids={"p1": []},
@@ -127,7 +133,9 @@ class TestBuildImportCardsPlan:
     ) -> None:
         card = _card("曖昧カード")
         candidates = [_existing("p1"), _existing("p2")]
-        monkeypatch.setattr(import_cards, "parse_decklist", lambda url, deck_name: _parsed([card]))
+        monkeypatch.setattr(
+            import_cards, "parse_decklist", lambda url, deck_name, html=None: _parsed([card])
+        )
         repo = FakeCardRepository(
             matches={"曖昧カード": CardMatch(card=None, ambiguous_candidates=candidates)}
         )
@@ -141,7 +149,9 @@ class TestBuildImportCardsPlan:
 
     def test_summary_counts_match_decisions(self, monkeypatch: pytest.MonkeyPatch) -> None:
         cards = [_card("新カード1"), _card("新カード2")]
-        monkeypatch.setattr(import_cards, "parse_decklist", lambda url, deck_name: _parsed(cards))
+        monkeypatch.setattr(
+            import_cards, "parse_decklist", lambda url, deck_name, html=None: _parsed(cards)
+        )
         repo = FakeCardRepository()
 
         plan = import_cards.build_import_cards_plan(

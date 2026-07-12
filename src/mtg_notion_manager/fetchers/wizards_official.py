@@ -34,6 +34,14 @@ class WizardsOfficialFetcher(BaseFetcher):
     def matches(self, url: str) -> bool:
         return urlparse(url).netloc.endswith("magic.wizards.com")
 
+    def list_deck_names(self, html: str, source_url: str) -> list[str]:
+        """記事内の全デッキ名を返す(MultipleDecksFoundErrorは送出しない)。"""
+        soup = BeautifulSoup(html, "lxml")
+        deck_list_tags = soup.find_all("deck-list")
+        if len(deck_list_tags) == 0:
+            raise ParseError(f"デッキリストが見つかりませんでした: {source_url}")
+        return [_attr(tag, "deck-title").strip() for tag in deck_list_tags]
+
     def parse(self, html: str, source_url: str, deck_name: str | None = None) -> RawDeckData:
         soup = BeautifulSoup(html, "lxml")
 

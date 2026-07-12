@@ -68,9 +68,13 @@ def build_import_cards_plan(
     card_repo: CardRepository,
     deck_name: str | None = None,
     allow_count_mismatch: bool = False,
+    html: str | None = None,
 ) -> ImportCardsPlan:
-    """URLからカード100枚を抽出し、カードDBと照合して計画を作る(書き込みなし)。"""
-    parsed = parse_decklist(url, deck_name)
+    """URLからカード100枚を抽出し、カードDBと照合して計画を作る(書き込みなし)。
+
+    html を渡した場合はダウンロードを省略して再利用する。
+    """
+    parsed = parse_decklist(url, deck_name, html=html)
     validate_deck_count(parsed, allow_mismatch=allow_count_mismatch)
 
     card_repo.load()
