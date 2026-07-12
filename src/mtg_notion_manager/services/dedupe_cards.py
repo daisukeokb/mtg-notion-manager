@@ -189,7 +189,21 @@ def _use_manual_representative(
     )
 
 
-def _choose_representative(repo: DedupeRepository, pages: list[dict]) -> RepresentativeChoice:
+@dataclass(frozen=True)
+class RepresentativeEvaluation:
+    """代表レコード選択の評価結果(例外を送出しない版)。
+
+    winner が None の場合は同点で自動決定できないことを意味し、
+    tied_candidates に同点候補が入る(audit-duplicates で利用する)。
+    """
+
+    winner: dict | None
+    reasons: list[str]
+    tied_candidates: list[dict] = field(default_factory=list)
+
+
+def evaluate_representative(repo: DedupeRepository, pages: list[dict]) -> RepresentativeEvaluation:
+    """代表レコード候補を評価する(同点でも例外を出さず結果を返す)。"""
     scored = []
     for page in pages:
         has_english = bool(_plain_text(page, ENGLISH_NAME_PROPERTY))
@@ -211,18 +225,29 @@ def _choose_representative(repo: DedupeRepository, pages: list[dict]) -> Represe
         oldest_created = tied_sorted[0][5]
         still_tied = [item for item in tied_sorted if item[5] == oldest_created]
         if len(still_tied) > 1:
-            candidates = ", ".join(item[0].get("url", item[0]["id"]) for item in still_tied)
-            raise RepresentativeSelectionError(
-                f"代表レコードを一意に決定できません(候補: {candidates})。"
-                " --representative-page-id で手動指定してください。"
+            return RepresentativeEvaluation(
+                winner=None, reasons=[], tied_candidates=[item[0] for item in still_tied]
             )
         winner = tied_sorted[0][0]
         reasons = _describe_reasons(tied_sorted[0], tie_broken_by_created=True)
-        return RepresentativeChoice(page=winner, reasons=reasons)
+        return RepresentativeEvaluation(winner=winner, reasons=reasons)
 
     winner = ranked[0][0]
     reasons = _describe_reasons(ranked[0])
-    return RepresentativeChoice(page=winner, reasons=reasons)
+    return RepresentativeEvaluation(winner=winner, reasons=reasons)
+
+
+def _choose_representative(repo: DedupeRepository, pages: list[dict]) -> RepresentativeChoice:
+    evaluation = evaluate_representative(repo, pages)
+    if evaluation.winner is None:
+        candidates = ", ".join(
+            p.get("url", p["id"]) for p in evaluation.tied_candidates
+        )
+        raise RepresentativeSelectionError(
+            f"代表レコードを一意に決定できません(候補: {candidates})。"
+            " --representative-page-id で手動指定してください。"
+        )
+    return RepresentativeChoice(page=evaluation.winner, reasons=evaluation.reasons)
 
 
 def _describe_reasons(scored_item: tuple, tie_broken_by_created: bool = False) -> list[str]:

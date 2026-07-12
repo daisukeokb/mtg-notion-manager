@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import typer
 from rich.console import Console
@@ -17,6 +18,16 @@ from mtg_notion_manager.preview import (
     print_dedupe_schema_plan,
     print_plan_detail,
     print_plan_summary,
+)
+from mtg_notion_manager.services.audit_duplicates import (
+    CATEGORY_AUTO,
+    CATEGORY_EXCLUDED,
+    CATEGORY_LABELS,
+    CATEGORY_MANUAL_REPRESENTATIVE,
+    CATEGORY_NEEDS_REVIEW,
+    audit_duplicate_groups,
+    load_exclusions,
+    write_audit_reports,
 )
 from mtg_notion_manager.services.dedupe_cards import build_dedupe_plan, execute_dedupe_plan
 from mtg_notion_manager.services.doctor import run_doctor
@@ -340,6 +351,60 @@ def dedupe_cards_command(
     except MtgNotionManagerError as exc:
         console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+
+@app.command(name="audit-duplicates")
+def audit_duplicates_command(
+    card_name: str = typer.Option(
+        None, "--card-name", help="対象カード名を1件に絞り込む(省略時は全重複グループ)"
+    ),
+    output_dir: str = typer.Option(
+        "reports", "--output-dir", help="レポート(JSON/CSV/Markdown)の出力先ディレクトリ"
+    ),
+) -> None:
+    """残りの重複カードグループを監査し、統合可否を分類したレポートを出力する。
+
+    Notionへは一切書き込まない(読み取り専用)。
+    """
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=1)
+
+    exclusions = load_exclusions()
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            repo = DedupeRepository(client, config.card_data_source_id)
+            audits = audit_duplicate_groups(repo, card_name=card_name, exclusions=exclusions)
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    paths = write_audit_reports(audits, Path(output_dir))
+
+    counts = {category: 0 for category in CATEGORY_LABELS}
+    for audit in audits:
+        counts[audit.category] += 1
+
+    console.print(f"全グループ数: {len(audits)}")
+    console.print(f"{CATEGORY_LABELS[CATEGORY_AUTO]}: {counts[CATEGORY_AUTO]}")
+    console.print(f"{CATEGORY_LABELS[CATEGORY_NEEDS_REVIEW]}: {counts[CATEGORY_NEEDS_REVIEW]}")
+    console.print(
+        f"{CATEGORY_LABELS[CATEGORY_MANUAL_REPRESENTATIVE]}: "
+        f"{counts[CATEGORY_MANUAL_REPRESENTATIVE]}"
+    )
+    console.print(f"{CATEGORY_LABELS[CATEGORY_EXCLUDED]}: {counts[CATEGORY_EXCLUDED]}")
+    console.print()
+    console.print("レポートを出力しました:")
+    console.print(f"  - {paths.json_path}")
+    console.print(f"  - {paths.csv_path}")
+    console.print(f"  - {paths.markdown_path}")
 
 
 if __name__ == "__main__":
