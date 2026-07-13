@@ -15,11 +15,21 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from mtg_notion_manager.exceptions import AmbiguousCardMatchError, NotionAPIError
-from mtg_notion_manager.models import CardDecision, DeckCard, ParsedDeckList
+from mtg_notion_manager.models import (
+    BLOCKED_CREATION_ACTIONS,
+    CardDecision,
+    DeckCard,
+    ParsedDeckList,
+)
 from mtg_notion_manager.notion.card_repository import CardRepository
 from mtg_notion_manager.parsers.decklist import parse_decklist, validate_deck_count
+from mtg_notion_manager.services.card_resolution import (
+    ConfirmedCardMapping,
+    UnverifiedNewCardError,
+    resolve_new_card,
+)
 
-BLOCKING_ACTIONS = {"ambiguous", "error"}
+BLOCKING_ACTIONS = {"ambiguous", "error"} | BLOCKED_CREATION_ACTIONS
 
 
 @dataclass(frozen=True)
@@ -69,22 +79,40 @@ def build_import_cards_plan(
     deck_name: str | None = None,
     allow_count_mismatch: bool = False,
     html: str | None = None,
+    confirmed_mapping: ConfirmedCardMapping | None = None,
 ) -> ImportCardsPlan:
     """URLからカード100枚を抽出し、カードDBと照合して計画を作る(書き込みなし)。
 
     html を渡した場合はダウンロードを省略して再利用する。
+
+    confirmed_mapping を指定した場合、カードDB内に一致がなく記事からも日本語名が
+    取得できないカード(英語記事由来の新規カード)は、このマッピングで人間が
+    確認済みのカードに限り新規作成対象(action="create")として扱う。
+    指定しない場合、そうしたカードは action が BLOCKED_CREATION_ACTIONS のいずれかになり、
+    execute_import_cards() は一切書き込みを行わない
+    (services.card_resolution.resolve_new_card() 参照)。
     """
     parsed = parse_decklist(url, deck_name, html=html)
     validate_deck_count(parsed, allow_mismatch=allow_count_mismatch)
 
     card_repo.load()
 
-    decisions = [_decide(card, deck_page_id, card_repo) for card in parsed.cards]
+    decisions = [
+        _decide(card, deck_page_id, card_repo, url, parsed.deck_name, confirmed_mapping)
+        for card in parsed.cards
+    ]
 
     return ImportCardsPlan(parsed=parsed, deck_page_id=deck_page_id, decisions=decisions)
 
 
-def _decide(card: DeckCard, deck_page_id: str, card_repo: CardRepository) -> CardDecision:
+def _decide(
+    card: DeckCard,
+    deck_page_id: str,
+    card_repo: CardRepository,
+    article_url: str,
+    deck_name: str,
+    confirmed_mapping: ConfirmedCardMapping | None,
+) -> CardDecision:
     match = card_repo.find_match(card)
 
     if match.is_ambiguous:
@@ -96,7 +124,20 @@ def _decide(card: DeckCard, deck_page_id: str, card_repo: CardRepository) -> Car
         )
 
     if match.card is None:
-        return CardDecision(card=card, action="create")
+        resolution = resolve_new_card(
+            card,
+            article_url=article_url,
+            deck_name=deck_name,
+            confirmed_mapping=confirmed_mapping,
+        )
+        if resolution.is_blocked:
+            return CardDecision(
+                card=card,
+                action=resolution.resolution_status,
+                detail=resolution.block_reason or "",
+                resolution=resolution,
+            )
+        return CardDecision(card=card, action="create", resolution=resolution)
 
     existing = match.card
     current_deck_ids = card_repo.get_deck_relation_ids(existing)
@@ -142,17 +183,38 @@ def execute_import_cards(
 
     results: list[CardApplyResult] = []
     for decision in plan.decisions:
-        results.append(_apply_one(decision, plan.deck_page_id, card_repo, note))
+        results.append(_apply_one(decision, plan.deck_page_id, card_repo, note, plan.parsed))
 
     return ImportCardsResult(results=results)
 
 
 def _apply_one(
-    decision: CardDecision, deck_page_id: str, card_repo: CardRepository, note: str
+    decision: CardDecision,
+    deck_page_id: str,
+    card_repo: CardRepository,
+    note: str,
+    parsed: ParsedDeckList,
 ) -> CardApplyResult:
     try:
         if decision.action == "create":
-            page = card_repo.create_card(decision.card, deck_page_id, note=note)
+            # 書き込み境界の防御: resolution.verified_card が無い場合(例えば
+            # CardDecisionが計画外で直接組み立てられた場合)でも、未検証のDeckCardを
+            # そのままcreate_card()へ渡さず、必ずresolve_new_card()を通す。
+            verified = decision.resolution.verified_card if decision.resolution else None
+            if verified is None:
+                resolution = resolve_new_card(
+                    decision.card,
+                    article_url=parsed.source_url,
+                    deck_name=parsed.deck_name,
+                    confirmed_mapping=None,
+                )
+                if resolution.verified_card is None:
+                    raise UnverifiedNewCardError(
+                        f"カード '{decision.card.display_name}' は日本語名が未確認のため"
+                        " 新規作成できません(安全機構違反)。"
+                    )
+                verified = resolution.verified_card
+            page = card_repo.create_card(verified, deck_page_id, note=note)
             return CardApplyResult(
                 card=decision.card,
                 action="created",

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 from typer.testing import CliRunner
 
@@ -16,6 +18,12 @@ from mtg_notion_manager.services.import_cards import (
 runner = CliRunner()
 URL = "https://mtg-jp.com/reading/publicity/0035593/"
 DECK_PAGE_ID = "39aa97c8-7142-81cb-af6e-d7a0446dea2c"
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain_help_text(stdout: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", stdout).replace("\n", "")
 
 
 def _fake_config() -> Config:
@@ -69,14 +77,26 @@ def _patch_notion_client(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _patch_build_plan(
+    monkeypatch: pytest.MonkeyPatch, decisions: list[CardDecision] | None = None
+) -> None:
+    def _fake_build_plan(
+        url: str,
+        deck_page_id: str,
+        repo: object,
+        deck_name: str | None = None,
+        allow_count_mismatch: bool = False,
+        confirmed_mapping: object = None,
+    ) -> ImportCardsPlan:
+        return _sample_plan(decisions)
+
+    monkeypatch.setattr(cli, "build_import_cards_plan", _fake_build_plan)
+
+
 def test_dry_run_shows_summary_and_does_not_apply(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion_client(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "build_import_cards_plan",
-        lambda url, deck_page_id, repo, deck_name=None, allow_count_mismatch=False: _sample_plan(),
-    )
+    _patch_build_plan(monkeypatch)
     executed = {"value": False}
     monkeypatch.setattr(
         cli,
@@ -100,11 +120,7 @@ def test_dry_run_shows_summary_and_does_not_apply(monkeypatch: pytest.MonkeyPatc
 def test_without_apply_flag_does_not_write(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion_client(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "build_import_cards_plan",
-        lambda url, deck_page_id, repo, deck_name=None, allow_count_mismatch=False: _sample_plan(),
-    )
+    _patch_build_plan(monkeypatch)
     executed = {"value": False}
     monkeypatch.setattr(
         cli,
@@ -121,11 +137,7 @@ def test_without_apply_flag_does_not_write(monkeypatch: pytest.MonkeyPatch) -> N
 def test_apply_executes_and_reports_result(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion_client(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "build_import_cards_plan",
-        lambda url, deck_page_id, repo, deck_name=None, allow_count_mismatch=False: _sample_plan(),
-    )
+    _patch_build_plan(monkeypatch)
 
     apply_result = ImportCardsResult(
         results=[
@@ -147,11 +159,7 @@ def test_apply_executes_and_reports_result(monkeypatch: pytest.MonkeyPatch) -> N
 def test_apply_with_failed_card_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion_client(monkeypatch)
-    monkeypatch.setattr(
-        cli,
-        "build_import_cards_plan",
-        lambda url, deck_page_id, repo, deck_name=None, allow_count_mismatch=False: _sample_plan(),
-    )
+    _patch_build_plan(monkeypatch)
     apply_result = ImportCardsResult(
         results=[
             CardApplyResult(card=_card("失敗カード"), action="failed", error="接続エラー"),
@@ -170,13 +178,7 @@ def test_ambiguous_match_error_is_reported(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion_client(monkeypatch)
     decisions = [CardDecision(card=_card("曖昧カード"), action="ambiguous", detail="2件の候補")]
-    monkeypatch.setattr(
-        cli,
-        "build_import_cards_plan",
-        lambda url, deck_page_id, repo, deck_name=None, allow_count_mismatch=False: _sample_plan(
-            decisions
-        ),
-    )
+    _patch_build_plan(monkeypatch, decisions)
 
     def _raise(*args: object, **kwargs: object) -> None:
         raise AmbiguousCardMatchError("曖昧一致のため中止しました")
@@ -235,6 +237,7 @@ def test_deck_lookup_by_name_when_page_id_omitted(monkeypatch: pytest.MonkeyPatc
         repo: object,
         deck_name: str | None = None,
         allow_count_mismatch: bool = False,
+        confirmed_mapping: object = None,
     ) -> ImportCardsPlan:
         captured["deck_page_id"] = deck_page_id
         return _sample_plan()
@@ -267,3 +270,10 @@ def test_deck_not_found_by_name_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert result.exit_code == 1
+
+
+def test_help_mentions_confirmed_card_map() -> None:
+    result = runner.invoke(cli.app, ["import-cards", "--help"])
+
+    assert result.exit_code == 0
+    assert "--confirmed-card-map" in _plain_help_text(result.stdout)

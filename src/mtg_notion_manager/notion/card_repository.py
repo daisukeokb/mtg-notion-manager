@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 from mtg_notion_manager.card_match_overrides import CardMatchOverrides
 from mtg_notion_manager.exceptions import CardMatchOverrideError
-from mtg_notion_manager.models import DeckCard, ExistingCard
+from mtg_notion_manager.models import DeckCard, ExistingCard, VerifiedNewCard
 from mtg_notion_manager.notion.client import NotionClient
 from mtg_notion_manager.parsers.card_names import normalize_card_name
 
@@ -173,10 +173,17 @@ class CardRepository:
             return {"id": existing.page_id, "url": existing.page_url}
         return self._client.update_page(existing.page_id, properties)
 
-    def create_card(self, card: DeckCard, deck_page_id: str, note: str = "") -> dict:
-        """新規カードを作成する。確実に取得できた項目のみ設定する。"""
+    def create_card(self, card: VerifiedNewCard, deck_page_id: str, note: str = "") -> dict:
+        """新規カードを作成する。確実に取得できた項目のみ設定する。
+
+        card は VerifiedNewCard のみを受け取る(未検証の DeckCard を直接渡すことは
+        できない)。name_ja は VerifiedNewCard のコンストラクタで既に
+        確認済み(provenanceがarticle_japanese_name/explicit_human_confirmation)
+        であることが保証されているため、display_nameのような英語名フォールバックは
+        一切使わない。
+        """
         properties: dict = {
-            TITLE_PROPERTY: {"title": [{"text": {"content": card.display_name}}]},
+            TITLE_PROPERTY: {"title": [{"text": {"content": card.name_ja}}]},
             OWNED_PROPERTY: {"checkbox": True},
             DECKS_RELATION_PROPERTY: {"relation": [{"id": deck_page_id}]},
         }

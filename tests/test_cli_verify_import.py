@@ -227,6 +227,7 @@ class TestExecutionErrorExitCode:
             card_repo: object,
             include_deck_names=None,
             deck_page_map_path=None,
+            confirmed_card_map_path=None,
         ):
             raise NotionAPIError("Notion API呼び出しに失敗しました (500): boom")
 
@@ -250,6 +251,7 @@ class TestExecutionErrorExitCode:
             card_repo: object,
             include_deck_names=None,
             deck_page_map_path=None,
+            confirmed_card_map_path=None,
         ):
             raise NotionAPIError("timeout")
 
@@ -277,6 +279,7 @@ class TestIncludeDeckOption:
             card_repo: object,
             include_deck_names=None,
             deck_page_map_path=None,
+            confirmed_card_map_path=None,
         ):
             captured["include_deck_names"] = include_deck_names
             return _report([_verified_entry("プリズマリの技巧")])
@@ -313,6 +316,7 @@ class TestIncludeDeckOption:
             card_repo: object,
             include_deck_names=None,
             deck_page_map_path=None,
+            confirmed_card_map_path=None,
         ):
             captured["include_deck_names"] = include_deck_names
             return _report([_verified_entry("A"), _verified_entry("B")])
@@ -407,6 +411,13 @@ def test_help_mentions_deck_page_map() -> None:
     assert "--deck-page-map" in _plain_help_text(result.stdout)
 
 
+def test_help_mentions_confirmed_card_map() -> None:
+    result = runner.invoke(cli.app, ["verify-import", "--help"])
+
+    assert result.exit_code == 0
+    assert "--confirmed-card-map" in _plain_help_text(result.stdout)
+
+
 def test_plain_help_text_strips_ansi_and_wrapping() -> None:
     """CI環境でrichが折り返し・色付けした--help出力でも検出できることを確認する
     (GitHub Actions run 29240645584 で実際に発生した失敗の再現)。
@@ -431,6 +442,7 @@ def test_deck_page_map_path_is_passed_through(
         card_repo: object,
         include_deck_names=None,
         deck_page_map_path=None,
+        confirmed_card_map_path=None,
     ):
         captured["deck_page_map_path"] = deck_page_map_path
         return _report([_verified_entry()])

@@ -37,6 +37,13 @@ from mtg_notion_manager.fetchers.base import download
 from mtg_notion_manager.models import CardDecision
 from mtg_notion_manager.notion.card_repository import CardRepository
 from mtg_notion_manager.notion.writer import NotionWriter
+from mtg_notion_manager.services.card_resolution import (
+    ConfirmedCardMapping,
+    PendingCardManifest,
+    build_pending_manifest,
+    load_confirmed_card_mapping,
+    summarize_decisions,
+)
 from mtg_notion_manager.services.deck_page_mapping import (
     DeckPageMapping,
     load_deck_page_mapping,
@@ -79,6 +86,7 @@ class ArticleImportPlan:
     all_deck_names: list[str]
     excluded_deck_names: list[str]
     entries: list[DeckArticleEntry]
+    pending_manifest: PendingCardManifest | None = None
 
     @property
     def counts(self) -> dict[str, int]:
@@ -86,6 +94,22 @@ class ArticleImportPlan:
         for entry in self.entries:
             counts[entry.status] += 1
         return counts
+
+    @property
+    def is_fully_applicable(self) -> bool:
+        """今回の対象範囲(全デッキ・全カード)のplanが全件成功しているか。
+
+        1件でも要確認・エラー・identity conflictがあれば、execute_article_import()は
+        対象範囲のどのデッキへも一切書き込みを行わない(デッキ単位でplanとwriteを
+        交互に行わないための全体ゲート)。
+        """
+        if not self.entries:
+            return False
+        if any(entry.status != STATUS_READY for entry in self.entries):
+            return False
+        if self.pending_manifest is not None and self.pending_manifest.conflicted_stable_keys:
+            return False
+        return True
 
 
 def build_article_import_plan(
@@ -96,6 +120,7 @@ def build_article_import_plan(
     include_deck_names: list[str] | None = None,
     allow_count_mismatch: bool = False,
     deck_page_map_path: Path | None = None,
+    confirmed_card_map_path: Path | None = None,
 ) -> ArticleImportPlan:
     """記事HTMLを1回だけ取得し、記事内の全デッキを解析・検証する(Notionへの書き込みなし)。
 
@@ -106,6 +131,11 @@ def build_article_import_plan(
     明示的な対応(config/deck_page_mapping.example.json 参照)を読み込み・検証し、
     名前完全一致より優先して使う(record_page_mapping.resolve_deck_page() 参照)。
     指定しない場合は従来どおり名前完全一致のみで解決する。
+
+    confirmed_card_map_path を指定した場合、記事から日本語名が取得できない新規カード
+    (英語記事由来)について、人間確認済みマッピング(config/confirmed_card_mapping.example.json
+    参照)で確認済みのカードのみ新規作成対象として扱う。指定しない場合、そうした
+    カードは全て確認待ち(blocked_missing_japanese_name)として新規作成をブロックする。
     """
     exclude_deck_names = exclude_deck_names or []
     include_deck_names = include_deck_names or []
@@ -117,6 +147,10 @@ def build_article_import_plan(
     if deck_page_map_path is not None:
         mapping = load_deck_page_mapping(deck_page_map_path, url, all_deck_names)
 
+    confirmed_mapping: ConfirmedCardMapping | None = None
+    if confirmed_card_map_path is not None:
+        confirmed_mapping = load_confirmed_card_mapping(confirmed_card_map_path, url)
+
     target_names = [name for name in all_deck_names if name not in exclude_deck_names]
     if include_deck_names:
         target_names = [name for name in target_names if name in include_deck_names]
@@ -124,15 +158,27 @@ def build_article_import_plan(
     card_repo.load()
 
     entries = [
-        _build_one_deck_entry(url, html, name, writer, card_repo, allow_count_mismatch, mapping)
+        _build_one_deck_entry(
+            url, html, name, writer, card_repo, allow_count_mismatch, mapping, confirmed_mapping
+        )
         for name in target_names
     ]
+
+    all_resolutions = [
+        decision.resolution
+        for entry in entries
+        if entry.cards_plan is not None
+        for decision in entry.cards_plan.decisions
+        if decision.resolution is not None
+    ]
+    pending_manifest = build_pending_manifest(url, all_resolutions) if all_resolutions else None
 
     return ArticleImportPlan(
         source_url=url,
         all_deck_names=all_deck_names,
         excluded_deck_names=[n for n in exclude_deck_names if n in all_deck_names],
         entries=entries,
+        pending_manifest=pending_manifest,
     )
 
 
@@ -144,6 +190,7 @@ def _build_one_deck_entry(
     card_repo: CardRepository,
     allow_count_mismatch: bool,
     mapping: DeckPageMapping | None,
+    confirmed_mapping: ConfirmedCardMapping | None,
 ) -> DeckArticleEntry:
     resolution = resolve_deck_page(deck_name, writer, mapping)
     if not resolution.resolved:
@@ -169,6 +216,7 @@ def _build_one_deck_entry(
             deck_name=deck_name,
             allow_count_mismatch=allow_count_mismatch,
             html=html,
+            confirmed_mapping=confirmed_mapping,
         )
     except MtgNotionManagerError as exc:
         return DeckArticleEntry(
@@ -206,10 +254,20 @@ def _build_one_deck_entry(
 def execute_article_import(
     plan: ArticleImportPlan, card_repo: CardRepository, note: str = ""
 ) -> ArticleImportPlan:
-    """処理可能(ready)なデッキのみ、デッキ単位で個別に適用する。
+    """今回の対象範囲(全デッキ・全カード)のplanが全件成功している場合のみ適用する。
 
-    1デッキの失敗が他デッキの結果を失わせないよう、デッキごとに独立して例外を捕捉する。
+    plan.is_fully_applicable が False の場合(1件でも要確認・エラー・
+    identity conflictがある場合)は、対象範囲のどのデッキへも一切書き込みを行わず、
+    planをそのまま返す(カードページ作成・更新、relation追加・削除、
+    統率者ページ更新のいずれも0件)。デッキ単位でplanとwriteを交互に行わない
+    (安全不変条件: 全件のpreflightが成功するまでNotion書き込みを1件も開始しない)。
+
+    全件成功している場合でも、デッキごとに独立して例外を捕捉する
+    (Notion API呼び出し自体の失敗は、他デッキの結果を失わせない)。
     """
+    if not plan.is_fully_applicable:
+        return plan
+
     new_entries = []
     for entry in plan.entries:
         if entry.status != STATUS_READY or entry.cards_plan is None:
@@ -247,6 +305,7 @@ def execute_article_import(
         all_deck_names=plan.all_deck_names,
         excluded_deck_names=plan.excluded_deck_names,
         entries=new_entries,
+        pending_manifest=plan.pending_manifest,
     )
 
 
@@ -297,16 +356,27 @@ def _entry_to_dict(entry: DeckArticleEntry) -> dict:
     if entry.cards_plan is not None:
         parsed = entry.cards_plan.parsed
         counts = entry.cards_plan.summary
+        resolution_summary = summarize_decisions(entry.cards_plan.decisions)
         result["extracted_quantity"] = parsed.total_quantity
         result["unique_card_count"] = len(parsed.cards)
         result["existing_card_count"] = counts.get("relation_update", 0) + counts.get(
             "unchanged", 0
         )
-        result["new_card_count"] = counts.get("create", 0)
+        result["new_card_count"] = resolution_summary.new_card_count
         result["relation_added_count"] = counts.get("relation_update", 0)
         result["unchanged_count"] = counts.get("unchanged", 0)
         result["ambiguous_count"] = counts.get("ambiguous", 0)
         result["error_count"] = counts.get("error", 0)
+        result["creatable_from_article_japanese_name_count"] = (
+            resolution_summary.creatable_from_article_japanese_name_count
+        )
+        result["creatable_from_human_confirmation_count"] = (
+            resolution_summary.creatable_from_human_confirmation_count
+        )
+        result["pending_confirmation_count"] = resolution_summary.pending_confirmation_count
+        result["identity_conflict_count"] = resolution_summary.identity_conflict_count
+        result["config_error_count"] = resolution_summary.config_error_count
+        result["is_fully_applicable"] = resolution_summary.is_fully_applicable
     if entry.apply_result is not None:
         result["apply"] = {
             "created": sum(1 for r in entry.apply_result.results if r.action == "created"),
@@ -415,7 +485,7 @@ def _deck_log_dict(entry: DeckArticleEntry) -> dict:
         )
     else:
         counts = entry.cards_plan.summary
-        result["new_card_count"] = counts.get("create", 0)
+        result["new_card_count"] = summarize_decisions(decisions).new_card_count
         result["relation_added_count"] = counts.get("relation_update", 0)
         result["unchanged_count"] = counts.get("unchanged", 0)
         result["error_count"] = counts.get("error", 0)

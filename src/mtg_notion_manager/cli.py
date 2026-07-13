@@ -71,6 +71,10 @@ from mtg_notion_manager.services.audit_duplicates import (
     load_exclusions,
     write_audit_reports,
 )
+from mtg_notion_manager.services.card_resolution import (
+    load_confirmed_card_mapping,
+    write_pending_manifest,
+)
 from mtg_notion_manager.services.dedupe_cards import build_dedupe_plan, execute_dedupe_plan
 from mtg_notion_manager.services.doctor import run_doctor
 from mtg_notion_manager.services.import_article import (
@@ -248,6 +252,16 @@ def import_cards_command(
     allow_count_mismatch: bool = typer.Option(
         False, "--allow-count-mismatch", help="デッキ合計枚数が100枚でなくても続行する"
     ),
+    confirmed_card_map: str = typer.Option(
+        None,
+        "--confirmed-card-map",
+        help=(
+            "記事から日本語名が取得できない新規カード(英語記事由来)について、"
+            "人間が確認済みの英語名→日本語名対応を記したJSON設定のパス"
+            "(config/confirmed_card_mapping.example.json 参照)。"
+            "指定しない場合、そうしたカードは全て確認待ちとして新規作成をブロックする。"
+        ),
+    ),
     show_detail: bool = typer.Option(
         True, "--detail/--no-detail", help="カード別詳細テーブルを表示する"
     ),
@@ -288,12 +302,16 @@ def import_cards_command(
             card_repo = CardRepository(
                 client, config.card_data_source_id, overrides=load_card_match_overrides()
             )
+            confirmed_mapping = None
+            if confirmed_card_map:
+                confirmed_mapping = load_confirmed_card_mapping(Path(confirmed_card_map), url)
             plan = build_import_cards_plan(
                 url,
                 resolved_deck_page_id,
                 card_repo,
                 deck_name=deck_name,
                 allow_count_mismatch=allow_count_mismatch,
+                confirmed_mapping=confirmed_mapping,
             )
 
             print_plan_summary(console, plan)
@@ -920,6 +938,22 @@ def import_article_command(
             "自動翻訳・類似一致は行わず、指定page_id・対象記事・期待ページ名を検証する。"
         ),
     ),
+    confirmed_card_map: str = typer.Option(
+        None,
+        "--confirmed-card-map",
+        help=(
+            "記事から日本語名が取得できない新規カード(英語記事由来)について、"
+            "人間が確認済みの英語名→日本語名対応を記したJSON設定のパス"
+            "(config/confirmed_card_mapping.example.json 参照)。"
+            "指定しない場合、そうしたカードは全て確認待ちとして新規作成をブロックする"
+            "(未確認の英語名を日本語タイトルへ書き込むことは一切ない)。"
+        ),
+    ),
+    pending_manifest_output: str = typer.Option(
+        None,
+        "--pending-manifest-output",
+        help="確認待ち(および作成可能)な新規カードの一覧をJSONで出力するパス",
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="取得・解析・照合・差分表示のみ行い、Notionへは書き込まない"
     ),
@@ -935,8 +969,11 @@ def import_article_command(
 
     各デッキはMTG統率者DBの既存デッキと完全一致で照合する(一致しないデッキは新規作成せず
     要確認として扱う)。カードDBは記事全体で1回だけ取得して索引化し、全デッキで共有する。
-    曖昧一致など未解決のカードが1件でもあるデッキはそのデッキだけを止め、他の安全な
-    デッキの処理は継続する。削除APIは一切使用しない。
+    新規カードは、記事から取得済みの日本語名(mtg-jp.com等)または --confirmed-card-map で
+    人間確認済みの日本語名がある場合のみ作成可能になる。今回の対象範囲(全デッキ・全カード)の
+    計画が全件成功する場合のみ書き込みフェーズを開始し、1件でも曖昧一致・未解決・確認待ちの
+    カードがあれば対象範囲全体でNotionへの書き込みを一切行わない
+    (デッキ単位でplanとwriteを交互に行わない安全機構)。削除APIは一切使用しない。
     """
     try:
         config = Config.load()
@@ -964,12 +1001,20 @@ def import_article_command(
                 exclude_deck_names=exclude_deck or [],
                 include_deck_names=include_deck or [],
                 deck_page_map_path=Path(deck_page_map) if deck_page_map else None,
+                confirmed_card_map_path=Path(confirmed_card_map) if confirmed_card_map else None,
             )
 
             print_article_plan_summary(console, plan)
             console.print()
             if show_detail:
                 print_article_deck_detail(console, plan)
+
+            if pending_manifest_output:
+                if plan.pending_manifest is not None:
+                    write_pending_manifest(plan.pending_manifest, Path(pending_manifest_output))
+                    console.print(f"確認待ちマニフェスト: {pending_manifest_output}")
+                else:
+                    console.print("新規カードが無いため、マニフェストは出力しませんでした。")
 
             if do_apply:
                 plan = execute_article_import(plan, card_repo, note="import-article由来")
@@ -1011,6 +1056,16 @@ def verify_import_command(
             "(config/deck_page_mapping.example.json 参照)。"
             "記事側のdeck-title属性がNotionページ名と完全一致しない場合に使う。"
             "自動翻訳・類似一致は行わず、指定page_id・対象記事・期待ページ名を検証する。"
+        ),
+    ),
+    confirmed_card_map: str = typer.Option(
+        None,
+        "--confirmed-card-map",
+        help=(
+            "人間確認済みの英語名→日本語名対応を記したJSON設定のパス"
+            "(config/confirmed_card_mapping.example.json 参照)。"
+            " --confirmed-card-map は import-article と同じ設定ファイル・同じresolverを使う"
+            "(新規カードのprovenance判定が両コマンドで食い違うことはない)。"
         ),
     ),
     show_detail: bool = typer.Option(
@@ -1057,6 +1112,7 @@ def verify_import_command(
                 card_repo,
                 include_deck_names=include_deck or [],
                 deck_page_map_path=Path(deck_page_map) if deck_page_map else None,
+                confirmed_card_map_path=Path(confirmed_card_map) if confirmed_card_map else None,
             )
     except MtgNotionManagerError as exc:
         console.print(f"[red]エラー:[/red] {exc}")

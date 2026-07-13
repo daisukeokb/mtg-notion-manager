@@ -5,6 +5,7 @@ from __future__ import annotations
 from rich.console import Console
 from rich.table import Table
 
+from mtg_notion_manager.services.card_resolution import ResolutionSummary, summarize_decisions
 from mtg_notion_manager.services.dedupe_cards import DedupeApplyResult, DedupePlan
 from mtg_notion_manager.services.import_article import (
     STATUS_LABELS,
@@ -29,6 +30,19 @@ def print_plan_summary(console: Console, plan: ImportCardsPlan) -> None:
     console.print(f"変更なし: {counts.get('unchanged', 0)}")
     console.print(f"曖昧一致: {counts.get('ambiguous', 0)}")
     console.print(f"エラー: {counts.get('error', 0)}")
+    console.print()
+    print_resolution_summary(console, summarize_decisions(plan.decisions))
+
+
+def print_resolution_summary(console: Console, summary: ResolutionSummary) -> None:
+    """新規カードのprovenance別内訳(全実行対象での書き込み可否判定を含む)。"""
+    console.print(
+        f"記事由来日本語名で作成可能: {summary.creatable_from_article_japanese_name_count}"
+    )
+    console.print(f"人間確認済みで作成可能: {summary.creatable_from_human_confirmation_count}")
+    console.print(f"確認待ち: {summary.pending_confirmation_count}")
+    console.print(f"identity conflict: {summary.identity_conflict_count}")
+    console.print(f"設定エラー: {summary.config_error_count}")
 
 
 def print_plan_detail(console: Console, plan: ImportCardsPlan) -> None:
@@ -154,6 +168,18 @@ def print_article_plan_summary(console: Console, plan: ArticleImportPlan) -> Non
     console.print(f"処理可能: {counts[STATUS_READY]}")
     console.print(f"要確認: {counts['needs_review']}")
     console.print(f"エラー: {counts['error']}")
+    console.print()
+
+    all_decisions = [
+        decision
+        for entry in plan.entries
+        if entry.cards_plan is not None
+        for decision in entry.cards_plan.decisions
+    ]
+    resolution_summary = summarize_decisions(all_decisions)
+    console.print(f"既存カード: {resolution_summary.existing_count}")
+    print_resolution_summary(console, resolution_summary)
+    console.print(f"実適用可能: {'はい' if plan.is_fully_applicable else 'いいえ'}")
     console.print()
 
     table = Table(title="デッキ別サマリー")

@@ -240,12 +240,14 @@ class TestExecuteImportCards:
             owned={"p1": True},
         )
         # 1回目: リレーション追加が必要と判定される
-        decision = import_cards._decide(card, DECK_PAGE_ID, repo)
+        decision = import_cards._decide(card, DECK_PAGE_ID, repo, SOURCE_URL, "吸血鬼の血統", None)
         assert decision.action == "relation_update"
 
         # 適用後、リポジトリの状態が更新されたとみなす(実際のNotion側の状態変化を模擬)
         repo.deck_relation_ids["p1"] = [DECK_PAGE_ID]
 
         # 2回目: 既にリレーション済みなのでunchangedと判定される
-        decision_again = import_cards._decide(card, DECK_PAGE_ID, repo)
+        decision_again = import_cards._decide(
+            card, DECK_PAGE_ID, repo, SOURCE_URL, "吸血鬼の血統", None
+        )
         assert decision_again.action == "unchanged"

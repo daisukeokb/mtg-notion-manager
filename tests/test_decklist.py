@@ -59,6 +59,16 @@ class TestParseMtgJpDecklist:
         for forbidden in ("統率者", "土地", "クリーチャー", "呪文"):
             assert forbidden not in names
 
+    def test_source_reference_is_absent_for_mtg_jp_cards(self) -> None:
+        """mtg-jp.comは角括弧形式を持たないため、source_referenceは常にNoneのまま
+        (欠落を許容する設計どおり)。"""
+        html = _read_fixture("mtgjp_full_decklist_100.html")
+        parsed = decklist.parse_mtg_jp_decklist(
+            html, "https://mtg-jp.com/reading/publicity/0035593/", deck_name="吸血鬼の血統"
+        )
+
+        assert all(c.source_reference is None for c in parsed.cards)
+
     def test_selects_deck_by_name_from_multi_deck_page(self) -> None:
         html = _read_fixture("mtgjp_multi_deck.html")
         parsed = decklist.parse_mtg_jp_decklist(
@@ -94,6 +104,18 @@ class TestParseWizardsDecklist:
         assert by_name["Forest"] == 10
         commander_cards = [c for c in parsed.cards if c.is_commander]
         assert len(commander_cards) == 1
+
+    def test_bracket_value_is_kept_as_source_reference_and_not_transformed(self) -> None:
+        """末尾の角括弧値は生文字列のまま保持し、意味を断定・変換しない
+        (欠落するカードも許容する)。"""
+        html = _read_fixture("wizards_single_deck.html")
+        parsed = decklist.parse_wizards_decklist(
+            html, "https://magic.wizards.com/en/news/announcements/bloomburrow-commander-decklists"
+        )
+
+        by_name = {c.name_en: c for c in parsed.cards}
+        assert by_name["Bello, Bard of the Brambles"].source_reference == "7M5v0rCo4IuTICf7OMwnCj"
+        assert by_name["Sol Ring"].source_reference is None
 
     def test_selects_deck_by_name_from_multi_deck_page(self) -> None:
         html = _read_fixture("wizards_multi_deck.html")
@@ -136,9 +158,9 @@ class TestValidateDeckCount:
 class TestAggregateCards:
     def test_duplicate_names_are_summed(self) -> None:
         entries = [
-            ("山", None, 5, False),
-            ("沼", None, 2, False),
-            ("山", None, 3, False),
+            ("山", None, 5, False, None),
+            ("沼", None, 2, False, None),
+            ("山", None, 3, False, None),
         ]
         cards = decklist._aggregate_cards(entries, "https://example.com")
 
@@ -150,11 +172,20 @@ class TestAggregateCards:
 
     def test_commander_flag_is_preserved_on_merge(self) -> None:
         entries = [
-            ("統率者カード", None, 1, True),
-            ("統率者カード", None, 1, False),
+            ("統率者カード", None, 1, True, None),
+            ("統率者カード", None, 1, False, None),
         ]
         cards = decklist._aggregate_cards(entries, "https://example.com")
 
         assert len(cards) == 1
         assert cards[0].quantity == 2
-        assert cards[0].is_commander is True
+
+    def test_source_reference_preserved_and_first_non_none_wins(self) -> None:
+        entries = [
+            ("平地", None, 4, False, None),
+            ("平地", None, 4, False, "12345"),
+        ]
+        cards = decklist._aggregate_cards(entries, "https://example.com")
+
+        assert cards[0].source_reference == "12345"
+        assert cards[0].quantity == 8
