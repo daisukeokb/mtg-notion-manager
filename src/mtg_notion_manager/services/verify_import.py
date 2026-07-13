@@ -66,6 +66,7 @@ class DeckVerifyEntry:
     unexpected_relation_page_ids: list[str] = field(default_factory=list)
     missing_relation_cards: list[dict] = field(default_factory=list)
     unexpected_relation_cards: list[dict] = field(default_factory=list)
+    resolution_method: str | None = None
 
     @property
     def is_verified(self) -> bool:
@@ -115,10 +116,17 @@ def build_verify_import_plan(
     writer: NotionWriter,
     card_repo: CardRepository,
     include_deck_names: list[str] | None = None,
+    deck_page_map_path: Path | None = None,
 ) -> ArticleVerifyReport:
     """記事から抽出できるカード・relationが、登録済みNotion状態と一致するか検証する。
 
     build_article_import_plan()(import-articleのdry-run計画処理)をそのまま再利用する。
+    デッキページの解決(名前完全一致 or deck_page_map_pathによる明示的マッピング)は
+    build_article_import_plan() 側の共通resolverが行い、ここではその結果
+    (DeckArticleEntry.deck_page_id / resolution_method)をそのまま引き継ぐ
+    (import-articleとverify-importが常に同じ解決結果を使うことを保証するため、
+    ここで名前による再解決は行わない)。
+
     記事取得・Notion読取に失敗した場合は例外がそのまま呼び出し側へ伝播する
     (登録状態の差分ではなく実行エラーとして扱うため、ここでは捕捉しない)。
     """
@@ -129,11 +137,10 @@ def build_verify_import_plan(
         card_repo,
         include_deck_names=include_deck_names,
         allow_count_mismatch=True,
+        deck_page_map_path=deck_page_map_path,
     )
 
-    entries = [
-        _verify_one_deck(entry, client, writer, card_repo) for entry in article_plan.entries
-    ]
+    entries = [_verify_one_deck(entry, client, card_repo) for entry in article_plan.entries]
 
     return ArticleVerifyReport(
         source_url=article_plan.source_url,
@@ -145,37 +152,30 @@ def build_verify_import_plan(
 def _verify_one_deck(
     entry: DeckArticleEntry,
     client: NotionClient,
-    writer: NotionWriter,
     card_repo: CardRepository,
 ) -> DeckVerifyEntry:
-    matches = writer.find_existing_decks(entry.deck_name)
-
-    if not matches:
-        return DeckVerifyEntry(
-            deck_name=entry.deck_name,
-            verification_status=VERIFICATION_MISMATCH,
-            verification_errors=["MTG統率者DBに一致するデッキレコードが見つかりません"],
-        )
-    if len(matches) > 1:
-        page_ids = sorted(m.page_id for m in matches)
+    if entry.deck_page_id is None:
         return DeckVerifyEntry(
             deck_name=entry.deck_name,
             verification_status=VERIFICATION_MISMATCH,
             verification_errors=[
-                f"デッキレコードが{len(matches)}件あり一意に特定できません(page_ids: {page_ids})"
+                entry.reason or "MTG統率者DBに一致するデッキレコードが見つかりません"
             ],
+            resolution_method=entry.resolution_method,
         )
-
-    deck = matches[0]
 
     if entry.cards_plan is None:
         return DeckVerifyEntry(
             deck_name=entry.deck_name,
             verification_status=VERIFICATION_MISMATCH,
             verification_errors=[entry.reason or "カード抽出・照合に失敗しました"],
-            deck_page_id=deck.page_id,
-            deck_page_url=deck.page_url,
+            deck_page_id=entry.deck_page_id,
+            deck_page_url=entry.deck_page_url,
+            resolution_method=entry.resolution_method,
         )
+
+    page = client.get_page(entry.deck_page_id)
+    properties = page.get("properties", {})
 
     parsed = entry.cards_plan.parsed
     decisions = entry.cards_plan.decisions
@@ -204,7 +204,7 @@ def _verify_one_deck(
     actual_ids = sorted(
         set(
             client.read_relation_ids(
-                deck.properties, deck.page_id, COMMANDER_CARDS_RELATION_PROPERTY
+                properties, entry.deck_page_id, COMMANDER_CARDS_RELATION_PROPERTY
             )
         )
     )
@@ -222,8 +222,8 @@ def _verify_one_deck(
         deck_name=entry.deck_name,
         verification_status=status,
         verification_errors=errors,
-        deck_page_id=deck.page_id,
-        deck_page_url=deck.page_url,
+        deck_page_id=entry.deck_page_id,
+        deck_page_url=entry.deck_page_url,
         extracted_card_count=extracted_card_count,
         unique_card_count=unique_card_count,
         existing_card_count=existing_card_count,
@@ -237,6 +237,7 @@ def _verify_one_deck(
         unexpected_relation_page_ids=unexpected_ids,
         missing_relation_cards=[_relation_card_dict(pid, card_repo) for pid in missing_ids],
         unexpected_relation_cards=[_relation_card_dict(pid, card_repo) for pid in unexpected_ids],
+        resolution_method=entry.resolution_method,
     )
 
 
@@ -307,4 +308,5 @@ def _deck_verify_to_dict(entry: DeckVerifyEntry) -> dict:
         "unexpected_relation_cards": entry.unexpected_relation_cards,
         "verification_status": entry.verification_status,
         "verification_errors": entry.verification_errors,
+        "resolution_method": entry.resolution_method,
     }

@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "article_url": "https://magic.wizards.com/ja/news/announcements/EXAMPLE-commander-decklists",
+  "decks": [
+    {
+      "article_deck_name": "Example Deck Name (English)",
+      "page_id": "00000000-0000-0000-0000-000000000000",
+      "expected_page_name": "サンプルデッキ名(日本語)"
+    }
+  ]
+}

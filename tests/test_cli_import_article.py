@@ -96,6 +96,7 @@ def _patch_build_plan(monkeypatch: pytest.MonkeyPatch, plan: ArticleImportPlan) 
         exclude_deck_names: list[str] | None = None,
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
     ) -> ArticleImportPlan:
         return plan
 
@@ -198,6 +199,7 @@ def test_exclude_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
         exclude_deck_names: list[str] | None = None,
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
     ) -> ArticleImportPlan:
         captured["exclude_deck_names"] = exclude_deck_names
         return _sample_plan([_ready_entry("デッキA")])
@@ -226,6 +228,7 @@ def test_include_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
         exclude_deck_names: list[str] | None = None,
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
     ) -> ArticleImportPlan:
         captured["include_deck_names"] = include_deck_names
         return _sample_plan([_ready_entry("プリズマリの技巧")])
@@ -272,3 +275,68 @@ def test_missing_card_data_source_id_errors(monkeypatch: pytest.MonkeyPatch) -> 
     result = runner.invoke(cli.app, ["import-article", URL, "--dry-run"])
 
     assert result.exit_code == 1
+
+
+def test_help_mentions_deck_page_map() -> None:
+    result = runner.invoke(cli.app, ["import-article", "--help"])
+
+    assert result.exit_code == 0
+    assert "--deck-page-map" in result.stdout
+
+
+def test_deck_page_map_path_is_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    captured: dict[str, object] = {}
+
+    def _fake_build_plan(
+        url: str,
+        writer: object,
+        card_repo: object,
+        exclude_deck_names: list[str] | None = None,
+        include_deck_names: list[str] | None = None,
+        allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
+    ) -> ArticleImportPlan:
+        captured["deck_page_map_path"] = deck_page_map_path
+        return _sample_plan([_ready_entry("デッキA")])
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-article",
+            URL,
+            "--deck-page-map",
+            "config/deck_page_mapping.example.json",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(captured["deck_page_map_path"]) == "config/deck_page_mapping.example.json"
+
+
+def test_invalid_deck_page_map_exits_nonzero_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    from mtg_notion_manager.exceptions import DeckPageMappingConfigError
+
+    def _fake_build_plan(*args: object, **kwargs: object) -> ArticleImportPlan:
+        raise DeckPageMappingConfigError("設定が不正です")
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    result = runner.invoke(
+        cli.app,
+        ["import-article", URL, "--deck-page-map", "bad.json", "--apply"],
+    )
+
+    assert result.exit_code != 0

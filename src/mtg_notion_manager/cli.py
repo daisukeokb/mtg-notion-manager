@@ -910,6 +910,16 @@ def import_article_command(
     include_deck: list[str] = typer.Option(
         None, "--include-deck", help="このデッキ名だけを処理対象にする(複数指定可)"
     ),
+    deck_page_map: str = typer.Option(
+        None,
+        "--deck-page-map",
+        help=(
+            "記事内デッキ名と既存Notionページの明示的な対応を記したJSON設定のパス"
+            "(config/deck_page_mapping.example.json 参照)。"
+            "記事側のdeck-title属性がNotionページ名と完全一致しない場合に使う。"
+            "自動翻訳・類似一致は行わず、指定page_id・対象記事・期待ページ名を検証する。"
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run", help="取得・解析・照合・差分表示のみ行い、Notionへは書き込まない"
     ),
@@ -953,6 +963,7 @@ def import_article_command(
                 card_repo,
                 exclude_deck_names=exclude_deck or [],
                 include_deck_names=include_deck or [],
+                deck_page_map_path=Path(deck_page_map) if deck_page_map else None,
             )
 
             print_article_plan_summary(console, plan)
@@ -992,6 +1003,16 @@ def verify_import_command(
     include_deck: list[str] = typer.Option(
         None, "--include-deck", help="このデッキ名だけを検証対象にする(複数指定可)"
     ),
+    deck_page_map: str = typer.Option(
+        None,
+        "--deck-page-map",
+        help=(
+            "記事内デッキ名と既存Notionページの明示的な対応を記したJSON設定のパス"
+            "(config/deck_page_mapping.example.json 参照)。"
+            "記事側のdeck-title属性がNotionページ名と完全一致しない場合に使う。"
+            "自動翻訳・類似一致は行わず、指定page_id・対象記事・期待ページ名を検証する。"
+        ),
+    ),
     show_detail: bool = typer.Option(
         False, "--detail/--no-detail", help="デッキごとの差分カード詳細も表示する"
     ),
@@ -1005,6 +1026,9 @@ def verify_import_command(
     デッキが実際にその通りに登録されているかを確認する読み取り専用コマンド
     (database query / page retrieve / relation property read のみ行う。
     Notionへの書き込みは一切行わず、--applyに相当するオプションも存在しない)。
+
+    --deck-page-map は import-article と同じ設定ファイル・同じresolverを使う
+    (デッキページの解決方法が両コマンドで食い違うことはない)。
 
     終了コード: 0=全デッキ検証成功 / 1=登録状態に差分あり / 2=入力・設定・記事取得・
     Notion読取などの実行エラー。
@@ -1027,7 +1051,12 @@ def verify_import_command(
             )
 
             report = build_verify_import_plan(
-                url, client, writer, card_repo, include_deck_names=include_deck or []
+                url,
+                client,
+                writer,
+                card_repo,
+                include_deck_names=include_deck or [],
+                deck_page_map_path=Path(deck_page_map) if deck_page_map else None,
             )
     except MtgNotionManagerError as exc:
         console.print(f"[red]エラー:[/red] {exc}")

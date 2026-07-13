@@ -46,6 +46,10 @@ class IntentionalDuplicateConfigError(MtgNotionManagerError):
     """intentional_duplicate_cards.jsonの設定が不正(JSON不正・必須キー欠落・矛盾する設定など)。"""
 
 
+class DeckPageMappingConfigError(MtgNotionManagerError):
+    """デッキページマッピング設定(--deck-page-map)が不正、または対象記事と一致しない。"""
+
+
 class ConflictError(MtgNotionManagerError):
     """重複統合時、複数レコード間で属性値が競合し自動統合できない。"""
 

@@ -44,13 +44,34 @@ class FakeFetcher:
 
 
 class FakeWriter:
-    def __init__(self, existing: dict[str, ExistingDeck]) -> None:
-        self.existing = existing
+    def __init__(
+        self,
+        existing: dict[str, ExistingDeck | list[ExistingDeck]] | None = None,
+        data_source_id: str = "commander-ds-id",
+        pages: dict[str, dict] | None = None,
+    ) -> None:
+        self.existing = existing or {}
         self.lookup_calls: list[str] = []
+        self.data_source_id = data_source_id
+        self.pages = pages or {}
+        self.get_page_calls: list[str] = []
+
+    def find_existing_decks(self, name: str) -> list[ExistingDeck]:
+        self.lookup_calls.append(name)
+        value = self.existing.get(name)
+        if value is None:
+            return []
+        return value if isinstance(value, list) else [value]
 
     def find_existing_deck(self, name: str) -> ExistingDeck | None:
-        self.lookup_calls.append(name)
-        return self.existing.get(name)
+        matches = self.find_existing_decks(name)
+        return matches[0] if matches else None
+
+    def get_page(self, page_id: str) -> dict:
+        self.get_page_calls.append(page_id)
+        if page_id not in self.pages:
+            raise NotionAPIError(f"page not found: {page_id}")
+        return self.pages[page_id]
 
 
 class FakeCardRepository:

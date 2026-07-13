@@ -22,6 +22,14 @@ class NotionWriter:
         self._client = client
         self._data_source_id = data_source_id
 
+    @property
+    def data_source_id(self) -> str:
+        return self._data_source_id
+
+    def get_page(self, page_id: str) -> dict:
+        """指定page_idのページを直接取得する(名前検索ではなくID指定の取得)。"""
+        return self._client.get_page(page_id)
+
     def find_existing_deck(self, name: str) -> ExistingDeck | None:
         matches = self.find_existing_decks(name)
         return matches[0] if matches else None

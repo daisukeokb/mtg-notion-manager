@@ -126,7 +126,7 @@ class TestSuccessExitCode:
         monkeypatch.setattr(
             cli,
             "build_verify_import_plan",
-            lambda url, client, writer, card_repo, include_deck_names=None: _report(
+            lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _report(
                 [_verified_entry()]
             ),
         )
@@ -149,7 +149,7 @@ class TestMismatchExitCode:
         monkeypatch.setattr(
             cli,
             "build_verify_import_plan",
-            lambda url, client, writer, card_repo, include_deck_names=None: _report(
+            lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _report(
                 [_verified_entry(), _mismatch_entry()]
             ),
         )
@@ -169,7 +169,7 @@ class TestMismatchExitCode:
         monkeypatch.setattr(
             cli,
             "build_verify_import_plan",
-            lambda url, client, writer, card_repo, include_deck_names=None: _report(
+            lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _report(
                 [_mismatch_entry()]
             ),
         )
@@ -214,6 +214,7 @@ class TestExecutionErrorExitCode:
             writer: object,
             card_repo: object,
             include_deck_names=None,
+            deck_page_map_path=None,
         ):
             raise NotionAPIError("Notion API呼び出しに失敗しました (500): boom")
 
@@ -236,6 +237,7 @@ class TestExecutionErrorExitCode:
             writer: object,
             card_repo: object,
             include_deck_names=None,
+            deck_page_map_path=None,
         ):
             raise NotionAPIError("timeout")
 
@@ -257,7 +259,12 @@ class TestIncludeDeckOption:
         captured: dict[str, object] = {}
 
         def fake_build(
-            url: str, client: object, writer: object, card_repo: object, include_deck_names=None
+            url: str,
+            client: object,
+            writer: object,
+            card_repo: object,
+            include_deck_names=None,
+            deck_page_map_path=None,
         ):
             captured["include_deck_names"] = include_deck_names
             return _report([_verified_entry("プリズマリの技巧")])
@@ -288,7 +295,12 @@ class TestIncludeDeckOption:
         captured: dict[str, object] = {}
 
         def fake_build(
-            url: str, client: object, writer: object, card_repo: object, include_deck_names=None
+            url: str,
+            client: object,
+            writer: object,
+            card_repo: object,
+            include_deck_names=None,
+            deck_page_map_path=None,
         ):
             captured["include_deck_names"] = include_deck_names
             return _report([_verified_entry("A"), _verified_entry("B")])
@@ -332,7 +344,7 @@ class TestReportWriting:
         monkeypatch.setattr(
             cli,
             "build_verify_import_plan",
-            lambda url, client, writer, card_repo, include_deck_names=None: _report(
+            lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _report(
                 [_verified_entry()]
             ),
         )
@@ -366,7 +378,7 @@ class TestReadOnlyGuarantee:
         monkeypatch.setattr(
             cli,
             "build_verify_import_plan",
-            lambda url, client, writer, card_repo, include_deck_names=None: _report(
+            lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _report(
                 [_verified_entry()]
             ),
         )
@@ -374,3 +386,64 @@ class TestReadOnlyGuarantee:
         result = runner.invoke(cli.app, ["verify-import", URL, "--output-dir", str(tmp_path)])
 
         assert result.exit_code == 0
+
+
+def test_help_mentions_deck_page_map() -> None:
+    result = runner.invoke(cli.app, ["verify-import", "--help"])
+
+    assert result.exit_code == 0
+    assert "--deck-page-map" in result.stdout
+
+
+def test_deck_page_map_path_is_passed_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_report(monkeypatch)
+
+    captured: dict[str, object] = {}
+
+    def fake_build(
+        url: str,
+        client: object,
+        writer: object,
+        card_repo: object,
+        include_deck_names=None,
+        deck_page_map_path=None,
+    ):
+        captured["deck_page_map_path"] = deck_page_map_path
+        return _report([_verified_entry()])
+
+    monkeypatch.setattr(cli, "build_verify_import_plan", fake_build)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "verify-import",
+            URL,
+            "--deck-page-map",
+            "config/deck_page_mapping.example.json",
+            "--output-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(captured["deck_page_map_path"]) == "config/deck_page_mapping.example.json"
+
+
+def test_invalid_deck_page_map_exits_with_execution_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+
+    from mtg_notion_manager.exceptions import DeckPageMappingConfigError
+
+    def fake_build(*args: object, **kwargs: object):
+        raise DeckPageMappingConfigError("設定が不正です")
+
+    monkeypatch.setattr(cli, "build_verify_import_plan", fake_build)
+
+    result = runner.invoke(cli.app, ["verify-import", URL, "--deck-page-map", "bad.json"])
+
+    assert result.exit_code == 2

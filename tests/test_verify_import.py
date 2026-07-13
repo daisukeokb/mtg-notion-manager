@@ -109,12 +109,17 @@ class FakeNotionClient:
         self.relation_ids = relation_ids or {}
         self.fail = fail
         self.calls: list[tuple[str, str]] = []
+        self.get_page_calls: list[str] = []
 
     def read_relation_ids(self, properties: dict, page_id: str, property_name: str) -> list[str]:
         self.calls.append((page_id, property_name))
         if self.fail:
             raise NotionAPIError("simulated relation read failure")
         return list(self.relation_ids.get(page_id, []))
+
+    def get_page(self, page_id: str) -> dict:
+        self.get_page_calls.append(page_id)
+        return {"id": page_id, "url": f"https://notion.so/{page_id}", "properties": {}}
 
     def update_page(self, *args: object, **kwargs: object) -> None:
         raise AssertionError("verify-import must never call update_page")
@@ -529,12 +534,12 @@ class TestErrorCountFromDecisions:
             deck_page_id="deck-x",
             deck_page_url="https://notion.so/deck-x",
             cards_plan=cards_plan,
+            resolution_method="exact_name_match",
         )
-        writer = FakeWriter({DECK_NAMES[0]: [_existing_deck("deck-x")]})
         card_repo = FakeCardRepository()
         client = FakeNotionClient({"deck-x": []})
 
-        result = verify_import._verify_one_deck(entry, client, writer, card_repo)
+        result = verify_import._verify_one_deck(entry, client, card_repo)
 
         assert result.error_count == 1
         assert not result.is_verified
