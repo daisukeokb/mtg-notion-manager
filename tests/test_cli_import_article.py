@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,17 @@ from mtg_notion_manager.services.import_cards import (
 
 runner = CliRunner()
 URL = "https://magic.wizards.com/ja/news/announcements/secrets-of-strixhaven-commander-decklists"
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain_help_text(stdout: str) -> str:
+    """rich/typerの--help出力から、環境依存のANSIコード・改行折り返しを除去する。
+
+    --helpの折り返し幅・色付けは実行環境(TTY有無・COLUMNS・CI)に応じてrichが
+    動的に決めるため、生のstdoutへ部分文字列一致させるテストは環境依存で壊れる。
+    """
+    return _ANSI_ESCAPE_RE.sub("", stdout).replace("\n", "")
 
 
 def _fake_config() -> Config:
@@ -96,6 +108,7 @@ def _patch_build_plan(monkeypatch: pytest.MonkeyPatch, plan: ArticleImportPlan) 
         exclude_deck_names: list[str] | None = None,
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
     ) -> ArticleImportPlan:
         return plan
 
@@ -198,6 +211,7 @@ def test_exclude_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
         exclude_deck_names: list[str] | None = None,
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
     ) -> ArticleImportPlan:
         captured["exclude_deck_names"] = exclude_deck_names
         return _sample_plan([_ready_entry("デッキA")])
@@ -226,6 +240,7 @@ def test_include_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
         exclude_deck_names: list[str] | None = None,
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
     ) -> ArticleImportPlan:
         captured["include_deck_names"] = include_deck_names
         return _sample_plan([_ready_entry("プリズマリの技巧")])
@@ -272,3 +287,76 @@ def test_missing_card_data_source_id_errors(monkeypatch: pytest.MonkeyPatch) -> 
     result = runner.invoke(cli.app, ["import-article", URL, "--dry-run"])
 
     assert result.exit_code == 1
+
+
+def test_help_mentions_deck_page_map() -> None:
+    result = runner.invoke(cli.app, ["import-article", "--help"])
+
+    assert result.exit_code == 0
+    assert "--deck-page-map" in _plain_help_text(result.stdout)
+
+
+def test_plain_help_text_strips_ansi_and_wrapping() -> None:
+    """CI環境でrichが折り返し・色付けした--help出力でも検出できることを確認する
+    (GitHub Actions run 29240645584 で実際に発生した失敗の再現)。
+    """
+    wrapped = "\x1b[1m--deck\x1b[0m\n\x1b[2m-page-map\x1b[0m"
+    assert "--deck-page-map" in _plain_help_text(wrapped)
+
+
+def test_deck_page_map_path_is_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    captured: dict[str, object] = {}
+
+    def _fake_build_plan(
+        url: str,
+        writer: object,
+        card_repo: object,
+        exclude_deck_names: list[str] | None = None,
+        include_deck_names: list[str] | None = None,
+        allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
+    ) -> ArticleImportPlan:
+        captured["deck_page_map_path"] = deck_page_map_path
+        return _sample_plan([_ready_entry("デッキA")])
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-article",
+            URL,
+            "--deck-page-map",
+            "config/deck_page_mapping.example.json",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert str(captured["deck_page_map_path"]) == "config/deck_page_mapping.example.json"
+
+
+def test_invalid_deck_page_map_exits_nonzero_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    from mtg_notion_manager.exceptions import DeckPageMappingConfigError
+
+    def _fake_build_plan(*args: object, **kwargs: object) -> ArticleImportPlan:
+        raise DeckPageMappingConfigError("設定が不正です")
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    result = runner.invoke(
+        cli.app,
+        ["import-article", URL, "--deck-page-map", "bad.json", "--apply"],
+    )
+
+    assert result.exit_code != 0

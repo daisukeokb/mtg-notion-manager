@@ -37,6 +37,11 @@ from mtg_notion_manager.fetchers.base import download
 from mtg_notion_manager.models import CardDecision
 from mtg_notion_manager.notion.card_repository import CardRepository
 from mtg_notion_manager.notion.writer import NotionWriter
+from mtg_notion_manager.services.deck_page_mapping import (
+    DeckPageMapping,
+    load_deck_page_mapping,
+    resolve_deck_page,
+)
 from mtg_notion_manager.services.import_cards import (
     BLOCKING_ACTIONS,
     ImportCardsPlan,
@@ -65,6 +70,7 @@ class DeckArticleEntry:
     deck_page_url: str | None = None
     cards_plan: ImportCardsPlan | None = None
     apply_result: ImportCardsResult | None = None
+    resolution_method: str | None = None
 
 
 @dataclass(frozen=True)
@@ -89,17 +95,27 @@ def build_article_import_plan(
     exclude_deck_names: list[str] | None = None,
     include_deck_names: list[str] | None = None,
     allow_count_mismatch: bool = False,
+    deck_page_map_path: Path | None = None,
 ) -> ArticleImportPlan:
     """記事HTMLを1回だけ取得し、記事内の全デッキを解析・検証する(Notionへの書き込みなし)。
 
     include_deck_names を指定した場合、そのデッキ名だけを対象にする
     (exclude_deck_names と併用可能。両方指定された場合は両方の条件を満たす必要がある)。
+
+    deck_page_map_path を指定した場合、記事側デッキ名から既存Notionページへの
+    明示的な対応(config/deck_page_mapping.example.json 参照)を読み込み・検証し、
+    名前完全一致より優先して使う(record_page_mapping.resolve_deck_page() 参照)。
+    指定しない場合は従来どおり名前完全一致のみで解決する。
     """
     exclude_deck_names = exclude_deck_names or []
     include_deck_names = include_deck_names or []
     html = download(url)
     fetcher = get_fetcher(url)
     all_deck_names = fetcher.list_deck_names(html, url)
+
+    mapping: DeckPageMapping | None = None
+    if deck_page_map_path is not None:
+        mapping = load_deck_page_mapping(deck_page_map_path, url, all_deck_names)
 
     target_names = [name for name in all_deck_names if name not in exclude_deck_names]
     if include_deck_names:
@@ -108,7 +124,7 @@ def build_article_import_plan(
     card_repo.load()
 
     entries = [
-        _build_one_deck_entry(url, html, name, writer, card_repo, allow_count_mismatch)
+        _build_one_deck_entry(url, html, name, writer, card_repo, allow_count_mismatch, mapping)
         for name in target_names
     ]
 
@@ -127,17 +143,23 @@ def _build_one_deck_entry(
     writer: NotionWriter,
     card_repo: CardRepository,
     allow_count_mismatch: bool,
+    mapping: DeckPageMapping | None,
 ) -> DeckArticleEntry:
-    existing_deck = writer.find_existing_deck(deck_name)
-    if existing_deck is None:
+    resolution = resolve_deck_page(deck_name, writer, mapping)
+    if not resolution.resolved:
+        reason = resolution.error or (
+            "MTG統率者DBに一致するデッキが見つかりません"
+            "(先に import コマンドで登録してください)"
+        )
         return DeckArticleEntry(
             deck_name=deck_name,
             status=STATUS_NEEDS_REVIEW,
-            reason=(
-                "MTG統率者DBに一致するデッキが見つかりません"
-                "(先に import コマンドで登録してください)"
-            ),
+            reason=reason,
+            resolution_method=resolution.resolution_method,
         )
+
+    existing_deck = resolution.existing_deck
+    assert existing_deck is not None
 
     try:
         cards_plan = build_import_cards_plan(
@@ -155,6 +177,7 @@ def _build_one_deck_entry(
             reason=str(exc),
             deck_page_id=existing_deck.page_id,
             deck_page_url=existing_deck.page_url,
+            resolution_method=resolution.resolution_method,
         )
 
     if cards_plan.has_blocking_issues:
@@ -167,6 +190,7 @@ def _build_one_deck_entry(
             deck_page_id=existing_deck.page_id,
             deck_page_url=existing_deck.page_url,
             cards_plan=cards_plan,
+            resolution_method=resolution.resolution_method,
         )
 
     return DeckArticleEntry(
@@ -175,6 +199,7 @@ def _build_one_deck_entry(
         deck_page_id=existing_deck.page_id,
         deck_page_url=existing_deck.page_url,
         cards_plan=cards_plan,
+        resolution_method=resolution.resolution_method,
     )
 
 
@@ -201,6 +226,7 @@ def execute_article_import(
                     deck_page_id=entry.deck_page_id,
                     deck_page_url=entry.deck_page_url,
                     cards_plan=entry.cards_plan,
+                    resolution_method=entry.resolution_method,
                 )
             )
             continue
@@ -212,6 +238,7 @@ def execute_article_import(
                 deck_page_url=entry.deck_page_url,
                 cards_plan=entry.cards_plan,
                 apply_result=result,
+                resolution_method=entry.resolution_method,
             )
         )
 
@@ -265,6 +292,7 @@ def _entry_to_dict(entry: DeckArticleEntry) -> dict:
         "reason": entry.reason,
         "deck_page_id": entry.deck_page_id,
         "deck_page_url": entry.deck_page_url,
+        "resolution_method": entry.resolution_method,
     }
     if entry.cards_plan is not None:
         parsed = entry.cards_plan.parsed

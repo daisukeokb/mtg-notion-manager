@@ -209,6 +209,9 @@ def print_article_plan_summary(console: Console, plan: ArticleImportPlan) -> Non
 def print_article_deck_detail(console: Console, plan: ArticleImportPlan) -> None:
     for entry in plan.entries:
         console.print(f"[bold]デッキ: {entry.deck_name}[/bold] ({STATUS_LABELS[entry.status]})")
+        console.print(f"  解決方法: {entry.resolution_method or '(未解決)'}")
+        if entry.deck_page_id:
+            console.print(f"  Notionページ: {entry.deck_page_url or entry.deck_page_id}")
         if entry.reason:
             console.print(f"  理由: {entry.reason}")
         if entry.cards_plan is not None:
@@ -289,6 +292,9 @@ def print_verify_import_detail(console: Console, report: ArticleVerifyReport) ->
     for entry in report.entries:
         result_label = "OK" if entry.is_verified else "NG"
         console.print(f"[bold]デッキ: {entry.deck_name}[/bold] ({result_label})")
+        console.print(f"  解決方法: {entry.resolution_method or '(未解決)'}")
+        if entry.deck_page_id:
+            console.print(f"  Notionページ: {entry.deck_page_url or entry.deck_page_id}")
         for error in entry.verification_errors:
             console.print(f"  - {error}")
         if entry.missing_relation_cards:
