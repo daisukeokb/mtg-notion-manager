@@ -32,6 +32,7 @@ from mtg_notion_manager.notion.card_repository import (
 from mtg_notion_manager.notion.client import NotionClient
 from mtg_notion_manager.notion.writer import NotionWriter
 from mtg_notion_manager.parsers.decklist import COMMANDER_DECK_SIZE
+from mtg_notion_manager.services.card_resolution import summarize_decisions
 from mtg_notion_manager.services.import_article import (
     DeckArticleEntry,
     build_article_import_plan,
@@ -117,6 +118,7 @@ def build_verify_import_plan(
     card_repo: CardRepository,
     include_deck_names: list[str] | None = None,
     deck_page_map_path: Path | None = None,
+    confirmed_card_map_path: Path | None = None,
 ) -> ArticleVerifyReport:
     """記事から抽出できるカード・relationが、登録済みNotion状態と一致するか検証する。
 
@@ -126,6 +128,9 @@ def build_verify_import_plan(
     (DeckArticleEntry.deck_page_id / resolution_method)をそのまま引き継ぐ
     (import-articleとverify-importが常に同じ解決結果を使うことを保証するため、
     ここで名前による再解決は行わない)。
+
+    confirmed_card_map_path も import-article と同じ解決結果を共有するために
+    そのまま引き継ぐ(新規カードのprovenance判定がimportとverifyで食い違わないため)。
 
     記事取得・Notion読取に失敗した場合は例外がそのまま呼び出し側へ伝播する
     (登録状態の差分ではなく実行エラーとして扱うため、ここでは捕捉しない)。
@@ -138,6 +143,7 @@ def build_verify_import_plan(
         include_deck_names=include_deck_names,
         allow_count_mismatch=True,
         deck_page_map_path=deck_page_map_path,
+        confirmed_card_map_path=confirmed_card_map_path,
     )
 
     entries = [_verify_one_deck(entry, client, card_repo) for entry in article_plan.entries]
@@ -181,10 +187,12 @@ def _verify_one_deck(
     decisions = entry.cards_plan.decisions
     counts = entry.cards_plan.summary
 
+    resolution_summary = summarize_decisions(decisions)
+
     extracted_card_count = parsed.total_quantity
     unique_card_count = len(parsed.cards)
     existing_card_count = counts.get("relation_update", 0) + counts.get("unchanged", 0)
-    new_card_count = counts.get("create", 0)
+    new_card_count = resolution_summary.new_card_count
     ambiguous_match_count = counts.get("ambiguous", 0)
     error_count = counts.get("error", 0)
 

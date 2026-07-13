@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -109,6 +110,7 @@ def _patch_build_plan(monkeypatch: pytest.MonkeyPatch, plan: ArticleImportPlan) 
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
         deck_page_map_path: object = None,
+        confirmed_card_map_path: object = None,
     ) -> ArticleImportPlan:
         return plan
 
@@ -212,6 +214,7 @@ def test_exclude_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
         deck_page_map_path: object = None,
+        confirmed_card_map_path: object = None,
     ) -> ArticleImportPlan:
         captured["exclude_deck_names"] = exclude_deck_names
         return _sample_plan([_ready_entry("デッキA")])
@@ -241,6 +244,7 @@ def test_include_deck_option_is_passed_through(monkeypatch: pytest.MonkeyPatch) 
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
         deck_page_map_path: object = None,
+        confirmed_card_map_path: object = None,
     ) -> ArticleImportPlan:
         captured["include_deck_names"] = include_deck_names
         return _sample_plan([_ready_entry("プリズマリの技巧")])
@@ -319,6 +323,7 @@ def test_deck_page_map_path_is_passed_through(monkeypatch: pytest.MonkeyPatch) -
         include_deck_names: list[str] | None = None,
         allow_count_mismatch: bool = False,
         deck_page_map_path: object = None,
+        confirmed_card_map_path: object = None,
     ) -> ArticleImportPlan:
         captured["deck_page_map_path"] = deck_page_map_path
         return _sample_plan([_ready_entry("デッキA")])
@@ -357,6 +362,123 @@ def test_invalid_deck_page_map_exits_nonzero_without_writing(
     result = runner.invoke(
         cli.app,
         ["import-article", URL, "--deck-page-map", "bad.json", "--apply"],
+    )
+
+    assert result.exit_code != 0
+
+
+def test_pending_manifest_output_writes_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from mtg_notion_manager.services import card_resolution
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    card = _card("Ashling, the Limitless")
+    resolution = card_resolution.resolve_new_card(
+        card, article_url=URL, deck_name="デッキA", confirmed_mapping=None
+    )
+    manifest = card_resolution.build_pending_manifest(URL, [resolution])
+
+    def _fake_build_plan(*args: object, **kwargs: object) -> ArticleImportPlan:
+        plan = _sample_plan([_ready_entry("デッキA")])
+        return ArticleImportPlan(
+            source_url=plan.source_url,
+            all_deck_names=plan.all_deck_names,
+            excluded_deck_names=plan.excluded_deck_names,
+            entries=plan.entries,
+            pending_manifest=manifest,
+        )
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    manifest_path = tmp_path / "manifest.json"
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-article",
+            URL,
+            "--pending-manifest-output",
+            str(manifest_path),
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert manifest_path.exists()
+    written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert written["schema_version"] == card_resolution.MANIFEST_SCHEMA_VERSION
+    assert len(written["cards"]) == 1
+
+
+def test_help_mentions_confirmed_card_map_and_pending_manifest_output() -> None:
+    result = runner.invoke(cli.app, ["import-article", "--help"])
+
+    assert result.exit_code == 0
+    plain = _plain_help_text(result.stdout)
+    assert "--confirmed-card-map" in plain
+    assert "--pending-manifest-output" in plain
+
+
+def test_confirmed_card_map_path_is_passed_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    captured: dict[str, object] = {}
+
+    def _fake_build_plan(
+        url: str,
+        writer: object,
+        card_repo: object,
+        exclude_deck_names: list[str] | None = None,
+        include_deck_names: list[str] | None = None,
+        allow_count_mismatch: bool = False,
+        deck_page_map_path: object = None,
+        confirmed_card_map_path: object = None,
+    ) -> ArticleImportPlan:
+        captured["confirmed_card_map_path"] = confirmed_card_map_path
+        return _sample_plan([_ready_entry("デッキA")])
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-article",
+            URL,
+            "--confirmed-card-map",
+            "config/confirmed_card_mapping.example.json",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert (
+        str(captured["confirmed_card_map_path"])
+        == "config/confirmed_card_mapping.example.json"
+    )
+
+
+def test_invalid_confirmed_card_map_exits_nonzero_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_write_log(monkeypatch)
+
+    from mtg_notion_manager.services.card_resolution import ConfirmedCardMappingConfigError
+
+    def _fake_build_plan(*args: object, **kwargs: object) -> ArticleImportPlan:
+        raise ConfirmedCardMappingConfigError("設定が不正です")
+
+    monkeypatch.setattr(cli, "build_article_import_plan", _fake_build_plan)
+
+    result = runner.invoke(
+        cli.app,
+        ["import-article", URL, "--confirmed-card-map", "bad.json", "--apply"],
     )
 
     assert result.exit_code != 0

@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "stable_key_version": 1,
+  "article_url": "https://magic.wizards.com/ja/news/announcements/EXAMPLE-commander-decklists",
+  "cards": [
+    {
+      "stable_key": "v1:https://magic.wizards.com/ja/news/announcements/example-commander-decklists:en:example card name",
+      "name_en": "Example Card Name",
+      "name_ja": "サンプルカード名(日本語)",
+      "source_reference": null,
+      "confirmation_source": {
+        "type": "official_card_page",
+        "reference": "https://example.com/card/example-card-name"
+      }
+    }
+  ]
+}

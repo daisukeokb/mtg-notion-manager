@@ -76,6 +76,10 @@ class DeckCard:
     quantity: int
     is_commander: bool
     source_url: str
+    #: 記事側の識別子的な生値(例: wizards.comデッキリスト行末の[...])。
+    #: 意味を断定せず(Gatherer ID等と決め打ちしない)、欠落を許容する。
+    #: stable_key計算・新規カード確認済みマッピングの照合にのみ使う。
+    source_reference: str | None = None
 
     def __post_init__(self) -> None:
         if not self.name_ja and not self.name_en:
@@ -87,6 +91,9 @@ class DeckCard:
 
     @property
     def display_name(self) -> str:
+        """表示用の名前。新規カード作成の安全判定には使用しないこと
+        (name_jaが未確認でもname_enへフォールバックしてしまうため)。
+        """
         return self.name_ja or self.name_en or "?"
 
 
@@ -113,16 +120,146 @@ class ExistingCard:
     properties: dict
 
 
+# --- 新規カード作成の安全性検証(provenance/stable key/書き込み境界) -------------
+#
+# 英語記事(magic.wizards.com)由来のカードはパース時点でname_jaが取得できない。
+# 「新規カードページは、日本語名・英語名・確認元・同定情報・重複確認が揃った
+# 検証済み計画からのみ作成できる」という不変条件を型で表現するための一群。
+
+PROVENANCE_EXISTING_NOTION_CARD = "existing_notion_card"
+PROVENANCE_ARTICLE_JAPANESE_NAME = "article_japanese_name"
+PROVENANCE_EXPLICIT_HUMAN_CONFIRMATION = "explicit_human_confirmation"
+PROVENANCE_UNCONFIRMED = "unconfirmed"
+PROVENANCE_INVALID = "invalid"
+
+#: 新規カード作成(VerifiedNewCard生成)を許可するprovenance。
+CREATABLE_PROVENANCES = (PROVENANCE_ARTICLE_JAPANESE_NAME, PROVENANCE_EXPLICIT_HUMAN_CONFIRMATION)
+
+RESOLUTION_EXISTING_CARD = "existing_card"
+RESOLUTION_CREATABLE_FROM_ARTICLE_JAPANESE_NAME = "creatable_from_article_japanese_name"
+RESOLUTION_CREATABLE_FROM_HUMAN_CONFIRMATION = "creatable_from_human_confirmation"
+RESOLUTION_BLOCKED_MISSING_JAPANESE_NAME = "blocked_missing_japanese_name"
+RESOLUTION_BLOCKED_MISSING_CONFIRMATION = "blocked_missing_confirmation"
+RESOLUTION_BLOCKED_AMBIGUOUS_MATCH = "blocked_ambiguous_match"
+RESOLUTION_BLOCKED_INVALID_MAPPING = "blocked_invalid_mapping"
+RESOLUTION_BLOCKED_IDENTITY_CONFLICT = "blocked_identity_conflict"
+
+#: resolution_status のうち、Notionへの新規作成を止めるべきもの。
+BLOCKED_RESOLUTION_STATUSES = frozenset(
+    {
+        RESOLUTION_BLOCKED_MISSING_JAPANESE_NAME,
+        RESOLUTION_BLOCKED_MISSING_CONFIRMATION,
+        RESOLUTION_BLOCKED_AMBIGUOUS_MATCH,
+        RESOLUTION_BLOCKED_INVALID_MAPPING,
+        RESOLUTION_BLOCKED_IDENTITY_CONFLICT,
+    }
+)
+
+#: CardDecision.action のうち、新規カード作成が安全性理由でブロックされたもの。
+#: 既存の "ambiguous" / "error" とは別の理由(日本語名未確認等)で
+#: 新規作成のみを止める(照合そのものはambiguousではない)。
+BLOCKED_CREATION_ACTIONS = frozenset(
+    {
+        RESOLUTION_BLOCKED_MISSING_JAPANESE_NAME,
+        RESOLUTION_BLOCKED_MISSING_CONFIRMATION,
+        RESOLUTION_BLOCKED_INVALID_MAPPING,
+        RESOLUTION_BLOCKED_IDENTITY_CONFLICT,
+    }
+)
+
+
+@dataclass(frozen=True)
+class ConfirmationSource:
+    """人間確認済み日本語名の出典。
+
+    単なる任意文字列を「安全」とみなさないよう、種別(type)を必須にする。
+    """
+
+    type: str
+    reference: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.type:
+            raise DeckCardValidationError("ConfirmationSource.type が空です。")
+
+    def to_dict(self) -> dict:
+        return {"type": self.type, "reference": self.reference}
+
+
+@dataclass(frozen=True)
+class VerifiedNewCard:
+    """新規カード作成の書き込み境界(未検証のDeckCardを直接渡さないための型)。
+
+    CardRepository.create_card() はこの型のみを受け取る。name_ja は必ず
+    確認済み(provenanceがCREATABLE_PROVENANCESのいずれか)であることを
+    コンストラクタで再検証する。display_name のような英語名フォールバックは
+    持たない(安全判定に使えないようにするため意図的に持たせていない)。
+    """
+
+    name_ja: str
+    name_en: str | None
+    provenance: str
+    confirmation_source: ConfirmationSource | None
+    source_url: str
+    source_reference: str | None
+    stable_key: str
+    quantity: int
+    is_commander: bool
+
+    def __post_init__(self) -> None:
+        if not self.name_ja:
+            raise DeckCardValidationError("VerifiedNewCard.name_ja が空です(安全機構違反)。")
+        if self.provenance not in CREATABLE_PROVENANCES:
+            raise DeckCardValidationError(
+                f"VerifiedNewCard.provenance が新規作成を許可しない値です: {self.provenance!r}"
+            )
+        if (
+            self.provenance == PROVENANCE_EXPLICIT_HUMAN_CONFIRMATION
+            and self.confirmation_source is None
+        ):
+            raise DeckCardValidationError(
+                "explicit_human_confirmationにはconfirmation_sourceが必須です。"
+            )
+
+
+@dataclass(frozen=True)
+class CardResolution:
+    """1カード(1デッキ内での出現)の解決結果(import/verify/マニフェスト共通)。"""
+
+    article_url: str
+    deck_name: str
+    quantity: int
+    is_commander: bool
+    name_en: str | None
+    name_ja: str | None
+    provenance: str | None
+    confirmation_source: ConfirmationSource | None
+    source_reference: str | None
+    stable_key: str
+    existing_page_id: str | None
+    existing_candidate_page_ids: list[str]
+    resolution_status: str
+    block_reason: str | None = None
+    verified_card: VerifiedNewCard | None = None
+
+    @property
+    def is_blocked(self) -> bool:
+        return self.resolution_status in BLOCKED_RESOLUTION_STATUSES
+
+
 @dataclass(frozen=True)
 class CardDecision:
     """1カードに対するNotion登録計画(dry-run/適用で共有する)。
 
     action は以下のいずれか:
-    - "create": カードDBに新規ページを作成する
+    - "create": カードDBに新規ページを作成する(resolutionのprovenanceが
+      article_japanese_name または explicit_human_confirmationの場合のみ)
     - "relation_update": 既存カードに採用デッキのリレーションを追加する(所持もtrue化しうる)
     - "unchanged": 既存カードで変更不要(既にリレーション済み・所持済み)
     - "ambiguous": カードDB内で候補が複数あり一意に決定できない
     - "error": その他の理由で処理できない
+    - BLOCKED_CREATION_ACTIONS のいずれか: 新規カードだが日本語名が未確認等の
+      理由でNotionへの作成を止める(models.BLOCKED_CREATION_ACTIONS参照)
     """
 
     card: DeckCard
@@ -131,3 +268,5 @@ class CardDecision:
     detail: str = ""
     owned_will_change: bool = False
     override_used: str | None = None
+    #: 新規作成判定の根拠(action=="create" または BLOCKED_CREATION_ACTIONS のときのみ設定)。
+    resolution: CardResolution | None = None

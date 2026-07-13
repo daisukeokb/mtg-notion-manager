@@ -19,7 +19,7 @@ import pytest
 from mtg_notion_manager.exceptions import NotionAPIError
 from mtg_notion_manager.models import DeckCard, ExistingCard, ExistingDeck, ParsedDeckList
 from mtg_notion_manager.notion.card_repository import CardMatch
-from mtg_notion_manager.services import import_article, verify_import
+from mtg_notion_manager.services import card_resolution, import_article, verify_import
 from mtg_notion_manager.services import import_cards as import_cards_module
 from mtg_notion_manager.services.deck_page_mapping import RESOLUTION_EXPLICIT_MAPPING
 
@@ -146,24 +146,38 @@ def _deck_page(page_id: str, name: str) -> dict:
     }
 
 
-def _write_mapping(tmp_path: Path) -> Path:
+def _write_mapping(tmp_path: Path, decks: list[str] | None = None) -> Path:
+    all_deck_entries = {
+        DECK_A_EN: {
+            "article_deck_name": DECK_A_EN,
+            "page_id": DECK_A_PAGE_ID,
+            "expected_page_name": DECK_A_JA,
+        },
+        DECK_B_EN: {
+            "article_deck_name": DECK_B_EN,
+            "page_id": DECK_B_PAGE_ID,
+            "expected_page_name": DECK_B_JA,
+        },
+    }
+    target_decks = decks if decks is not None else [DECK_A_EN, DECK_B_EN]
     data = {
         "schema_version": 1,
         "article_url": ARTICLE_URL,
-        "decks": [
-            {
-                "article_deck_name": DECK_A_EN,
-                "page_id": DECK_A_PAGE_ID,
-                "expected_page_name": DECK_A_JA,
-            },
-            {
-                "article_deck_name": DECK_B_EN,
-                "page_id": DECK_B_PAGE_ID,
-                "expected_page_name": DECK_B_JA,
-            },
-        ],
+        "decks": [all_deck_entries[name] for name in target_decks],
     }
     path = tmp_path / "deck_page_mapping.json"
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _write_confirmed_card_mapping(tmp_path: Path, cards: list[dict]) -> Path:
+    data = {
+        "schema_version": 1,
+        "stable_key_version": card_resolution.STABLE_KEY_VERSION,
+        "article_url": ARTICLE_URL,
+        "cards": cards,
+    }
+    path = tmp_path / "confirmed_card_mapping.json"
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     return path
 
@@ -188,9 +202,16 @@ def _patch_common(monkeypatch: pytest.MonkeyPatch, parse_map: dict[str, ParsedDe
 
 
 class TestLorwynEclipsedScenario:
-    def test_import_article_resolves_both_decks_via_mapping(
+    def test_import_article_resolves_both_decks_via_mapping_but_blocks_unconfirmed_new_cards(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        """ローウィンの昏明の実症状そのもの: デッキページの解決(名前→ページ)は
+        --deck-page-mapで解決できるが、記事が英語のため全カードが新規かつ
+        日本語名未確認になる。--confirmed-card-map を指定しない限り、
+        安全機構がこれらの新規カード作成をブロックし、デッキ全体がneeds_reviewになる
+        (以前はここで無条件にcreateされ、英語名がそのまま日本語タイトルへ
+        書き込まれていた)。
+        """
         cards_a = [_card(f"a-card-{i}") for i in range(100)]
         cards_b = [_card(f"b-card-{i}") for i in range(100)]
         parse_map = {DECK_A_EN: _parsed(DECK_A_EN, cards_a), DECK_B_EN: _parsed(DECK_B_EN, cards_b)}
@@ -210,7 +231,7 @@ class TestLorwynEclipsedScenario:
         entry_a = next(e for e in plan.entries if e.deck_name == DECK_A_EN)
         entry_b = next(e for e in plan.entries if e.deck_name == DECK_B_EN)
 
-        assert entry_a.status == import_article.STATUS_READY
+        # デッキページの解決自体は成功する(mapping機能は無関係に正しく動く)。
         assert entry_a.deck_page_id == DECK_A_PAGE_ID
         assert entry_a.resolution_method == RESOLUTION_EXPLICIT_MAPPING
         assert entry_a.cards_plan is not None
@@ -218,11 +239,79 @@ class TestLorwynEclipsedScenario:
         assert entry_a.cards_plan.summary.get("ambiguous", 0) == 0
         assert entry_a.cards_plan.summary.get("error", 0) == 0
 
-        assert entry_b.status == import_article.STATUS_READY
+        # しかし全カードが日本語名未確認のため、安全機構によりneeds_reviewになる。
+        assert entry_a.status == import_article.STATUS_NEEDS_REVIEW
+        assert "日本語名" in entry_a.reason
+        summary_a = card_resolution.summarize_decisions(entry_a.cards_plan.decisions)
+        assert summary_a.pending_confirmation_count == 100
+        assert summary_a.creatable_from_article_japanese_name_count == 0
+        assert summary_a.creatable_from_human_confirmation_count == 0
+
         assert entry_b.deck_page_id == DECK_B_PAGE_ID
         assert entry_b.resolution_method == RESOLUTION_EXPLICIT_MAPPING
-        assert entry_b.cards_plan is not None
-        assert entry_b.cards_plan.parsed.total_quantity == 100
+        assert entry_b.status == import_article.STATUS_NEEDS_REVIEW
+
+        # preflightが全件成功していないため、書き込みフェーズは一切開始しない。
+        # FakeCardRepository.create_card/apply_relation_updateはAssertionErrorを
+        # 送出する設計のため、例外なく完了すること自体が書き込みゼロの証明になる。
+        assert plan.is_fully_applicable is False
+        applied = import_article.execute_article_import(plan, card_repo)
+        assert all(e.apply_result is None for e in applied.entries)
+
+    def test_confirmed_card_map_unblocks_creation_for_covered_cards(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """--confirmed-card-map で人間確認済みのカードだけが新規作成対象になる。
+        1件でも未確認カードが残っていれば、デッキ全体はneeds_reviewのままになる
+        (部分適用は行わない)。
+        """
+        cards_a = [_card(f"a-card-{i}") for i in range(3)]
+        parse_map = {DECK_A_EN: _parsed(DECK_A_EN, cards_a)}
+        _patch_common(monkeypatch, parse_map)
+
+        writer = FakeWriter({DECK_A_PAGE_ID: _deck_page(DECK_A_PAGE_ID, DECK_A_JA)})
+        matches = _make_matches("a", 3)
+        card_repo = FakeCardRepository(matches)
+        deck_mapping_path = _write_mapping(tmp_path, decks=[DECK_A_EN])
+
+        # 3枚中2枚だけ人間確認済みにする(1枚は未確認のまま残す)。
+        confirmed_entries = []
+        for i in range(2):
+            name_en = f"a-card-{i}"
+            stable_key = card_resolution.compute_stable_key(ARTICLE_URL, name_en, None, None)
+            confirmed_entries.append(
+                {
+                    "stable_key": stable_key,
+                    "name_en": name_en,
+                    "name_ja": f"日本語名{i}",
+                    "confirmation_source": {
+                        "type": "official_card_page",
+                        "reference": f"https://example.com/{i}",
+                    },
+                }
+            )
+        confirmed_path = _write_confirmed_card_mapping(tmp_path, confirmed_entries)
+
+        plan = import_article.build_article_import_plan(
+            ARTICLE_URL,
+            writer,
+            card_repo,
+            include_deck_names=[DECK_A_EN],
+            allow_count_mismatch=True,
+            deck_page_map_path=deck_mapping_path,
+            confirmed_card_map_path=confirmed_path,
+        )
+
+        entry_a = plan.entries[0]
+        summary_a = card_resolution.summarize_decisions(entry_a.cards_plan.decisions)
+        assert summary_a.creatable_from_human_confirmation_count == 2
+        assert summary_a.pending_confirmation_count == 1
+        # 1枚でも未確認が残っていれば、デッキ全体はneeds_reviewのまま。
+        assert entry_a.status == import_article.STATUS_NEEDS_REVIEW
+        assert plan.is_fully_applicable is False
+
+        applied = import_article.execute_article_import(plan, card_repo)
+        assert applied.entries[0].apply_result is None
 
     def test_import_and_verify_agree_on_same_page_resolution(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
