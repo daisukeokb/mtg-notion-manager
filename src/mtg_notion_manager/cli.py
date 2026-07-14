@@ -96,6 +96,23 @@ from mtg_notion_manager.services.review_duplicate_conflicts import (
     review_duplicate_conflicts,
     write_review_reports,
 )
+from mtg_notion_manager.services.single_card_title_update import (
+    PreApplySnapshot,
+    SingleTitleUpdateWriter,
+    SingleUpdatePreflightResult,
+    build_single_update_preflight,
+    install_single_title_update_write_guard,
+    load_single_update_manifest,
+    preflight_to_json_dict,
+    verify_optimistic_lock,
+    verify_post_update,
+)
+from mtg_notion_manager.services.single_card_title_update import (
+    write_json_report as write_single_json_report,
+)
+from mtg_notion_manager.services.single_card_title_update import (
+    write_markdown_report as write_single_markdown_report,
+)
 from mtg_notion_manager.services.title_update_dry_run import (
     ReadOnlyNotionClient,
     build_title_update_dry_run_plan,
@@ -1244,6 +1261,193 @@ def plan_title_updates_command(
 
     if not report.all_or_nothing_eligible:
         raise typer.Exit(code=1)
+
+
+@app.command(name="apply-single-title-update")
+def apply_single_title_update_command(
+    manifest: str = typer.Option(
+        ..., "--manifest", help="1件専用の人間確認済みタイトル更新マニフェストのJSONパス"
+    ),
+    expected_count: int = typer.Option(
+        ..., "--expected-count", help="マニフェストのentry件数(1固定。1以外は即失敗)"
+    ),
+    max_updates: int = typer.Option(
+        ..., "--max-updates", help="今回の実行で許可する最大更新件数(1固定。1以外は即失敗)"
+    ),
+    approval_digest: str = typer.Option(
+        None,
+        "--approval-digest",
+        help=(
+            "preflightで算出したoperation_digestと完全一致する場合のみ書き込みを許可する"
+            "(--apply指定時は必須。固定の承認トークンは存在しない)"
+        ),
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="実際に1件だけ書き込む(指定しない限り読み取り専用preflightのみで終了する)",
+    ),
+    output_dir: str = typer.Option("reports", "--output-dir", help="レポートの出力先ディレクトリ"),
+) -> None:
+    """人間確認済みの日本語タイトルを、対象1件・プロパティ1件・書き込み1回だけに
+    制限して更新する、1件専用コマンド(読み取り専用preflight+ガード付き実更新)。
+
+    --apply を指定しない場合は読み取り専用preflightのみを実行し、operation_digestを
+    表示するだけでNotionへは一切書き込まない。--apply指定時も、--expected-countと
+    --max-updatesが両方とも1、マニフェストのentryが1件、--approval-digestが
+    preflight再計算結果と完全一致、書き込み直前の楽観的ロック(状態変化なし)、
+    かつ全ての安全確認(現在タイトル・英語名一致、同名衝突なし、relation整合)を
+    通過した場合のみ、タイトルプロパティを1回だけ更新する。事後検証に失敗しても
+    自動rollback・自動再試行は行わない。
+    """
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=1)
+
+    if expected_count != 1:
+        console.print(
+            f"[red]エラー:[/red] --expected-count は 1 でなければなりません"
+            f"(指定値: {expected_count})。"
+        )
+        raise typer.Exit(code=1)
+    if max_updates != 1:
+        console.print(
+            f"[red]エラー:[/red] --max-updates は 1 でなければなりません(指定値: {max_updates})。"
+        )
+        raise typer.Exit(code=1)
+
+    manifest_path = Path(manifest)
+    try:
+        entry = load_single_update_manifest(manifest_path)
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            install_http_write_guard(client)
+            read_only_client = ReadOnlyNotionClient(client)
+            preflight = build_single_update_preflight(
+                read_only_client, config.card_data_source_id, entry
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    _print_single_update_preflight(preflight)
+
+    data = preflight_to_json_dict(preflight, write_operations=0)
+    json_path = write_single_json_report(
+        data, Path(output_dir) / f"preflight-single-card-title-{_timestamp()}.json"
+    )
+    md_path = write_single_markdown_report(
+        data, Path(output_dir) / f"preflight-single-card-title-{_timestamp()}.md"
+    )
+    console.print("レポートを出力しました:")
+    console.print(f"  - {json_path}")
+    console.print(f"  - {md_path}")
+
+    if not apply:
+        console.print(
+            "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません"
+            "(preflightのみ)。[/cyan]"
+        )
+        raise typer.Exit(code=0 if preflight.eligible_for_future_update else 1)
+
+    # --- ここから先は --apply 指定時のみ到達する ---
+    if not preflight.eligible_for_future_update:
+        console.print("[red]エラー:[/red] preflightが適用不可のため、書き込みを行いません。")
+        raise typer.Exit(code=1)
+
+    if not approval_digest or approval_digest != preflight.operation_digest:
+        console.print(
+            "[red]エラー:[/red] --approval-digest がpreflight結果のoperation_digestと"
+            " 完全一致しないため、書き込みを行いません。"
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            install_http_write_guard(client)
+            read_only_client = ReadOnlyNotionClient(client)
+            fresh_preflight = build_single_update_preflight(
+                read_only_client, config.card_data_source_id, entry
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    changes = verify_optimistic_lock(preflight, fresh_preflight)
+    if changes:
+        console.print(
+            f"[red]エラー:[/red] 書き込み直前の状態確認で変化を検出したため中止します: {changes}"
+        )
+        raise typer.Exit(code=1)
+
+    snapshot = PreApplySnapshot.from_preflight(fresh_preflight, now=_timestamp())
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            write_call_log = install_single_title_update_write_guard(
+                client,
+                approved_page_id=entry.page_id,
+                title_property_name=fresh_preflight.title_property_name,
+                approved_new_title=entry.confirmed_new_title,
+            )
+            writer = SingleTitleUpdateWriter(client)
+            writer.update_title(
+                entry.page_id, fresh_preflight.title_property_name, entry.confirmed_new_title
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] 書き込みに失敗しました: {exc}")
+        raise typer.Exit(code=1) from exc
+
+    write_count = sum(
+        1
+        for call in write_call_log
+        if call.allowed and call.method != "GET" and not call.url.rstrip("/").endswith("/query")
+    )
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            install_http_write_guard(client)
+            read_only_client = ReadOnlyNotionClient(client)
+            after_preflight = build_single_update_preflight(
+                read_only_client, config.card_data_source_id, entry
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    post_result = verify_post_update(snapshot, after_preflight, entry, write_count)
+
+    console.print(f"書き込み回数: {write_count}")
+    console.print(f"事後検証: {post_result}")
+    console.print(
+        "[yellow]事後検証に失敗しても自動rollback・自動再試行は行いません。"
+        "誤更新時は別途rollbackマニフェスト・別承認フローで対応してください。[/yellow]"
+    )
+
+    if not post_result.all_passed:
+        raise typer.Exit(code=1)
+
+
+def _print_single_update_preflight(preflight: SingleUpdatePreflightResult) -> None:
+    console.print(f"page_id: {preflight.page_id}")
+    console.print(
+        f"現在タイトル: {preflight.current_title} (期待: {preflight.expected_current_title})"
+    )
+    console.print(f"新タイトル: {preflight.confirmed_new_title}")
+    console.print(f"適用可能: {preflight.eligible_for_future_update}")
+    console.print(f"ブロック理由: {'; '.join(preflight.blocking_reasons) or 'なし'}")
+    console.print(f"operation_digest: {preflight.operation_digest}")
+    console.print("approval_required: true")
 
 
 def _timestamp() -> str:
