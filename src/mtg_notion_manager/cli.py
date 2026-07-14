@@ -1,3 +1,4 @@
+import datetime
 import json
 from pathlib import Path
 from typing import Optional
@@ -94,6 +95,15 @@ from mtg_notion_manager.services.review_duplicate_conflicts import (
     REVIEW_CATEGORY_LABELS,
     review_duplicate_conflicts,
     write_review_reports,
+)
+from mtg_notion_manager.services.title_update_dry_run import (
+    ReadOnlyNotionClient,
+    build_title_update_dry_run_plan,
+    install_http_write_guard,
+    load_confirmed_title_update_manifest,
+    to_json_dict,
+    write_json_report,
+    write_markdown_report,
 )
 from mtg_notion_manager.services.verify_import import (
     VERIFICATION_VERIFIED,
@@ -1129,6 +1139,115 @@ def verify_import_command(
 
     if report.verification_status != VERIFICATION_VERIFIED:
         raise typer.Exit(code=1)
+
+
+@app.command(name="plan-title-updates")
+def plan_title_updates_command(
+    manifest: str = typer.Option(
+        ..., "--manifest", help="人間確認済みタイトル更新マニフェストのJSONパス"
+    ),
+    expected_count: int = typer.Option(
+        ...,
+        "--expected-count",
+        help="マニフェストに含まれるべきentry件数(不一致ならNotionへ接続せず失敗する)",
+    ),
+    output_dir: str = typer.Option(
+        "reports", "--output-dir", help="dry-runレポート(JSON/Markdown)の出力先ディレクトリ"
+    ),
+) -> None:
+    """人間確認済みの日本語タイトルへの変更計画を、読み取り専用で作成する(dry-run専用)。
+
+    Notionへの書き込みは一切行わない(--applyに相当するオプションは存在しない)。
+    対象ページはマニフェスト内のpage_idのみで特定する(英語名・日本語名の検索は
+    同名ページの衝突確認にのみ使い、対象の決定には使わない)。
+
+    終了コード: 0=対象件数が期待値と一致し全件適用可能 / 1=マニフェスト不正・
+    件数不一致・Notion読み取りエラー・1件でも適用不可(ブロック)のいずれか。
+    """
+    try:
+        config = Config.load()
+    except ConfigError as exc:
+        console.print(f"[red]設定エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    if not config.card_data_source_id:
+        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        raise typer.Exit(code=1)
+
+    manifest_path = Path(manifest)
+    try:
+        loaded_manifest = load_confirmed_title_update_manifest(
+            manifest_path, expected_entry_count=expected_count
+        )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        with NotionClient(config.notion_api_key) as client:
+            http_call_log = install_http_write_guard(client)
+            read_only_client = ReadOnlyNotionClient(client)
+            report = build_title_update_dry_run_plan(
+                read_only_client,
+                config.card_data_source_id,
+                loaded_manifest,
+                str(manifest_path),
+            )
+    except MtgNotionManagerError as exc:
+        console.print(f"[red]エラー:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    write_ops = sum(1 for call in http_call_log if not call.allowed)
+    data = to_json_dict(report, write_operations=write_ops, write_attempts=write_ops)
+    data["expected_target_count"] = expected_count
+    data["notion_access"]["called_endpoints"] = sorted(
+        {f"{c.method} {c.url}" for c in http_call_log}
+    )
+    data["notion_access"]["rejected_call_count"] = write_ops
+
+    console.print(
+        f"対象件数: {len(report.entries)} / 期待件数: {expected_count}"
+    )
+    console.print(f"適用可能: {report.eligible_count} / ブロック: {report.blocked_count}")
+    console.print(f"all-or-nothing判定: {report.all_or_nothing_eligible}")
+    console.print(f"Notion書き込み操作数: {write_ops} / 拒否されたHTTP呼び出し: {write_ops}")
+
+    table = Table(title="タイトル更新dry-run結果")
+    table.add_column("page_id")
+    table.add_column("現在タイトル")
+    table.add_column("新タイトル")
+    table.add_column("適用可能")
+    table.add_column("ブロック理由")
+    for entry in report.entries:
+        table.add_row(
+            entry.page_id,
+            entry.current_title or "-",
+            entry.confirmed_new_title,
+            str(entry.eligible_for_future_update),
+            "; ".join(entry.blocking_reasons) or "-",
+        )
+    console.print(table)
+
+    json_path = write_json_report(
+        data, Path(output_dir) / f"dry-run-card-title-updates-{_timestamp()}.json"
+    )
+    md_path = write_markdown_report(
+        data, Path(output_dir) / f"dry-run-card-title-updates-{_timestamp()}.md"
+    )
+    console.print("レポートを出力しました:")
+    console.print(f"  - {json_path}")
+    console.print(f"  - {md_path}")
+    console.print(
+        "[cyan]このコマンドは読み取り専用のdry-run専用です。"
+        "Notionへの書き込みは一切行いません。[/cyan]"
+    )
+
+    if not report.all_or_nothing_eligible:
+        raise typer.Exit(code=1)
+
+
+def _timestamp() -> str:
+    return datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
 
 if __name__ == "__main__":

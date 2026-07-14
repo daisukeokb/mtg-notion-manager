@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "purpose": "plan_existing_card_title_updates",
+  "source_audit_report": "reports/audit-strixhaven-cards-EXAMPLE.json",
+  "entries": [
+    {
+      "page_id": "00000000-0000-0000-0000-000000000000",
+      "expected_current_title": "Example English Title",
+      "confirmed_new_title": "サンプル日本語タイトル",
+      "expected_english_name": "Example English Title",
+      "source_deck_ids": ["00000000-0000-0000-0000-000000000001"],
+      "verification_status": "human_confirmed",
+      "verification_actor": "user",
+      "verification_note": "Japanese card title explicitly confirmed by the user",
+      "reference_url": "https://example.com/card-reference"
+    }
+  ]
+}
