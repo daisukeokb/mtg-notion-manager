@@ -294,6 +294,10 @@ class ReadOnlyNotionClient:
         self._record("get_page")
         return self._client.get_page(page_id)
 
+    def get_data_source(self, data_source_id: str) -> dict:
+        self._record("get_data_source")
+        return self._client.get_data_source(data_source_id)
+
     def query_data_source_by_title(
         self, data_source_id: str, title_property: str, title: str
     ) -> list[dict]:
@@ -456,8 +460,8 @@ def _plan_one(
         )
 
     properties = page.get("properties", {})
-    current_title = _plain_text(properties, TITLE_PROPERTY)
-    current_english_name = _plain_text(properties, ENGLISH_NAME_PROPERTY)
+    current_title = plain_text(properties, TITLE_PROPERTY)
+    current_english_name = plain_text(properties, ENGLISH_NAME_PROPERTY)
 
     is_archived_or_trashed = bool(page.get("archived")) or bool(page.get("in_trash"))
     if is_archived_or_trashed:
@@ -477,13 +481,13 @@ def _plan_one(
             f" actual={current_english_name!r}"
         )
 
-    same_title_check = _check_same_title(
+    same_title_check = check_same_title(
         client, card_data_source_id, entry.confirmed_new_title, entry.page_id
     )
     if same_title_check.classification == "blocking_same_title":
         blocking_reasons.append("blocking_same_title_exists")
 
-    relation_snapshot = _build_relation_snapshot(client, entry, page, properties)
+    relation_snapshot = build_relation_snapshot(client, entry, page, properties)
     if not relation_snapshot.source_deck_ids_present:
         blocking_reasons.append("source_deck_relation_missing")
     if not relation_snapshot.deck_to_card_consistent:
@@ -509,13 +513,13 @@ def _plan_one(
     )
 
 
-def _check_same_title(
+def check_same_title(
     client: ReadOnlyNotionClient, card_data_source_id: str, new_title: str, self_page_id: str
 ) -> SameTitleCheck:
     results = client.query_data_source_by_title(card_data_source_id, TITLE_PROPERTY, new_title)
     matching = [
         SameTitlePageRef(
-            page_id=page["id"], title=_plain_text(page.get("properties", {}), TITLE_PROPERTY)
+            page_id=page["id"], title=plain_text(page.get("properties", {}), TITLE_PROPERTY)
         )
         for page in results
         if page["id"] != self_page_id
@@ -526,7 +530,7 @@ def _check_same_title(
     )
 
 
-def _build_relation_snapshot(
+def build_relation_snapshot(
     client: ReadOnlyNotionClient,
     entry: ConfirmedTitleUpdateEntry,
     page: dict,
@@ -578,7 +582,7 @@ def _build_relation_snapshot(
     )
 
 
-def _plain_text(properties: dict, name: str) -> str | None:
+def plain_text(properties: dict, name: str) -> str | None:
     prop = properties.get(name)
     if prop is None:
         return None
