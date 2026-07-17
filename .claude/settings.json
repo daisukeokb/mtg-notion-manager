@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '(.tool_input.file_path // .tool_response.filePath // empty)' 2>/dev/null | { read -r f; case \"$f\" in */tests/*) : ;; */src/mtg_notion_manager/cli.py) echo '{\"systemMessage\": \"📘 Wiki同期リマインド: cli.py を編集しました。CLIコマンド/引数を変更した場合は 💻CLI仕様 ページを確認・更新してください。\"}' ;; */src/mtg_notion_manager/notion/*.py|*/src/mtg_notion_manager/services/doctor.py) echo '{\"systemMessage\": \"📘 Wiki同期リマインド: Notion接続/スキーマ関連コードを編集しました。🗃Notion Data Model ページを確認・更新してください。\"}' ;; */src/mtg_notion_manager/services/*.py) echo '{\"systemMessage\": \"📘 Wiki同期リマインド: services配下を編集しました。JSON出力/契約変更なら 📐Data Contracts、安全設計に関わる変更なら 📚ADR も確認・更新してください。\"}' ;; */src/mtg_notion_manager/*.py) echo '{\"systemMessage\": \"📘 Wiki同期リマインド: src配下のコードを編集しました。関連するWikiページ(Repository Map等)を確認してください。\"}' ;; esac; } 2>/dev/null || true",
+            "statusMessage": "Wiki同期を確認中..."
+          }
+        ]
+      }
+    ]
+  }
+}
