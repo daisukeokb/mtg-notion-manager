@@ -68,6 +68,14 @@ Notion APIは2025-09-03以降のバージョン(data source対応)を使うこ�
 
 `tests/fixtures/` には実際のページから抽出した単一デッキ分のHTML断片を置く(著作権配慮のため最小限の抜粋)。`pytest` で実行。
 
+## Generation Workspace Tool(Boundary Note)
+
+- Tool Location: `tools/generation_workspace/`
+- Integration: Independent Python Package(このRepositoryの製品機能=MTG統率者DB管理とは無関係。詳細は`tools/generation_workspace/README.md`を参照)
+- Production Authorization: Repository Integrationとは別のUser Authorizationが必要(Repositoryに存在すること自体は実行許可を意味しない)
+- Official Execution: Installed `generation-workspace` または Installed `python -m generation_workspace`
+- Production Prohibition: PYTHONPATH依存、Temporary Launcher、Ad-hoc Scriptによる実行は禁止
+
 ## 指示書に基づく実装の必須手順(例外なく実施する)
 
 ユーザーから指示書(Work Unit指示書・再開指示書・Addendum等)を渡されて作業する場合、実装や作業の完了後に必ず次の3ステップを順に実施する。指示書側にこの記載がなくても実施する。
