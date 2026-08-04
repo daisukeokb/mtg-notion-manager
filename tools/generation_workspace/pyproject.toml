@@ -1,0 +1,24 @@
+[project]
+name = "wp-claim-exit-generation-workspace"
+version = "0.1.0"
+description = "Independent Generation Directory + Single Atomic Active Generation Switch tool for WP-CLAIM-EXIT workspace integrity. Not a Notion/MTG product feature."
+readme = "README.md"
+requires-python = ">=3.9"
+
+[project.scripts]
+generation-workspace = "generation_workspace.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["generation_workspace"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["generation_workspace", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

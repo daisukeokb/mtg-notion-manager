@@ -67,3 +67,31 @@ jobs:
           python -m pip install -e ".[dev]"
       - name: Run mypy
         run: mypy src
+
+  generation-workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+          python -m pip install -e tools/generation_workspace
+      - name: Run generation workspace pytest
+        run: pytest tools/generation_workspace/tests
+      - name: Report generation workspace pytest collection count
+        run: pytest tools/generation_workspace/tests --collect-only -q
+      - name: Run ruff on generation workspace
+        run: ruff check tools/generation_workspace
+      - name: Run mypy on generation workspace
+        run: mypy tools/generation_workspace/generation_workspace
+      - name: Verify official console CLI
+        run: generation-workspace --help
+      - name: Verify official module CLI
+        run: python -m generation_workspace --help
