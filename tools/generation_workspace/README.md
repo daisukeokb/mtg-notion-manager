@@ -169,6 +169,32 @@ the editable install, the test suite (including `--collect-only`), `ruff`,
 workspace, never runs `--apply`, and writes only inside pytest's own
 temporary directories.
 
+## Flat Baseline Governance
+
+The Flat Baseline is the set of files that sat directly under
+`workspace_root` before Bootstrap ran — the same files
+`bootstrap_generation_workspace` copies into `generations/gen-0000000001/`.
+Once a Generation exists, Governance Decision `UD-OGR-01` fixes the Flat
+Baseline's role as **`FROZEN_EVIDENCE`**, and only that role:
+
+- **Operational Read: NO** — once a Generation exists, the Flat Baseline is
+  not an authorized operational read source.
+- **Fallback: NO** — the Flat Baseline is not an authorized fallback when
+  Generation read, verification, or resolution fails.
+- **Recovery Source: NO** — the Flat Baseline must not be selected, restored
+  from, or otherwise treated as a recovery source.
+- **Canonical Read Source: NO** — the Flat Baseline is not an authorized
+  canonical source for operational reads. Establishing the canonical
+  operational reader is a separate concern and is not defined by this
+  governance role.
+
+The Flat Baseline's only sanctioned purpose is as evidence: a historical
+comparison point and audit record of what Bootstrap materialized into
+`gen-0000000001`. It exists so that a human, or a future audit, can
+independently check the Bootstrap Generation against its origin. It is not
+authorized for operational reads, fallback, recovery, or canonical reads,
+and no such role is established by this governance decision.
+
 ## Production Authorization Boundary
 
 Being importable, installable, or covered by CI in this repository does
