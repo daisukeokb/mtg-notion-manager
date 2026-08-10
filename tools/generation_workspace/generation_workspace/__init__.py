@@ -9,6 +9,7 @@ It is not part of the installable ``mtg-notion-manager`` distribution.
 
 from .bootstrap import BootstrapResult, bootstrap_generation_workspace
 from .digest import compute_generation_digest
+from .recovery_inspection import RecoveryInspectionResult, inspect_generation_recovery
 from .resolver import (
     ResolveResult,
     VerifiedActiveGeneration,
@@ -48,4 +49,6 @@ __all__ = [
     "begin_generation_transaction",
     "commit_generation_transaction",
     "recover_generation_transaction",
+    "RecoveryInspectionResult",
+    "inspect_generation_recovery",
 ]
