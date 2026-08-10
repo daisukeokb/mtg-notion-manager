@@ -11,7 +11,12 @@ from .bootstrap import BootstrapResult, bootstrap_generation_workspace
 from .digest import compute_generation_digest
 from .resolver import (
     ResolveResult,
+    VerifiedActiveGeneration,
+    VerifiedActiveGenerationResult,
+    VerifiedFile,
     VerifyResult,
+    read_verified_active_generation,
+    read_verified_file,
     resolve_active_generation,
     verify_active_generation,
 )
@@ -30,6 +35,11 @@ __all__ = [
     "compute_generation_digest",
     "ResolveResult",
     "VerifyResult",
+    "VerifiedActiveGeneration",
+    "VerifiedActiveGenerationResult",
+    "VerifiedFile",
+    "read_verified_active_generation",
+    "read_verified_file",
     "resolve_active_generation",
     "verify_active_generation",
     "BeginResult",

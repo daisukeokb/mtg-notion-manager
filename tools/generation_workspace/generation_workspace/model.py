@@ -25,6 +25,19 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 
 _CANONICAL_SEPARATORS = (",", ":")
 
+# Canonical Operational Reader (WP-OGR-01) failure classification. These are
+# shared, read-only classification constants — not mutation authorization
+# error codes — so they live here rather than in mutation_guard.py, keeping
+# the existing "read-only APIs never depend on mutation_guard" boundary
+# intact (see mutation_guard.py's module docstring).
+ACTIVE_GENERATION_ABSENT = "ACTIVE_GENERATION_ABSENT"
+ACTIVE_GENERATION_MALFORMED = "ACTIVE_GENERATION_MALFORMED"
+ACTIVE_GENERATION_SYMLINK = "ACTIVE_GENERATION_SYMLINK"
+GENERATION_MISSING = "GENERATION_MISSING"
+GENERATION_SYMLINK = "GENERATION_SYMLINK"
+GENERATION_DIGEST_MISMATCH = "GENERATION_DIGEST_MISMATCH"
+GENERATION_INVENTORY_MISMATCH = "GENERATION_INVENTORY_MISMATCH"
+
 
 class MalformedPointerError(ValueError):
     """Raised when a pointer file cannot be parsed or fails validation."""
