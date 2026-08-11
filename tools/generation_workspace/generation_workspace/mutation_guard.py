@@ -21,6 +21,11 @@ from pathlib import Path
 from .model import is_valid_generation_id, is_valid_sha256, is_valid_uuid
 
 AUTHORIZATION_SCHEMA_VERSION = "WP-CLAIM-EXIT-MUTATION-AUTHORIZATION-v1"
+# v2 adds generation_source_expected_files (GENERATION_SOURCE_CONTENT_INVENTORY,
+# UD-OGR-02-INV-01) for GENERATION_TRANSACTION only. v1 parsing/canonicalization/
+# digest are entirely unaffected; see parse_authorization_obj's exact-match
+# dispatch and MutationAuthorization.canonical_bytes's version-conditional branch.
+AUTHORIZATION_SCHEMA_VERSION_V2 = "WP-CLAIM-EXIT-MUTATION-AUTHORIZATION-v2"
 LOCK_SCHEMA_VERSION = "WP-CLAIM-EXIT-LOCK-v1"
 
 OPERATION_SCOPE_BOOTSTRAP = "BOOTSTRAP_GENERATION_WORKSPACE"
@@ -42,6 +47,9 @@ _REQUIRED_AUTH_FIELDS = [
     "expected_stable_file_count",
     "expected_files",
 ]
+
+# v2 required fields: exactly the v1 set plus generation_source_expected_files.
+_REQUIRED_AUTH_FIELDS_V2 = [*_REQUIRED_AUTH_FIELDS, "generation_source_expected_files"]
 
 # --- Error codes -----------------------------------------------------------
 
@@ -98,6 +106,16 @@ class ExpectedFile:
     sha256: str
 
 
+# GENERATION_SOURCE_CONTENT_INVENTORY entry (UD-OGR-02-INV-01, v2 only). Distinct
+# from ExpectedFile: it additionally binds byte_count, and its relative_path is a
+# single top-level filename (no nested path), per the approved v2 contract.
+@dataclass(frozen=True)
+class GenerationSourceExpectedFile:
+    relative_path: str
+    byte_count: int
+    sha256: str
+
+
 @dataclass(frozen=True)
 class MutationAuthorization:
     authorization_schema_version: str
@@ -111,8 +129,31 @@ class MutationAuthorization:
     target_generation_id: str
     expected_stable_file_count: int
     expected_files: list = field(default_factory=list)  # list[ExpectedFile]
+    # v1 sentinel: None. v2: list[GenerationSourceExpectedFile] (GENERATION_SOURCE_
+    # CONTENT_INVENTORY). Never populated by any existing v1 call site.
+    generation_source_expected_files: list | None = None
 
     def canonical_bytes(self) -> bytes:
+        is_v2 = self.authorization_schema_version == AUTHORIZATION_SCHEMA_VERSION_V2
+        if is_v2:
+            if self.generation_source_expected_files is None:
+                raise GuardRejection(
+                    AUTHORIZATION_SCHEMA_INVALID,
+                    "v2 authorization requires generation_source_expected_files",
+                )
+            if self.operation_scope != OPERATION_SCOPE_TRANSACTION:
+                raise GuardRejection(
+                    AUTHORIZATION_SCHEMA_INVALID,
+                    f"invalid operation_scope for v2: {self.operation_scope!r}",
+                )
+        elif self.generation_source_expected_files:
+            # v1 object misuse protection (UD-OGR-02-INV-01): a v1-labeled object
+            # must never silently carry v2-only authority.
+            raise GuardRejection(
+                AUTHORIZATION_SCHEMA_INVALID,
+                "generation_source_expected_files is only valid for v2 authorization",
+            )
+
         files_sorted = sorted(self.expected_files, key=lambda f: f.relative_path)
         obj = {
             "authorization_schema_version": self.authorization_schema_version,
@@ -129,6 +170,17 @@ class MutationAuthorization:
                 {"relative_path": f.relative_path, "sha256": f.sha256} for f in files_sorted
             ],
         }
+        if is_v2:
+            # Narrows generation_source_expected_files from `list | None`: the
+            # is_v2 branch above already rejected None, so this is always a
+            # list here (mypy cannot see that across the two `if is_v2:`
+            # blocks on its own).
+            assert self.generation_source_expected_files is not None
+            gs_sorted = sorted(self.generation_source_expected_files, key=lambda f: f.relative_path)
+            obj["generation_source_expected_files"] = [
+                {"relative_path": f.relative_path, "byte_count": f.byte_count, "sha256": f.sha256}
+                for f in gs_sorted
+            ]
         return json.dumps(
             obj, ensure_ascii=False, sort_keys=False, separators=_CANONICAL_SEPARATORS
         ).encode("utf-8")
@@ -142,6 +194,13 @@ class MutationAuthorization:
 def parse_authorization_obj(obj: dict) -> MutationAuthorization:
     if not isinstance(obj, dict):
         raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "authorization must be a JSON object")
+
+    # Exact-match v2 dispatch (UD-OGR-02-INV-01 / Candidate A). Anything other
+    # than a literal v2 schema-version match — including a missing key, the v1
+    # string, or any other value — falls through unchanged to the existing v1
+    # body below, preserving every characterized v1-era outcome exactly.
+    if obj.get("authorization_schema_version") == AUTHORIZATION_SCHEMA_VERSION_V2:
+        return _parse_authorization_obj_v2(obj)
 
     unknown = set(obj.keys()) - set(_REQUIRED_AUTH_FIELDS)
     if unknown:
@@ -209,6 +268,134 @@ def parse_authorization_obj(obj: dict) -> MutationAuthorization:
         expected_stable_file_count=obj["expected_stable_file_count"],
         expected_files=expected_files,
     )
+
+
+def _parse_authorization_obj_v2(obj: dict) -> MutationAuthorization:
+    """v2 parsing path (UD-OGR-02-INV-01 / Candidate A). Entirely separate from
+    the v1 body above (deliberately not shared/refactored, to guarantee v1
+    behavior cannot regress): its own required-field set, its own
+    operation_scope restriction (GENERATION_TRANSACTION only), and its own
+    generation_source_expected_files (GENERATION_SOURCE_CONTENT_INVENTORY)
+    entry validation. expected_files retains its existing v1 meaning and
+    validation here (CURRENT SOURCE GENERATION BASELINE INVENTORY) — this
+    function only adds handling for the new field.
+    """
+    unknown = set(obj.keys()) - set(_REQUIRED_AUTH_FIELDS_V2)
+    if unknown:
+        raise GuardRejection(
+            AUTHORIZATION_UNKNOWN_FIELD, f"unknown authorization field(s): {sorted(unknown)}"
+        )
+    missing = [k for k in _REQUIRED_AUTH_FIELDS_V2 if k not in obj]
+    if missing:
+        raise GuardRejection(
+            AUTHORIZATION_FIELD_MISSING, f"missing authorization field(s): {missing}"
+        )
+
+    # authorization_schema_version already matched AUTHORIZATION_SCHEMA_VERSION_V2
+    # exactly by the caller's dispatch.
+    if not is_valid_uuid(str(obj.get("authorization_id", ""))):
+        raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "invalid authorization_id")
+    if obj["operation_scope"] != OPERATION_SCOPE_TRANSACTION:
+        raise GuardRejection(
+            AUTHORIZATION_SCHEMA_INVALID,
+            f"invalid operation_scope for v2: {obj['operation_scope']!r}",
+        )
+    if not is_valid_uuid(str(obj.get("transaction_id", ""))):
+        raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "invalid transaction_id")
+    if not isinstance(obj["workspace_root"], str) or not obj["workspace_root"]:
+        raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "invalid workspace_root")
+    if not isinstance(obj["apply"], bool):
+        raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "apply must be a boolean")
+    if not isinstance(obj["expected_stable_file_count"], int):
+        raise GuardRejection(
+            AUTHORIZATION_SCHEMA_INVALID, "expected_stable_file_count must be an integer"
+        )
+    if not isinstance(obj["expected_files"], list):
+        raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "expected_files must be a list")
+    if not isinstance(obj["generation_source_expected_files"], list):
+        raise GuardRejection(
+            AUTHORIZATION_SCHEMA_INVALID, "generation_source_expected_files must be a list"
+        )
+
+    expected_files = []
+    seen_paths = set()
+    for entry in obj["expected_files"]:
+        if not isinstance(entry, dict) or set(entry.keys()) != {"relative_path", "sha256"}:
+            raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "malformed expected_files entry")
+        rel = entry["relative_path"]
+        sha = entry["sha256"]
+        if not isinstance(rel, str) or not isinstance(sha, str) or not is_valid_sha256(sha):
+            raise GuardRejection(AUTHORIZATION_SCHEMA_INVALID, "malformed expected_files entry")
+        if rel.startswith("/") or rel.startswith("..") or "/../" in rel or "\\" in rel:
+            raise GuardRejection(AUTHORIZATION_UNSAFE_PATH, f"unsafe relative_path: {rel!r}")
+        if Path(rel).is_absolute() or ".." in Path(rel).parts:
+            raise GuardRejection(AUTHORIZATION_UNSAFE_PATH, f"unsafe relative_path: {rel!r}")
+        if rel in seen_paths:
+            raise GuardRejection(AUTHORIZATION_DUPLICATE_PATH, f"duplicate relative_path: {rel!r}")
+        seen_paths.add(rel)
+        expected_files.append(ExpectedFile(relative_path=rel, sha256=sha))
+
+    generation_source_expected_files = []
+    seen_gs_paths = set()
+    for entry in obj["generation_source_expected_files"]:
+        if not isinstance(entry, dict) or set(entry.keys()) != {
+            "relative_path",
+            "byte_count",
+            "sha256",
+        }:
+            raise GuardRejection(
+                AUTHORIZATION_SCHEMA_INVALID, "malformed generation_source_expected_files entry"
+            )
+        rel = entry["relative_path"]
+        byte_count = entry["byte_count"]
+        sha = entry["sha256"]
+        if not isinstance(rel, str) or not isinstance(sha, str) or not is_valid_sha256(sha):
+            raise GuardRejection(
+                AUTHORIZATION_SCHEMA_INVALID, "malformed generation_source_expected_files entry"
+            )
+        # type(x) is int (not isinstance): bool is an int subclass in Python and
+        # must not silently satisfy a byte_count check (True/False are rejected).
+        if type(byte_count) is not int or byte_count < 0:
+            raise GuardRejection(
+                AUTHORIZATION_SCHEMA_INVALID, "malformed generation_source_expected_files entry"
+            )
+        if not _is_safe_generation_source_relative_path(rel):
+            raise GuardRejection(AUTHORIZATION_UNSAFE_PATH, f"unsafe relative_path: {rel!r}")
+        if rel in seen_gs_paths:
+            raise GuardRejection(AUTHORIZATION_DUPLICATE_PATH, f"duplicate relative_path: {rel!r}")
+        seen_gs_paths.add(rel)
+        generation_source_expected_files.append(
+            GenerationSourceExpectedFile(relative_path=rel, byte_count=byte_count, sha256=sha)
+        )
+
+    return MutationAuthorization(
+        authorization_schema_version=obj["authorization_schema_version"],
+        authorization_id=obj["authorization_id"],
+        operation_scope=obj["operation_scope"],
+        transaction_id=obj["transaction_id"],
+        workspace_root=obj["workspace_root"],
+        apply=obj["apply"],
+        source_generation_id=obj.get("source_generation_id"),
+        source_generation_digest=obj.get("source_generation_digest"),
+        target_generation_id=obj["target_generation_id"],
+        expected_stable_file_count=obj["expected_stable_file_count"],
+        expected_files=expected_files,
+        generation_source_expected_files=generation_source_expected_files,
+    )
+
+
+def _is_safe_generation_source_relative_path(rel: str) -> bool:
+    """GENERATION_SOURCE_CONTENT_INVENTORY relative_path contract (Human
+    Decision Section 24): one exact top-level filename, no nested path, no
+    traversal, no absolute path, no backslash, no NUL. Deliberately stricter
+    than expected_files' path check — a single "/" is enough to reject a
+    nested path, an absolute path, and a slash-separated traversal alike.
+    """
+    if not rel or rel in (".", ".."):
+        return False
+    if "\x00" in rel or "\\" in rel or "/" in rel:
+        return False
+    return True
 
 
 # --- Authorization Artifact Policy (external file) --------------------------
