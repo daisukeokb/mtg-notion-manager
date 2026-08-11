@@ -38,6 +38,12 @@ GENERATION_SYMLINK = "GENERATION_SYMLINK"
 GENERATION_DIGEST_MISMATCH = "GENERATION_DIGEST_MISMATCH"
 GENERATION_INVENTORY_MISMATCH = "GENERATION_INVENTORY_MISMATCH"
 
+# Recovery Inspection (WP-OGR-03) failure/observation classification. Same
+# read-only rationale as the Reader constants above: recovery_inspection.py
+# must never depend on mutation_guard.py, so these live here too.
+RECOVERY_CONTEXT_UNCLASSIFIED = "RECOVERY_CONTEXT_UNCLASSIFIED"
+LOCK_WITHOUT_CONTROL_TRANSACTION = "LOCK_WITHOUT_CONTROL_TRANSACTION"
+
 
 class MalformedPointerError(ValueError):
     """Raised when a pointer file cannot be parsed or fails validation."""

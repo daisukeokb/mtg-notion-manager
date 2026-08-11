@@ -316,3 +316,102 @@ def test_CLI_015_apply_goes_through_function_level_guard(
     )
     assert code == cli.EXIT_OK
     assert len(calls) == 1  # the guarded function, not a direct filesystem write, was used
+
+
+# --- inspect-generation-recovery ---------------------------------------------
+
+
+def test_CLI_016_inspect_generation_recovery_field_and_type_contract(
+    bootstrapped_workspace, capsys
+):
+    """TEST-RI-08 (CLI layer): automatic_mutation/filesystem_writes/
+    mutation_started exact values and types, plus the full 29-field
+    Common(9) + Command-specific(20) output contract."""
+    code = cli.main(
+        ["inspect-generation-recovery", "--workspace-root", str(bootstrapped_workspace), "--json"]
+    )
+    assert code == cli.EXIT_OK
+    payload = json.loads(capsys.readouterr().out)
+
+    common_fields = {
+        "schema_version",
+        "mode",
+        "operation",
+        "workspace_root_verified",
+        "result",
+        "error_code",
+        "mutation_started",
+        "filesystem_writes",
+        "recovery_required",
+    }
+    command_specific_fields = {
+        "underlying_recovery_case",
+        "underlying_recovery_status",
+        "underlying_safe_action",
+        "lock_present",
+        "lock_metadata_status",
+        "lock_transaction_id",
+        "control_transaction_present",
+        "control_transaction_tmp_present",
+        "pointer_generation_id",
+        "pointer_transaction_id",
+        "current_verified_active_generation_id",
+        "staging_present",
+        "staging_entry_count",
+        "generation_directories_present",
+        "inspection_classification",
+        "transaction_binding_status",
+        "phase_origin",
+        "transaction_commit_status",
+        "safe_action",
+        "automatic_mutation",
+    }
+    assert len(common_fields) == 9
+    assert len(command_specific_fields) == 20
+    assert set(payload.keys()) == common_fields | command_specific_fields
+
+    assert payload["automatic_mutation"] == "PROHIBITED"
+    assert isinstance(payload["automatic_mutation"], str)
+    assert payload["filesystem_writes"] == 0
+    assert isinstance(payload["filesystem_writes"], int)
+    assert payload["mutation_started"] is False
+    assert isinstance(payload["mutation_started"], bool)
+
+
+def test_CLI_017_inspect_generation_recovery_no_na_in_json(tmp_path, bootstrapped_workspace):
+    for workspace in (tmp_path / "never_bootstrapped", bootstrapped_workspace):
+        workspace.mkdir(parents=True, exist_ok=True)
+        code = None
+        import io
+        from contextlib import redirect_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cli.main(
+                ["inspect-generation-recovery", "--workspace-root", str(workspace), "--json"]
+            )
+        assert code == cli.EXIT_OK
+        assert '"N/A"' not in buf.getvalue()
+        assert "N/A" not in buf.getvalue()
+
+
+def test_CLI_018_inspect_generation_recovery_is_read_only(bootstrapped_workspace):
+    def _fingerprint():
+        return sorted(
+            str(p.relative_to(bootstrapped_workspace)) for p in bootstrapped_workspace.rglob("*")
+        )
+
+    before = _fingerprint()
+    code = cli.main(
+        ["inspect-generation-recovery", "--workspace-root", str(bootstrapped_workspace), "--json"]
+    )
+    after = _fingerprint()
+
+    assert code == cli.EXIT_OK
+    assert before == after
+
+
+def test_CLI_019_inspect_generation_recovery_missing_workspace_root_usage_error(tmp_path):
+    missing = tmp_path / "does-not-exist"
+    code = cli.main(["inspect-generation-recovery", "--workspace-root", str(missing), "--json"])
+    assert code == cli.EXIT_USAGE

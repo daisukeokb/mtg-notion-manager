@@ -19,6 +19,7 @@ from typing import Any
 from . import mutation_guard as guard
 from .bootstrap import bootstrap_generation_workspace
 from .digest import SUPPORTED_DIGEST_SCHEMA_VERSIONS
+from .recovery_inspection import RECOVERY_INSPECTION_SCHEMA_VERSION, inspect_generation_recovery
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -83,6 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap_p.add_argument("--json", action="store_true")
     bootstrap_p.add_argument("--report-file", default=None)
 
+    inspect_p = sub.add_parser(
+        "inspect-generation-recovery",
+        help="Read-only inspection of Generation Workspace recovery state.",
+    )
+    inspect_p.add_argument("--workspace-root", required=True)
+    inspect_p.add_argument("--json", action="store_true")
+
     return parser
 
 
@@ -120,6 +128,8 @@ def main(argv: list | None = None) -> int:
 
     if args.command == "bootstrap":
         return _run_bootstrap(args)
+    if args.command == "inspect-generation-recovery":
+        return _run_inspect_generation_recovery(args)
     return EXIT_USAGE
 
 
@@ -222,6 +232,62 @@ def _run_bootstrap(args: argparse.Namespace) -> int:
     output["result"] = "FAILURE"
     output["error_code"] = result.error_code
     return finish(_exit_code_for(result.error_code, result.reason))
+
+
+def _run_inspect_generation_recovery(args: argparse.Namespace) -> int:
+    workspace_root = Path(args.workspace_root)
+
+    output: dict[str, Any] = {
+        "schema_version": RECOVERY_INSPECTION_SCHEMA_VERSION,
+        "mode": "inspection",
+        "operation": "INSPECT_GENERATION_RECOVERY",
+        "workspace_root_verified": False,
+        "result": "FAILURE",
+        "error_code": None,
+        "mutation_started": False,
+        "filesystem_writes": 0,
+        "recovery_required": False,
+    }
+
+    if not workspace_root.is_dir():
+        output["error_code"] = "WORKSPACE_ROOT_INVALID"
+        _print_output(output, args.json)
+        return EXIT_USAGE
+
+    output["workspace_root_verified"] = True
+
+    inspection = inspect_generation_recovery(workspace_root)
+
+    output["recovery_required"] = (
+        inspection.underlying_recovery_status == "FAILED_REQUIRES_RECOVERY"
+    )
+    output["result"] = "INSPECTION_COMPLETE"
+    output["error_code"] = None
+    output.update(
+        underlying_recovery_case=inspection.underlying_recovery_case,
+        underlying_recovery_status=inspection.underlying_recovery_status,
+        underlying_safe_action=inspection.underlying_safe_action,
+        lock_present=inspection.lock_present,
+        lock_metadata_status=inspection.lock_metadata_status,
+        lock_transaction_id=inspection.lock_transaction_id,
+        control_transaction_present=inspection.control_transaction_present,
+        control_transaction_tmp_present=inspection.control_transaction_tmp_present,
+        pointer_generation_id=inspection.pointer_generation_id,
+        pointer_transaction_id=inspection.pointer_transaction_id,
+        current_verified_active_generation_id=inspection.current_verified_active_generation_id,
+        staging_present=inspection.staging_present,
+        staging_entry_count=inspection.staging_entry_count,
+        generation_directories_present=inspection.generation_directories_present,
+        inspection_classification=inspection.inspection_classification,
+        transaction_binding_status=inspection.transaction_binding_status,
+        phase_origin=inspection.phase_origin,
+        transaction_commit_status=inspection.transaction_commit_status,
+        safe_action=inspection.safe_action,
+        automatic_mutation=inspection.automatic_mutation,
+    )
+
+    _print_output(output, args.json)
+    return EXIT_OK
 
 
 if __name__ == "__main__":
