@@ -5,6 +5,7 @@ production WP-CLAIM-EXIT workspace is never referenced.
 """
 
 import dataclasses
+import hashlib
 import os
 import shutil
 
@@ -22,7 +23,10 @@ from generation_workspace.mutation_guard import (
     AUTHORIZATION_FIELD_MISSING,
     AUTHORIZATION_FILE_REJECTED,
     AUTHORIZATION_OPERATION_MISMATCH,
+    AUTHORIZATION_SCHEMA_INVALID,
     AUTHORIZATION_SCHEMA_UNSUPPORTED,
+    AUTHORIZATION_SCHEMA_VERSION,
+    AUTHORIZATION_SCHEMA_VERSION_V2,
     AUTHORIZATION_TRANSACTION_MISMATCH,
     AUTHORIZATION_UNKNOWN_FIELD,
     AUTHORIZATION_UNSAFE_PATH,
@@ -33,7 +37,9 @@ from generation_workspace.mutation_guard import (
     ROOT_SYMLINK_REJECTED,
     SOURCE_GENERATION_MISMATCH,
     ExpectedFile,
+    GenerationSourceExpectedFile,
     GuardRejection,
+    MutationAuthorization,
     enforce_root_policy,
     find_repository_root,
     load_authorization_file,
@@ -69,6 +75,35 @@ def _raw_auth_obj(workspace_root, target="0000000001", transaction_id=None):
 
 def _snapshot(workspace_root):
     return sorted(p.name for p in workspace_root.iterdir())
+
+
+def _raw_v2_transaction_obj(
+    workspace_root="/tmp/whatever",
+    source_generation_id="0000000001",
+    source_generation_digest=None,
+    target="0000000002",
+    transaction_id=None,
+    generation_source_expected_files=None,
+):
+    """A schema-v2 GENERATION_TRANSACTION raw dict (UD-OGR-02-INV-01). Never
+    touches the filesystem; workspace_root here is only a JSON field value
+    consumed by parse_authorization_obj (a pure function), not resolved."""
+    return {
+        "authorization_schema_version": AUTHORIZATION_SCHEMA_VERSION_V2,
+        "authorization_id": new_uuid(),
+        "operation_scope": "GENERATION_TRANSACTION",
+        "transaction_id": transaction_id or new_uuid(),
+        "workspace_root": str(workspace_root),
+        "apply": True,
+        "source_generation_id": source_generation_id,
+        "source_generation_digest": source_generation_digest or ("b" * 64),
+        "target_generation_id": target,
+        "expected_stable_file_count": 0,
+        "expected_files": [],
+        "generation_source_expected_files": (
+            generation_source_expected_files if generation_source_expected_files is not None else []
+        ),
+    }
 
 
 def test_PG_001_authorization_absent_rejected_zero_writes(flat_workspace):
@@ -551,3 +586,593 @@ def test_PG_027_target_generation_already_exists_reachable(bootstrapped_workspac
     result = begin_generation_transaction(bootstrapped_workspace, txn_id, authorization)
     assert not result.ok
     assert result.error_code == TARGET_GENERATION_ALREADY_EXISTS
+
+
+# --- WP-OGR-02 Authorization Schema v2 Extension (UD-OGR-02-INV-01) --------
+#
+# generation_source_expected_files (GENERATION_SOURCE_CONTENT_INVENTORY) is
+# authorization-bound content for the future apply-generation-transaction
+# flow; runtime consumption (preflight/apply/orchestrator/CLI) is NOT part
+# of this schema-only extension and is exercised nowhere below.
+#
+# V1-* : v1 regression coverage (must remain byte-for-byte unchanged).
+# V2-* / V2-REQ-* : v2 happy-path and requiredness/scope coverage.
+# ENTRY-* / PATH-* / BYTECOUNT-* / SHA-* : generation_source_expected_files
+#   entry-shape and field-level validation.
+# CANON-* / DIGEST-* : canonicalization and digest-binding contract.
+
+
+def test_V1_01_valid_v1_parses_successfully(flat_workspace):
+    bootstrap_obj = _raw_auth_obj(flat_workspace)
+    auth = parse_authorization_obj(bootstrap_obj)
+    assert auth.operation_scope == "BOOTSTRAP_GENERATION_WORKSPACE"
+    assert auth.generation_source_expected_files is None
+
+    txn_obj = dict(bootstrap_obj)
+    txn_obj["authorization_id"] = new_uuid()
+    txn_obj["operation_scope"] = "GENERATION_TRANSACTION"
+    txn_obj["source_generation_id"] = "0000000001"
+    txn_obj["source_generation_digest"] = "b" * 64
+    auth2 = parse_authorization_obj(txn_obj)
+    assert auth2.operation_scope == "GENERATION_TRANSACTION"
+    assert auth2.generation_source_expected_files is None
+
+
+def test_V1_02_bootstrap_v1_remains_compatible(flat_workspace):
+    txn_id = new_uuid()
+    authorization = build_bootstrap_authorization(flat_workspace, txn_id)
+    result = bootstrap_generation_workspace(flat_workspace, txn_id, DIGEST_SCHEMA, authorization)
+    assert result.ok, result.reason
+
+
+def test_V1_03_generation_transaction_v1_remains_compatible(bootstrapped_workspace):
+    txn_id = new_uuid()
+    authorization = build_transaction_authorization(bootstrapped_workspace, txn_id)
+    result = begin_generation_transaction(bootstrapped_workspace, txn_id, authorization)
+    assert result.ok, result.reason
+
+
+def _expected_v1_canonical_bytes(auth: MutationAuthorization) -> bytes:
+    """Independently re-derive the expected v1 canonical JSON (not by calling
+    canonical_bytes() — that would be tautological)."""
+    import json
+
+    files_sorted = sorted(auth.expected_files, key=lambda f: f.relative_path)
+    obj = {
+        "authorization_schema_version": auth.authorization_schema_version,
+        "authorization_id": auth.authorization_id,
+        "operation_scope": auth.operation_scope,
+        "transaction_id": auth.transaction_id,
+        "workspace_root": auth.workspace_root,
+        "apply": auth.apply,
+        "source_generation_id": auth.source_generation_id,
+        "source_generation_digest": auth.source_generation_digest,
+        "target_generation_id": auth.target_generation_id,
+        "expected_stable_file_count": auth.expected_stable_file_count,
+        "expected_files": [
+            {"relative_path": f.relative_path, "sha256": f.sha256} for f in files_sorted
+        ],
+    }
+    return json.dumps(obj, ensure_ascii=False, sort_keys=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def test_V1_04_and_V1_05_v1_canonical_bytes_and_digest_remain_exact(flat_workspace):
+    obj = _raw_auth_obj(flat_workspace)
+    obj["expected_files"] = [{"relative_path": "a.txt", "sha256": "a" * 64}]
+    obj["expected_stable_file_count"] = 1
+    auth = parse_authorization_obj(obj)
+
+    expected_bytes = _expected_v1_canonical_bytes(auth)
+    assert auth.canonical_bytes() == expected_bytes  # CANON-01
+    assert auth.digest() == hashlib.sha256(expected_bytes).hexdigest()  # DIGEST-05/06 basis
+    assert b"generation_source_expected_files" not in auth.canonical_bytes()  # CANON-03
+
+
+def test_V1_06_v1_plus_generation_source_expected_files_rejected_as_unknown(flat_workspace):
+    obj = _raw_auth_obj(flat_workspace)
+    obj["generation_source_expected_files"] = []  # v1 schema string, extra v2-only field
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_UNKNOWN_FIELD
+
+
+def test_V1_07_missing_field_behavior_unchanged(flat_workspace):
+    obj = _raw_auth_obj(flat_workspace)
+    del obj["apply"]
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_FIELD_MISSING
+
+
+def test_V1_08_unknown_field_behavior_unchanged(flat_workspace):
+    obj = _raw_auth_obj(flat_workspace)
+    obj["not_a_real_field"] = 1
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_UNKNOWN_FIELD
+
+
+def test_V1_09_unsupported_schema_version_behavior_unchanged(flat_workspace):
+    obj = _raw_auth_obj(flat_workspace)
+    obj["authorization_schema_version"] = "SOME-OTHER-SCHEMA-v9"
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_UNSUPPORTED
+
+
+def test_V1_10_operation_mismatch_behavior_unchanged(bootstrapped_workspace):
+    txn_id = new_uuid()
+    bootstrap_style_auth = build_bootstrap_authorization(bootstrapped_workspace, txn_id)
+    result = begin_generation_transaction(bootstrapped_workspace, txn_id, bootstrap_style_auth)
+    assert not result.ok
+    assert result.error_code == AUTHORIZATION_OPERATION_MISMATCH
+
+
+def test_V1_11_expected_files_canonical_ordering_unchanged(flat_workspace):
+    obj_a = _raw_auth_obj(flat_workspace)
+    obj_a["expected_files"] = [
+        {"relative_path": "b.txt", "sha256": "b" * 64},
+        {"relative_path": "a.txt", "sha256": "a" * 64},
+    ]
+    obj_a["expected_stable_file_count"] = 2
+    obj_b = dict(obj_a)
+    obj_b["authorization_id"] = obj_a["authorization_id"]
+    obj_b["expected_files"] = list(reversed(obj_a["expected_files"]))
+
+    auth_a = parse_authorization_obj(obj_a)
+    auth_b = parse_authorization_obj(obj_b)
+    assert auth_a.canonical_bytes() == auth_b.canonical_bytes()
+
+
+def test_V1_12_existing_v1_construction_needs_no_new_argument():
+    auth = MutationAuthorization(
+        authorization_schema_version=AUTHORIZATION_SCHEMA_VERSION,
+        authorization_id=new_uuid(),
+        operation_scope="BOOTSTRAP_GENERATION_WORKSPACE",
+        transaction_id=new_uuid(),
+        workspace_root="/tmp/whatever",
+        apply=True,
+        source_generation_id=None,
+        source_generation_digest=None,
+        target_generation_id="0000000001",
+        expected_stable_file_count=0,
+    )
+    assert auth.generation_source_expected_files is None
+    assert auth.canonical_bytes()  # does not raise
+
+
+# --- V2 happy path -----------------------------------------------------------
+
+
+def test_V2_01_valid_v2_generation_transaction_parses():
+    obj = _raw_v2_transaction_obj()
+    auth = parse_authorization_obj(obj)
+    assert auth.authorization_schema_version == AUTHORIZATION_SCHEMA_VERSION_V2
+    assert auth.operation_scope == "GENERATION_TRANSACTION"
+    assert auth.generation_source_expected_files == []
+
+
+def test_V2_02_one_valid_entry_parses():
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "candidate.md", "byte_count": 12, "sha256": "c" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    assert auth.generation_source_expected_files == [
+        GenerationSourceExpectedFile(relative_path="candidate.md", byte_count=12, sha256="c" * 64)
+    ]
+
+
+def test_V2_03_multiple_entries_parse():
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "a.md", "byte_count": 1, "sha256": "a" * 64},
+            {"relative_path": "b.md", "byte_count": 2, "sha256": "b" * 64},
+            {"relative_path": "c.md", "byte_count": 3, "sha256": "c" * 64},
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    assert len(auth.generation_source_expected_files) == 3
+
+
+def test_V2_04_byte_count_zero_is_schema_valid():
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "empty.txt", "byte_count": 0, "sha256": "0" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    assert auth.generation_source_expected_files[0].byte_count == 0
+
+
+def test_V2_05_and_V2_06_unicode_and_exact_relative_path_preserved():
+    unicode_name = "候補_ファイル.md"
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": unicode_name, "byte_count": 5, "sha256": "d" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    assert auth.generation_source_expected_files[0].relative_path == unicode_name
+    assert unicode_name.encode("utf-8") in auth.canonical_bytes()  # not \uXXXX-escaped
+
+
+def test_V2_07_exact_byte_count_preserved():
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": 123456, "sha256": "e" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    assert auth.generation_source_expected_files[0].byte_count == 123456
+
+
+def test_V2_08_exact_sha256_preserved():
+    sha = "1234567890abcdef" * 4
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": 1, "sha256": sha}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    assert auth.generation_source_expected_files[0].sha256 == sha
+
+
+# --- V2 requiredness / scope --------------------------------------------------
+
+
+def test_V2_REQ_01_missing_generation_source_expected_files_fails():
+    obj = _raw_v2_transaction_obj()
+    del obj["generation_source_expected_files"]
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_FIELD_MISSING
+
+
+def test_V2_REQ_02_v2_plus_bootstrap_fails_closed():
+    obj = _raw_v2_transaction_obj()
+    obj["operation_scope"] = "BOOTSTRAP_GENERATION_WORKSPACE"
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_INVALID
+
+
+def test_V2_REQ_03_unknown_v2_top_level_field_fails():
+    obj = _raw_v2_transaction_obj()
+    obj["not_a_real_field"] = 1
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_UNKNOWN_FIELD
+
+
+def test_V2_REQ_04_direct_invalid_v2_object_with_none_inventory_fails_closed():
+    auth = MutationAuthorization(
+        authorization_schema_version=AUTHORIZATION_SCHEMA_VERSION_V2,
+        authorization_id=new_uuid(),
+        operation_scope="GENERATION_TRANSACTION",
+        transaction_id=new_uuid(),
+        workspace_root="/tmp/whatever",
+        apply=True,
+        source_generation_id="0000000001",
+        source_generation_digest="b" * 64,
+        target_generation_id="0000000002",
+        expected_stable_file_count=0,
+        # generation_source_expected_files omitted -> None (the v1 sentinel)
+    )
+    with pytest.raises(GuardRejection) as excinfo:
+        auth.canonical_bytes()
+    assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_INVALID
+    with pytest.raises(GuardRejection):
+        auth.digest()
+
+
+def test_direct_v2_object_wrong_operation_scope_fails_closed():
+    """Section 29/37: v2 + operation_scope != GENERATION_TRANSACTION fails
+    closed even for a directly-constructed object (not only via the parser)."""
+    auth = MutationAuthorization(
+        authorization_schema_version=AUTHORIZATION_SCHEMA_VERSION_V2,
+        authorization_id=new_uuid(),
+        operation_scope="BOOTSTRAP_GENERATION_WORKSPACE",
+        transaction_id=new_uuid(),
+        workspace_root="/tmp/whatever",
+        apply=True,
+        source_generation_id=None,
+        source_generation_digest=None,
+        target_generation_id="0000000001",
+        expected_stable_file_count=0,
+        generation_source_expected_files=[],
+    )
+    with pytest.raises(GuardRejection) as excinfo:
+        auth.canonical_bytes()
+    assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_INVALID
+
+
+def test_direct_v1_object_with_non_empty_generation_source_expected_files_fails_closed():
+    """Section 30/38: v1 object misuse protection — a v1-labeled object must
+    never silently digest non-empty v2-only authority."""
+    auth = MutationAuthorization(
+        authorization_schema_version=AUTHORIZATION_SCHEMA_VERSION,
+        authorization_id=new_uuid(),
+        operation_scope="BOOTSTRAP_GENERATION_WORKSPACE",
+        transaction_id=new_uuid(),
+        workspace_root="/tmp/whatever",
+        apply=True,
+        source_generation_id=None,
+        source_generation_digest=None,
+        target_generation_id="0000000001",
+        expected_stable_file_count=0,
+        generation_source_expected_files=[
+            GenerationSourceExpectedFile(relative_path="x.txt", byte_count=1, sha256="a" * 64)
+        ],
+    )
+    with pytest.raises(GuardRejection) as excinfo:
+        auth.canonical_bytes()
+    assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_INVALID
+
+
+def test_empty_generation_source_expected_files_is_schema_valid():
+    """Section 23/26: [] is schema-valid at this layer; transaction
+    eligibility of an empty Generation Source is explicitly out of scope
+    for this schema-only extension (DEFERRED)."""
+    obj = _raw_v2_transaction_obj(generation_source_expected_files=[])
+    auth = parse_authorization_obj(obj)
+    assert auth.generation_source_expected_files == []
+    assert auth.canonical_bytes()  # does not raise; schema-level validity only
+
+
+# --- Entry shape ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        "not-an-object",
+        {"relative_path": "f.txt", "byte_count": 1},  # missing sha256
+        {"byte_count": 1, "sha256": "a" * 64},  # missing relative_path
+        {"relative_path": "f.txt", "sha256": "a" * 64},  # missing byte_count
+        {"relative_path": "f.txt", "byte_count": 1, "sha256": "a" * 64, "extra": "x"},  # unknown
+    ],
+)
+def test_ENTRY_malformed_shape_rejected(bad_entry):
+    obj = _raw_v2_transaction_obj(generation_source_expected_files=[bad_entry])
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_INVALID
+
+
+def test_ENTRY_duplicate_relative_path_rejected():
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": 1, "sha256": "a" * 64},
+            {"relative_path": "f.txt", "byte_count": 2, "sha256": "b" * 64},
+        ]
+    )
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_DUPLICATE_PATH
+
+
+# --- relative_path safety -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    ["", ".", "..", "/absolute", "nested/file", "../file", "file/..", "file\\name", "a\x00b"],
+)
+def test_PATH_unsafe_generation_source_relative_path_rejected(bad_path):
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": bad_path, "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    with pytest.raises(GuardRejection) as excinfo:
+        parse_authorization_obj(obj)
+    assert excinfo.value.error_code == AUTHORIZATION_UNSAFE_PATH
+
+
+# --- byte_count -------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "byte_count,should_pass",
+    [
+        (0, True),
+        (42, True),
+        (-1, False),
+        (True, False),
+        (False, False),
+        (1.0, False),
+        ("1", False),
+        (None, False),
+    ],
+)
+def test_BYTECOUNT_contract(byte_count, should_pass):
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": byte_count, "sha256": "a" * 64}
+        ]
+    )
+    if should_pass:
+        auth = parse_authorization_obj(obj)
+        assert auth.generation_source_expected_files[0].byte_count == byte_count
+    else:
+        with pytest.raises(GuardRejection) as excinfo:
+            parse_authorization_obj(obj)
+        assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_INVALID
+
+
+# --- SHA-256 ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "sha,should_pass",
+    [
+        ("a" * 64, True),
+        ("a" * 63, False),  # short
+        ("a" * 65, False),  # long
+        ("g" * 64, False),  # non-hex
+    ],
+)
+def test_SHA_contract(sha, should_pass):
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": 1, "sha256": sha}
+        ]
+    )
+    if should_pass:
+        auth = parse_authorization_obj(obj)
+        assert auth.generation_source_expected_files[0].sha256 == sha
+    else:
+        with pytest.raises(GuardRejection) as excinfo:
+            parse_authorization_obj(obj)
+        assert excinfo.value.error_code == AUTHORIZATION_SCHEMA_INVALID
+
+
+# --- Canonicalization ---------------------------------------------------------------
+
+
+def test_CANON_04_and_05_new_field_present_and_last_in_v2_canonical_output():
+    import json
+
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    cb = auth.canonical_bytes()
+    assert b'"generation_source_expected_files"' in cb  # CANON-04
+
+    # v2 = existing v1 key order, then the new field appended at the end.
+    top_level_keys = list(json.loads(cb.decode("utf-8")).keys())
+    v1_keys = [
+        "authorization_schema_version",
+        "authorization_id",
+        "operation_scope",
+        "transaction_id",
+        "workspace_root",
+        "apply",
+        "source_generation_id",
+        "source_generation_digest",
+        "target_generation_id",
+        "expected_stable_file_count",
+        "expected_files",
+    ]
+    assert top_level_keys == [*v1_keys, "generation_source_expected_files"]  # CANON-05
+
+
+def test_CANON_06_entry_key_order():
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    cb = auth.canonical_bytes().decode("utf-8")
+    entry_start = cb.index('"generation_source_expected_files":[') + len(
+        '"generation_source_expected_files":['
+    )
+    entry_text = cb[entry_start : entry_start + 200]
+    assert entry_text.startswith('{"relative_path":"f.txt","byte_count":1,"sha256":"' + "a" * 64)
+
+
+def test_CANON_07_and_08_inventory_sorted_and_input_order_independent():
+    entries_a = [
+        {"relative_path": "b.txt", "byte_count": 2, "sha256": "b" * 64},
+        {"relative_path": "a.txt", "byte_count": 1, "sha256": "a" * 64},
+    ]
+    entries_b = list(reversed(entries_a))
+
+    obj_a = _raw_v2_transaction_obj(generation_source_expected_files=entries_a)
+    obj_b = _raw_v2_transaction_obj(generation_source_expected_files=entries_b)
+    obj_b["authorization_id"] = obj_a["authorization_id"]
+    obj_b["transaction_id"] = obj_a["transaction_id"]
+
+    auth_a = parse_authorization_obj(obj_a)
+    auth_b = parse_authorization_obj(obj_b)
+    assert auth_a.canonical_bytes() == auth_b.canonical_bytes()  # CANON-08
+
+    cb = auth_a.canonical_bytes().decode("utf-8")
+    assert cb.index('"relative_path":"a.txt"') < cb.index('"relative_path":"b.txt"')  # CANON-07
+
+
+def test_CANON_09_unicode_canonical_encoding_matches_existing_v1_behavior():
+    name = "候補.md"
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": name, "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    assert name.encode("utf-8") in auth.canonical_bytes()
+    assert b"\\u" not in auth.canonical_bytes()  # ensure_ascii=False, no \uXXXX escapes
+
+
+def test_CANON_10_compact_separators_preserved():
+    obj = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "f.txt", "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    auth = parse_authorization_obj(obj)
+    cb = auth.canonical_bytes()
+    assert b", " not in cb
+    assert b": " not in cb
+
+
+# --- Digest binding ---------------------------------------------------------------
+
+
+def test_DIGEST_01_same_inventory_different_order_same_digest():
+    entries_a = [
+        {"relative_path": "b.txt", "byte_count": 2, "sha256": "b" * 64},
+        {"relative_path": "a.txt", "byte_count": 1, "sha256": "a" * 64},
+    ]
+    entries_b = list(reversed(entries_a))
+    obj_a = _raw_v2_transaction_obj(generation_source_expected_files=entries_a)
+    obj_b = _raw_v2_transaction_obj(generation_source_expected_files=entries_b)
+    obj_b["authorization_id"] = obj_a["authorization_id"]
+    obj_b["transaction_id"] = obj_a["transaction_id"]
+    assert parse_authorization_obj(obj_a).digest() == parse_authorization_obj(obj_b).digest()
+
+
+def test_DIGEST_02_relative_path_change_changes_digest():
+    base = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "a.txt", "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    changed = dict(base)
+    changed["generation_source_expected_files"] = [
+        {"relative_path": "z.txt", "byte_count": 1, "sha256": "a" * 64}
+    ]
+    assert parse_authorization_obj(base).digest() != parse_authorization_obj(changed).digest()
+
+
+def test_DIGEST_03_byte_count_change_changes_digest():
+    base = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "a.txt", "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    changed = dict(base)
+    changed["generation_source_expected_files"] = [
+        {"relative_path": "a.txt", "byte_count": 999, "sha256": "a" * 64}
+    ]
+    assert parse_authorization_obj(base).digest() != parse_authorization_obj(changed).digest()
+
+
+def test_DIGEST_04_sha256_change_changes_digest():
+    base = _raw_v2_transaction_obj(
+        generation_source_expected_files=[
+            {"relative_path": "a.txt", "byte_count": 1, "sha256": "a" * 64}
+        ]
+    )
+    changed = dict(base)
+    changed["generation_source_expected_files"] = [
+        {"relative_path": "a.txt", "byte_count": 1, "sha256": "f" * 64}
+    ]
+    assert parse_authorization_obj(base).digest() != parse_authorization_obj(changed).digest()
