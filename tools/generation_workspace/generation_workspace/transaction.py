@@ -16,8 +16,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import generation_source as gs
 from . import mutation_guard as guard
-from .digest import compute_generation_digest
+from .digest import SUPPORTED_DIGEST_SCHEMA_VERSIONS, compute_generation_digest
 from .durability import assert_same_filesystem, fsync_dir, fsync_file
 from .inventory import InventoryMismatchError, verify_physical_inventory
 from .model import (
@@ -184,24 +185,33 @@ def begin_generation_transaction(
         guard.validate_phase_b_transaction(workspace_root, mutation_authorization, source_id)
     except guard.GuardRejection as rej:
         release = _release_owned_lock()
+        # `writes` already counts the successful lock creation above; the
+        # lock deletion below is itself a second successful logical
+        # mutation whenever it actually happens (release.released), and
+        # must be counted too -- a mutation later cleaned up is not the
+        # same as a mutation that never happened.
+        release_writes = writes + (1 if release.released else 0)
         if release.error_code == guard.LOCK_OWNERSHIP_MISMATCH:
             return BeginResult(
                 ok=False,
                 reason=f"{rej.message} (lock ownership mismatch during cleanup)",
                 error_code=guard.LOCK_OWNERSHIP_MISMATCH,
-                filesystem_writes=0,
+                filesystem_writes=release_writes,
             )
         error_code = rej.error_code if release.released else guard.FAILED_REQUIRES_RECOVERY
-        return BeginResult(ok=False, reason=rej.message, error_code=error_code, filesystem_writes=0)
+        return BeginResult(
+            ok=False, reason=rej.message, error_code=error_code, filesystem_writes=release_writes
+        )
 
     staging = _staging_path(workspace_root, target_id)
     if staging.exists():
-        _release_owned_lock()
+        release = _release_owned_lock()
+        release_writes = writes + (1 if release.released else 0)
         return BeginResult(
             ok=False,
             reason=f"staging directory already exists: {staging}",
             error_code=guard.TARGET_GENERATION_ALREADY_EXISTS,
-            filesystem_writes=0,
+            filesystem_writes=release_writes,
         )
     staging.mkdir(parents=True)
     writes += 1
@@ -280,75 +290,134 @@ def commit_generation_transaction(
             ok=False, reason=rej.message, error_code=rej.error_code, filesystem_writes=0
         )
 
-    target_id = txn["target_generation"]
-    staging = _staging_path(workspace_root, target_id)
-    generations_dir = workspace_root / GENERATIONS_DIRNAME
-    generations_dir.mkdir(exist_ok=True)
-    published_path = generations_dir / generation_directory_name(target_id)
+    # Actual successful-mutation counter (WP-OGR-02 filesystem_writes
+    # repair): incremented only after each logical filesystem mutation
+    # below actually succeeds, never set from the expected happy-path
+    # shape. Reads/stat/fsync/hashing/comparison are never counted.
+    writes = 0
 
-    assert_same_filesystem(workspace_root, staging, generations_dir)
-
-    # Step: verify Staging content is complete and internally consistent
-    # (Manifest/State must already carry their final values at this point).
+    # --- Operational Commit Mutation Boundary --------------------------
+    #
+    # Everything below this point is the accepted commit-phase filesystem
+    # mutation sequence (WP-OGR-02 Repair-3: commit-phase operational
+    # exception containment). All preceding validation/typed-return
+    # processing above (control-transaction read, transaction_id match,
+    # authorization/transaction binding) is unchanged and stays outside
+    # this boundary. Existing explicit typed failures inside this
+    # boundary (InventoryMismatchError, post-commit verification failure)
+    # are preserved exactly as before and are not reclassified.
+    #
+    # An expected operational OSError from any filesystem operation in
+    # this sequence (write, rename, fsync, unlink, mkdir) -- not just the
+    # one that happens to sit between publication and pointer commit --
+    # is contained here rather than escaping uncaught. The handler
+    # performs zero workspace mutations of its own: no rollback, no
+    # cleanup, no retry, no automatic recovery. The last successfully
+    # persisted physical/control state is left exactly as the mutations
+    # that already completed left it; only `writes` (already-accurate
+    # successful-mutation count) and a FAILED_REQUIRES_RECOVERY
+    # CommitResult are produced. Only OSError is caught -- arbitrary
+    # programming exceptions (TypeError, KeyError, assertion failures,
+    # etc.) are not swallowed and continue to propagate.
     try:
-        verify_physical_inventory(staging)
-    except InventoryMismatchError as exc:
-        return CommitResult(ok=False, reason=f"staging inventory invalid: {exc}")
+        target_id = txn["target_generation"]
+        staging = _staging_path(workspace_root, target_id)
+        generations_dir = workspace_root / GENERATIONS_DIRNAME
+        if not generations_dir.exists():
+            generations_dir.mkdir(exist_ok=True)
+            writes += 1
+        published_path = generations_dir / generation_directory_name(target_id)
 
-    digest = compute_generation_digest(staging, target_id, digest_schema_version)
-    txn["state"] = STATE_VERIFIED
-    txn["target_generation_digest"] = digest
-    txn["updated_at_utc"] = _now_iso()
-    _write_control_transaction(workspace_root, txn)
+        assert_same_filesystem(workspace_root, staging, generations_dir)
 
-    # fsync every staging file, then the staging directory itself.
-    for entry in staging.iterdir():
-        fsync_file(entry)
-    fsync_dir(staging)
+        # Step: verify Staging content is complete and internally
+        # consistent (Manifest/State must already carry their final
+        # values at this point).
+        try:
+            verify_physical_inventory(staging)
+        except InventoryMismatchError as exc:
+            return CommitResult(
+                ok=False, reason=f"staging inventory invalid: {exc}", filesystem_writes=writes
+            )
 
-    # Publish: rename Staging -> canonical Generation name. Content is
-    # immutable from this point on.
-    os.rename(staging, published_path)
-    fsync_dir(generations_dir)
+        digest = compute_generation_digest(staging, target_id, digest_schema_version)
+        txn["state"] = STATE_VERIFIED
+        txn["target_generation_digest"] = digest
+        txn["updated_at_utc"] = _now_iso()
+        _write_control_transaction(workspace_root, txn)
+        writes += 1
 
-    txn["state"] = STATE_GENERATION_PUBLISHED
-    txn["updated_at_utc"] = _now_iso()
-    _write_control_transaction(workspace_root, txn)
+        # fsync every staging file, then the staging directory itself.
+        for entry in staging.iterdir():
+            fsync_file(entry)
+        fsync_dir(staging)
 
-    pointer = Pointer(
-        pointer_schema_version=POINTER_SCHEMA_VERSION,
-        generation_id=target_id,
-        generation_digest_schema_version=digest_schema_version,
-        generation_digest=digest,
-        transaction_id=transaction_id,
+        # Publish: rename Staging -> canonical Generation name. Content is
+        # immutable from this point on.
+        os.rename(staging, published_path)
+        writes += 1
+        fsync_dir(generations_dir)
+
+        txn["state"] = STATE_GENERATION_PUBLISHED
+        txn["updated_at_utc"] = _now_iso()
+        _write_control_transaction(workspace_root, txn)
+        writes += 1
+
+        pointer = Pointer(
+            pointer_schema_version=POINTER_SCHEMA_VERSION,
+            generation_id=target_id,
+            generation_digest_schema_version=digest_schema_version,
+            generation_digest=digest,
+            transaction_id=transaction_id,
+        )
+        pointer_path = workspace_root / ACTIVE_GENERATION_FILENAME
+        pointer_tmp = workspace_root / (ACTIVE_GENERATION_FILENAME + ".tmp")
+        pointer_tmp.write_bytes(pointer.to_canonical_bytes())
+        writes += 1
+        fsync_file(pointer_tmp)
+
+        txn["state"] = STATE_COMMITTING_POINTER
+        txn["updated_at_utc"] = _now_iso()
+        _write_control_transaction(workspace_root, txn)
+        writes += 1
+
+        # Pointer commit: the single atomic rename that switches the
+        # Active Generation. This is the actual commit point.
+        os.rename(pointer_tmp, pointer_path)
+        writes += 1
+        fsync_dir(workspace_root)
+
+        verified = verify_active_generation(workspace_root)
+        if not verified.ok or verified.generation_id != target_id:
+            return CommitResult(
+                ok=False,
+                reason=f"post-commit verification failed: {verified.reason}",
+                filesystem_writes=writes,
+            )
+
+        txn["state"] = STATE_COMMITTED
+        txn["updated_at_utc"] = _now_iso()
+        _write_control_transaction(workspace_root, txn)
+        writes += 1
+
+        # Transient cleanup only; Generation content is never touched again.
+        (workspace_root / CONTROL_TRANSACTION_FILENAME).unlink()
+        writes += 1
+        lock_path = workspace_root / LOCK_FILENAME
+        if lock_path.exists():
+            lock_path.unlink()
+            writes += 1
+    except OSError as exc:
+        return CommitResult(
+            ok=False,
+            reason=f"commit-phase operational failure: {exc}",
+            error_code=guard.FAILED_REQUIRES_RECOVERY,
+            filesystem_writes=writes,
+        )
+
+    return CommitResult(
+        ok=True, generation_id=target_id, generation_digest=digest, filesystem_writes=writes
     )
-    pointer_path = workspace_root / ACTIVE_GENERATION_FILENAME
-    pointer_tmp = workspace_root / (ACTIVE_GENERATION_FILENAME + ".tmp")
-    pointer_tmp.write_bytes(pointer.to_canonical_bytes())
-    fsync_file(pointer_tmp)
-
-    txn["state"] = STATE_COMMITTING_POINTER
-    txn["updated_at_utc"] = _now_iso()
-    _write_control_transaction(workspace_root, txn)
-
-    os.rename(pointer_tmp, pointer_path)
-    fsync_dir(workspace_root)
-
-    verified = verify_active_generation(workspace_root)
-    if not verified.ok or verified.generation_id != target_id:
-        return CommitResult(ok=False, reason=f"post-commit verification failed: {verified.reason}")
-
-    txn["state"] = STATE_COMMITTED
-    txn["updated_at_utc"] = _now_iso()
-    _write_control_transaction(workspace_root, txn)
-
-    # Transient cleanup only; Generation content is never touched again.
-    (workspace_root / CONTROL_TRANSACTION_FILENAME).unlink()
-    lock_path = workspace_root / LOCK_FILENAME
-    if lock_path.exists():
-        lock_path.unlink()
-
-    return CommitResult(ok=True, generation_id=target_id, generation_digest=digest)
 
 
 CASE_F_POINTER_INVALID = "CASE_F_POINTER_INVALID"
@@ -451,4 +520,189 @@ def recover_generation_transaction(workspace_root: Path) -> RecoveryResult:
         status="FAILED_REQUIRES_RECOVERY",
         authoritative_generation=None,
         safe_action="manual_disposition_required",
+    )
+
+
+@dataclass(frozen=True)
+class ApplyTransactionResult:
+    ok: bool
+    source_generation_id: str | None = None
+    source_generation_digest: str | None = None
+    target_generation_id: str | None = None
+    target_generation_digest: str | None = None
+    reason: str = ""
+    error_code: str | None = None
+    mutation_started: bool = False
+    filesystem_writes: int = 0
+    recovery_required: bool = False
+
+
+def apply_generation_transaction(
+    workspace_root: Path,
+    generation_source_directory: Path,
+    mutation_authorization: guard.MutationAuthorization | None,
+) -> ApplyTransactionResult:
+    """Frozen WP-OGR-02 Generation Transaction Runtime orchestrator.
+
+    Human-frozen Generation Source error precedence: GS-1 (root safety) ->
+    GS-2 (physical entry safety) -> GS-3 (authorized inventory set) -> GS-4
+    (authorized content) -> begin_generation_transaction. GS-1..GS-4 are
+    pure reads and always complete before begin_generation_transaction is
+    called, so the transaction lock acquired there remains the first
+    authorized workspace mutation (Generation Source preflight failure
+    precedes transaction-begin failure, and preflight filesystem_writes
+    stays 0). begin_generation_transaction, commit_generation_transaction,
+    and recover_generation_transaction are reused unchanged; only
+    Generation Source validation and materialization are new here.
+    """
+    if mutation_authorization is None:
+        return ApplyTransactionResult(
+            ok=False,
+            reason="mutation_authorization is required",
+            error_code=guard.MUTATION_AUTHORIZATION_REQUIRED,
+        )
+    if mutation_authorization.operation_scope != guard.OPERATION_SCOPE_TRANSACTION:
+        return ApplyTransactionResult(
+            ok=False,
+            reason=(
+                f"authorization operation_scope "
+                f"{mutation_authorization.operation_scope!r} != "
+                f"{guard.OPERATION_SCOPE_TRANSACTION!r}"
+            ),
+            error_code=guard.AUTHORIZATION_OPERATION_MISMATCH,
+        )
+    if mutation_authorization.generation_source_expected_files is None:
+        return ApplyTransactionResult(
+            ok=False,
+            reason=(
+                "apply_generation_transaction requires a v2 authorization with "
+                "generation_source_expected_files"
+            ),
+            error_code=guard.AUTHORIZATION_SCHEMA_INVALID,
+        )
+
+    source_generation_id = mutation_authorization.source_generation_id
+    source_generation_digest = mutation_authorization.source_generation_digest
+    target_generation_id = mutation_authorization.target_generation_id
+
+    # --- GS-1..GS-4: Generation Source preflight (pure reads, 0 writes). ---
+    try:
+        real_workspace_root = Path(workspace_root).resolve()
+        real_source = gs.validate_generation_source_preflight(
+            generation_source_directory, real_workspace_root, mutation_authorization
+        )
+    except gs.GenerationSourceRejection as rej:
+        return ApplyTransactionResult(
+            ok=False,
+            source_generation_id=source_generation_id,
+            source_generation_digest=source_generation_digest,
+            target_generation_id=target_generation_id,
+            reason=rej.message,
+            error_code=rej.error_code,
+            mutation_started=False,
+            filesystem_writes=0,
+            recovery_required=False,
+        )
+
+    # --- Transaction begin: first authorized workspace mutation. ---
+    begin_result = begin_generation_transaction(
+        workspace_root, mutation_authorization.transaction_id, mutation_authorization
+    )
+    if not begin_result.ok:
+        # Human-frozen: filesystem_writes > 0 => mutation_started = true,
+        # even when begin's own cleanup (e.g. releasing a lock it just
+        # created) fully reverted the observable workspace state. A
+        # mutation later cleaned up is not the same as a mutation that
+        # never happened. recovery_required stays false here: every begin
+        # failure path returns before the control-transaction file is
+        # ever created, so recover_generation_transaction never has a
+        # PREPARING transaction to act on -- the active pointer remains
+        # untouched regardless of which begin failure branch was taken.
+        return ApplyTransactionResult(
+            ok=False,
+            source_generation_id=source_generation_id,
+            source_generation_digest=source_generation_digest,
+            target_generation_id=target_generation_id,
+            reason=begin_result.reason,
+            error_code=begin_result.error_code,
+            mutation_started=begin_result.filesystem_writes > 0,
+            filesystem_writes=begin_result.filesystem_writes,
+            recovery_required=False,
+        )
+    assert begin_result.staging_path is not None
+
+    # --- Materialization: TOCTOU-safe verified-byte staging write. ---
+    materialize_result = gs.materialize_generation_source(
+        real_source, begin_result.staging_path, mutation_authorization
+    )
+    if not materialize_result.ok:
+        # Frozen failure-preservation contract: lock, control transaction
+        # (still PREPARING), and partial staging are left exactly as
+        # begin_generation_transaction created them. No cleanup, no
+        # rollback, no retry, no deletion -- recover_generation_transaction
+        # Case A (NOT_COMMITTED / RESTART_FROM_STAGING) already covers this
+        # state unchanged.
+        return ApplyTransactionResult(
+            ok=False,
+            source_generation_id=source_generation_id,
+            source_generation_digest=source_generation_digest,
+            target_generation_id=target_generation_id,
+            reason=materialize_result.reason,
+            error_code=guard.FAILED_REQUIRES_RECOVERY,
+            mutation_started=True,
+            filesystem_writes=begin_result.filesystem_writes + materialize_result.filesystem_writes,
+            recovery_required=True,
+        )
+
+    # --- Existing Phase B / publication / pointer commit (unchanged). ---
+    digest_schema_version = next(iter(SUPPORTED_DIGEST_SCHEMA_VERSIONS))
+    commit_result = commit_generation_transaction(
+        workspace_root,
+        mutation_authorization.transaction_id,
+        digest_schema_version,
+        mutation_authorization,
+    )
+    total_writes = (
+        begin_result.filesystem_writes
+        + materialize_result.filesystem_writes
+        + commit_result.filesystem_writes
+    )
+    if not commit_result.ok:
+        # Human-frozen fallback: any recovery-required Generation
+        # Transaction failure with no more-specific already-accepted
+        # error code must report FAILED_REQUIRES_RECOVERY, never null.
+        # commit_generation_transaction's own CommitResult.error_code is
+        # already-accepted and specific for authorization/binding
+        # failures (e.g. AUTHORIZATION_DIGEST_MISMATCH); it is None only
+        # for its two internal post-mutation-start failure branches
+        # (staging inventory invalid, post-commit verification failed),
+        # both of which leave a transaction requiring recovery, exactly
+        # the same failure class already classified as
+        # FAILED_REQUIRES_RECOVERY for materialization failures above.
+        error_code = (
+            commit_result.error_code
+            if commit_result.error_code is not None
+            else guard.FAILED_REQUIRES_RECOVERY
+        )
+        return ApplyTransactionResult(
+            ok=False,
+            source_generation_id=source_generation_id,
+            source_generation_digest=source_generation_digest,
+            target_generation_id=target_generation_id,
+            reason=commit_result.reason,
+            error_code=error_code,
+            mutation_started=True,
+            filesystem_writes=total_writes,
+            recovery_required=True,
+        )
+
+    return ApplyTransactionResult(
+        ok=True,
+        source_generation_id=source_generation_id,
+        source_generation_digest=source_generation_digest,
+        target_generation_id=commit_result.generation_id,
+        target_generation_digest=commit_result.generation_digest,
+        mutation_started=True,
+        filesystem_writes=total_writes,
+        recovery_required=False,
     )
