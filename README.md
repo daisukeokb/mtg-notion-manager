@@ -48,6 +48,24 @@ mtg-notion-manager import <URL>
 - 発売セット名・色名はNotion側の選択肢と完全一致する必要がある。未知の値は `src/mtg_notion_manager/mapping.py` に追記してから再実行すること。マッピングされていない値でNotionに新しい選択肢を自動追加することはしない。
 - 外部ページの取得失敗、パース失敗、Notion API失敗時は、不完全なレコードを書き込まずエラー終了する。
 
+## `--error-json`(構造化エラー出力、pilot: `import-article` / `apply-single-title-update`)
+
+`import-article` と `apply-single-title-update` の2コマンドは `--error-json` フラグをサポートする。
+
+- **成功時の出力・終了コードは一切変更しない**(`--error-json` を付けても付けなくても同じ)。
+- **失敗時のみ**、人間向けメッセージの代わりに、以下5フィールドだけを持つ1行の純粋なJSONオブジェクトをstdoutへ出力する(Rich装飾・ANSIエスケープ・前後の文言は一切含まない)。
+
+  ```json
+  {"schema_version": 1, "command": "import-article", "error_category": "MAPPING", "error_code": "UNMAPPED_VALUE", "message": "..."}
+  ```
+
+  - `schema_version`(整数)・`command`・`error_category`・`error_code` は安定した公開契約であり、スクリプトから参照してよい。
+  - `message` は人間向けの診断テキストであり**安定した契約ではない**。内容をパースしないこと。
+  - `ok` / `details` / `exception_type` / `retryable` / mutation状態を示すフィールドはこのMVPには含まれない。
+- **既存の終了コードは変更しない**(`--error-json` の有無で終了コードは変わらない)。
+- **本出力は診断情報であり、Notion側の状態変化(mutation)を証明する記録ではない**。特に `error_category: PRODUCTION_API` は、書き込みがNotion側へ実際に到達したかどうかを保証しない。retry安全性の判定にも使用できない。
+- Typer/Clickのusage error(必須引数欠落など)や、この2コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
+
 ## 開発
 
 ```bash
