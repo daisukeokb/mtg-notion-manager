@@ -23,7 +23,7 @@ Notion APIは2025-09-03以降のバージョン(data source対応)を使うこ�
 - `doctor`: Notion認証・両DB接続・必須スキーマを診断する。
 - `import <url>`: 単一デッキをMTG統率者DBへ登録する(`--dry-run` / `--deck-name`)。
 - `import-cards <url>`: 1デッキ分のカード一式をMTGカードDBへ登録・Relationする(`--deck-name`または`--deck-page-id`必須、`--dry-run` / `--apply` / `--allow-count-mismatch` / `--confirmed-card-map`)。
-- `import-article <url>`: 記事内の複数デッキのカード一式をまとめて登録する。対象範囲内に曖昧一致・未解決・確認待ちが1件でもあれば全体の書き込みを行わない(all-or-nothing)。
+- `import-article <url>`: 記事内の複数デッキのカード一式をまとめて登録する。対象範囲内に曖昧一致・未解決・確認待ちが1件でもあれば全体の書き込みを行わない(all-or-nothing)。`--error-json`で失敗時のみ構造化JSON出力に対応(README「`--error-json`」節参照)。
 - `verify-import <url>`: 登録済みのはずのデッキ・カード・Relationが実際にNotion上正しいかを読み取り専用で検証する(`--apply`相当のオプションなし)。
 - `dedupe-cards`: MTGカードDBの同名重複ページを検出し代表レコードへ統合する(`--dry-run` / `--apply` / `--apply-schema` / `--apply-all`+`--yes`)。
 - `audit-duplicates`: 重複グループを読み取り専用で監査しJSON/CSV/Markdownレポートを出力する。
@@ -31,7 +31,7 @@ Notion APIは2025-09-03以降のバージョン(data source対応)を使うこ�
 - `apply-dedupe-plan`: 監査レポートの「自動統合可能」グループのみ鮮度再チェックのうえ段階適用する。
 - `apply-price-link-dedupe`: price-only/manual-representativeグループを段階適用する(`--scope canary/remaining/manual`)。代表ページの販売価格・リンクは上書きしない。
 - `plan-title-updates`: 人間確認済みマニフェストの複数件タイトル更新計画を読み取り専用で作成する(dry-run専用)。
-- `apply-single-title-update`: 人間確認済み1件だけを、operation digest一致・楽観的ロック・事後検証を経て安全に更新する(対象1件・プロパティ1件・書き込み1回に限定)。
+- `apply-single-title-update`: 人間確認済み1件だけを、operation digest一致・楽観的ロック・事後検証を経て安全に更新する(対象1件・プロパティ1件・書き込み1回に限定)。`--error-json`で失敗時のみ構造化JSON出力に対応(README「`--error-json`」節参照)。
 
 ## 抽出元サイトの構造(実測、2024年Bloomburrow記事で検証)
 

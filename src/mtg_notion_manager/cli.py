@@ -1,4 +1,5 @@
 import datetime
+import io
 import json
 from pathlib import Path
 from typing import Optional
@@ -9,6 +10,12 @@ from rich.table import Table
 
 from mtg_notion_manager.card_match_overrides import load_card_match_overrides
 from mtg_notion_manager.config import Config, ConfigError
+from mtg_notion_manager.error_contract import (
+    ErrorCategory,
+    ErrorCode,
+    classify_exception,
+    emit_error_json,
+)
 from mtg_notion_manager.exceptions import MtgNotionManagerError
 from mtg_notion_manager.intentional_duplicates import load_intentional_duplicates
 from mtg_notion_manager.notion.card_repository import CardRepository
@@ -991,6 +998,16 @@ def import_article_command(
         False, "--detail/--no-detail", help="デッキごとのカード別詳細テーブルも表示する"
     ),
     output_dir: str = typer.Option("reports", "--output-dir", help="実行ログの出力先ディレクトリ"),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "失敗時のみ、人間向けメッセージの代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message)をstdoutへ出力する。"
+            "成功時の出力・終了コードは変更しない。messageは診断用でありスクリプトから"
+            "パースしないこと。"
+        ),
+    ),
 ) -> None:
     """記事内の複数統率者デッキのカード一式を、まとめてMTGカードDBへ登録する。
 
@@ -1005,14 +1022,32 @@ def import_article_command(
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("import-article", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "import-article", ErrorCategory.CONFIGURATION, ErrorCode.CONFIG_LOAD_FAILED, message
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     do_apply = apply and not dry_run
+
+    # --error-json モードでは、計画表示(print_article_plan_summary等)が
+    # 成功した後に execute_article_import が失敗するケースがあり得る。
+    # そのケースでもstdoutを純粋なJSON1件だけにするため、成功が確定するまで
+    # これらの出力を一時バッファへ書き、例外発生時は破棄する
+    # (成功時は例外の外で実コンソールへそのまま出力するため、成功時の出力内容
+    # 自体は変更しない)。
+    error_buffer = io.StringIO()
+    render_console = Console(file=error_buffer) if error_json else console
 
     try:
         with NotionClient(config.notion_api_key) as client:
@@ -1031,25 +1066,37 @@ def import_article_command(
                 confirmed_card_map_path=Path(confirmed_card_map) if confirmed_card_map else None,
             )
 
-            print_article_plan_summary(console, plan)
-            console.print()
+            print_article_plan_summary(render_console, plan)
+            render_console.print()
             if show_detail:
-                print_article_deck_detail(console, plan)
+                print_article_deck_detail(render_console, plan)
 
             if pending_manifest_output:
                 if plan.pending_manifest is not None:
                     write_pending_manifest(plan.pending_manifest, Path(pending_manifest_output))
-                    console.print(f"確認待ちマニフェスト: {pending_manifest_output}")
+                    render_console.print(f"確認待ちマニフェスト: {pending_manifest_output}")
                 else:
-                    console.print("新規カードが無いため、マニフェストは出力しませんでした。")
+                    render_console.print("新規カードが無いため、マニフェストは出力しませんでした。")
 
             if do_apply:
                 plan = execute_article_import(plan, card_repo, note="import-article由来")
-                console.print()
-                print_article_apply_result(console, plan)
+                render_console.print()
+                print_article_apply_result(render_console, plan)
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("import-article", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    except Exception as exc:  # noqa: BLE001 — 想定外例外もerror_json時はINTERNALとして通知する
+        if error_json:
+            emit_error_json(
+                "import-article", ErrorCategory.INTERNAL, ErrorCode.UNHANDLED_EXCEPTION, str(exc)
+            )
+        raise
+
+    if error_json:
+        print(error_buffer.getvalue(), end="")
 
     log_paths = write_article_import_log(plan, output_dir=Path(output_dir), applied=do_apply)
     console.print()
@@ -1288,6 +1335,17 @@ def apply_single_title_update_command(
         help="実際に1件だけ書き込む(指定しない限り読み取り専用preflightのみで終了する)",
     ),
     output_dir: str = typer.Option("reports", "--output-dir", help="レポートの出力先ディレクトリ"),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "失敗時のみ、人間向けメッセージの代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message)をstdoutへ出力する。"
+            "成功時の出力・終了コードは変更しない。messageは診断用でありスクリプトから"
+            "パースしないこと。本出力はmutation(Notion側の書き込み結果)を保証する記録では"
+            "ない。"
+        ),
+    ),
 ) -> None:
     """人間確認済みの日本語タイトルを、対象1件・プロパティ1件・書き込み1回だけに
     制限して更新する、1件専用コマンド(読み取り専用preflight+ガード付き実更新)。
@@ -1300,33 +1358,57 @@ def apply_single_title_update_command(
     通過した場合のみ、タイトルプロパティを1回だけ更新する。事後検証に失敗しても
     自動rollback・自動再試行は行わない。
     """
+    command_name = "apply-single-title-update"
+
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json(command_name, *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                command_name, ErrorCategory.CONFIGURATION, ErrorCode.CONFIG_LOAD_FAILED, message
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     if expected_count != 1:
-        console.print(
-            f"[red]エラー:[/red] --expected-count は 1 でなければなりません"
-            f"(指定値: {expected_count})。"
-        )
+        message = f"--expected-count は 1 でなければなりません(指定値: {expected_count})。"
+        if error_json:
+            emit_error_json(
+                command_name,
+                ErrorCategory.INPUT_VALIDATION,
+                ErrorCode.EXPECTED_COUNT_NOT_ONE,
+                message,
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {message}")
         raise typer.Exit(code=1)
     if max_updates != 1:
-        console.print(
-            f"[red]エラー:[/red] --max-updates は 1 でなければなりません(指定値: {max_updates})。"
-        )
+        message = f"--max-updates は 1 でなければなりません(指定値: {max_updates})。"
+        if error_json:
+            emit_error_json(
+                command_name, ErrorCategory.INPUT_VALIDATION, ErrorCode.MAX_UPDATES_NOT_ONE, message
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     manifest_path = Path(manifest)
     try:
         entry = load_single_update_manifest(manifest_path)
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json(command_name, *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
@@ -1337,10 +1419,36 @@ def apply_single_title_update_command(
                 read_only_client, config.card_data_source_id, entry
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json(command_name, *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    _print_single_update_preflight(preflight)
+    # --error-json かつ preflight不適用の場合は、この先の人間向け表示
+    # (preflight詳細・レポート出力メッセージ)を一切printせず、ここで純粋な
+    # JSON1件だけをstdoutへ出力して終了する(stdout純度の維持)。
+    # eligible_for_future_update はこの時点で確定済みであり、--apply の
+    # 有無に関わらず同じ判定結果になる(既存の2箇所の不適用チェックを1箇所へ集約)。
+    if error_json and not preflight.eligible_for_future_update:
+        emit_error_json(
+            command_name,
+            ErrorCategory.PRECONDITION,
+            ErrorCode.PREFLIGHT_NOT_ELIGIBLE,
+            "preflightの結果、適用条件を満たしていないため書き込みできません。",
+        )
+        raise typer.Exit(code=1)
+
+    # ここに到達した時点でpreflightは適用可能(--error-jsonの場合は上のガードにより
+    # 保証済み)。この先も承認ダイジェスト不一致・楽観的ロック不一致・書き込み失敗・
+    # 事後検証失敗が起こり得るため、それらのケースでもstdoutを純粋なJSON1件だけに
+    # するには、成功が確定するまでこれらの出力を一時バッファへ書く必要がある。
+    # 例外的にeligibleでない場合は上で既にJSONを出して終了しているので、
+    # ここから先のerror_json=Trueは常に「preflightは適用可能」を意味する。
+    error_buffer = io.StringIO()
+    render_console = Console(file=error_buffer) if error_json else console
+
+    _print_single_update_preflight(render_console, preflight)
 
     data = preflight_to_json_dict(preflight, write_operations=0)
     json_path = write_single_json_report(
@@ -1349,27 +1457,40 @@ def apply_single_title_update_command(
     md_path = write_single_markdown_report(
         data, Path(output_dir) / f"preflight-single-card-title-{_timestamp()}.md"
     )
-    console.print("レポートを出力しました:")
-    console.print(f"  - {json_path}")
-    console.print(f"  - {md_path}")
+    render_console.print("レポートを出力しました:")
+    render_console.print(f"  - {json_path}")
+    render_console.print(f"  - {md_path}")
 
     if not apply:
-        console.print(
+        render_console.print(
             "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません"
             "(preflightのみ)。[/cyan]"
         )
+        if error_json:
+            print(error_buffer.getvalue(), end="")
         raise typer.Exit(code=0 if preflight.eligible_for_future_update else 1)
 
     # --- ここから先は --apply 指定時のみ到達する ---
+    # (error_json かつ 不適用のケースは上のガードで既に処理済みのため、
+    #  ここへ到達するのは常に human mode の場合のみ)
     if not preflight.eligible_for_future_update:
         console.print("[red]エラー:[/red] preflightが適用不可のため、書き込みを行いません。")
         raise typer.Exit(code=1)
 
     if not approval_digest or approval_digest != preflight.operation_digest:
-        console.print(
-            "[red]エラー:[/red] --approval-digest がpreflight結果のoperation_digestと"
+        message = (
+            "--approval-digest がpreflight結果のoperation_digestと"
             " 完全一致しないため、書き込みを行いません。"
         )
+        if error_json:
+            emit_error_json(
+                command_name,
+                ErrorCategory.PRECONDITION,
+                ErrorCode.APPROVAL_DIGEST_MISMATCH,
+                message,
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     try:
@@ -1380,14 +1501,24 @@ def apply_single_title_update_command(
                 read_only_client, config.card_data_source_id, entry
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json(command_name, *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     changes = verify_optimistic_lock(preflight, fresh_preflight)
     if changes:
-        console.print(
-            f"[red]エラー:[/red] 書き込み直前の状態確認で変化を検出したため中止します: {changes}"
-        )
+        message = f"書き込み直前の状態確認で変化を検出したため中止します: {changes}"
+        if error_json:
+            emit_error_json(
+                command_name,
+                ErrorCategory.PRECONDITION,
+                ErrorCode.OPTIMISTIC_LOCK_MISMATCH,
+                message,
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     snapshot = PreApplySnapshot.from_preflight(fresh_preflight, now=_timestamp())
@@ -1405,7 +1536,10 @@ def apply_single_title_update_command(
                 entry.page_id, fresh_preflight.title_property_name, entry.confirmed_new_title
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] 書き込みに失敗しました: {exc}")
+        if error_json:
+            emit_error_json(command_name, *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] 書き込みに失敗しました: {exc}")
         raise typer.Exit(code=1) from exc
 
     write_count = sum(
@@ -1422,32 +1556,53 @@ def apply_single_title_update_command(
                 read_only_client, config.card_data_source_id, entry
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json(command_name, *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     post_result = verify_post_update(snapshot, after_preflight, entry, write_count)
 
-    console.print(f"書き込み回数: {write_count}")
-    console.print(f"事後検証: {post_result}")
-    console.print(
+    # --error-json かつ事後検証失敗の場合は、この先の人間向け表示を一切printせず、
+    # ここで純粋なJSON1件だけをstdoutへ出力して終了する(stdout純度の維持)。
+    # この時点で書き込みは既に実行済みであり、本JSONはmutation自体の結果を
+    # 証明するものではなく診断情報に過ぎない(事後検証が不一致を検出したという事実のみ)。
+    if error_json and not post_result.all_passed:
+        emit_error_json(
+            command_name,
+            ErrorCategory.INTEGRITY,
+            ErrorCode.POST_VERIFICATION_FAILED,
+            "事後検証に失敗しました。自動rollback・自動再試行は行いません。",
+        )
+        raise typer.Exit(code=1)
+
+    render_console.print(f"書き込み回数: {write_count}")
+    render_console.print(f"事後検証: {post_result}")
+    render_console.print(
         "[yellow]事後検証に失敗しても自動rollback・自動再試行は行いません。"
         "誤更新時は別途rollbackマニフェスト・別承認フローで対応してください。[/yellow]"
     )
+
+    if error_json:
+        print(error_buffer.getvalue(), end="")
 
     if not post_result.all_passed:
         raise typer.Exit(code=1)
 
 
-def _print_single_update_preflight(preflight: SingleUpdatePreflightResult) -> None:
-    console.print(f"page_id: {preflight.page_id}")
-    console.print(
+def _print_single_update_preflight(
+    render_console: Console, preflight: SingleUpdatePreflightResult
+) -> None:
+    render_console.print(f"page_id: {preflight.page_id}")
+    render_console.print(
         f"現在タイトル: {preflight.current_title} (期待: {preflight.expected_current_title})"
     )
-    console.print(f"新タイトル: {preflight.confirmed_new_title}")
-    console.print(f"適用可能: {preflight.eligible_for_future_update}")
-    console.print(f"ブロック理由: {'; '.join(preflight.blocking_reasons) or 'なし'}")
-    console.print(f"operation_digest: {preflight.operation_digest}")
-    console.print("approval_required: true")
+    render_console.print(f"新タイトル: {preflight.confirmed_new_title}")
+    render_console.print(f"適用可能: {preflight.eligible_for_future_update}")
+    render_console.print(f"ブロック理由: {'; '.join(preflight.blocking_reasons) or 'なし'}")
+    render_console.print(f"operation_digest: {preflight.operation_digest}")
+    render_console.print("approval_required: true")
 
 
 def _timestamp() -> str:
