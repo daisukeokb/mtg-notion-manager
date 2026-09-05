@@ -10,7 +10,8 @@ from __future__ import annotations
 from mtg_notion_manager.exceptions import MappingError
 
 # Notion「MTG統率者DB」>「発売セット」の既存選択肢(2026-07-11 時点で実測、
-# 2026-07-11 に「イニストラード：真紅の契り」をNotion側で手動追加・反映)。
+# 2026-07-11 に「イニストラード：真紅の契り」をNotion側で手動追加・反映、
+# 2026-08-26 に「イクサラン：失われし洞窟」をNotion側で手動追加・反映)。
 VALID_SET_NAMES: frozenset[str] = frozenset(
     {
         "マーベル スーパー・ヒーローズ",
@@ -26,6 +27,7 @@ VALID_SET_NAMES: frozenset[str] = frozenset(
         "ローウィンの昏明",
         "タルキール：龍嵐録",
         "イニストラード：真紅の契り",
+        "イクサラン：失われし洞窟",
     }
 )
 
