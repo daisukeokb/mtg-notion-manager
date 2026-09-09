@@ -69,6 +69,32 @@ class TestRequestRetry:
 
         assert result == {"name": "bot"}
 
+    def test_create_page_timeout_does_not_retry(self, httpx_mock: HTTPXMock) -> None:
+        """create_page()はべき等ではないため、タイムアウト時に自動リトライして
+        二重にページを作成してはならない(2026-09-08に実際にこの二重作成が
+        発生したことを受けた回帰テスト)。
+        """
+        httpx_mock.add_exception(httpx.ReadTimeout("timed out"))
+
+        with NotionClient("secret_test") as client, pytest.raises(NotionAPIError):
+            client.create_page("ds-1", {"名前": {"title": [{"text": {"content": "x"}}]}})
+
+        assert len(httpx_mock.get_requests()) == 1
+
+    def test_create_page_still_retries_on_429(self, httpx_mock: HTTPXMock) -> None:
+        """タイムアウトと異なり、429/5xxはサーバーが応答済みで処理失敗が
+        ほぼ確実なため、create_page()でも従来通りリトライしてよい。
+        """
+        httpx_mock.add_response(
+            url=f"{API_BASE_URL}/pages", status_code=429, headers={"Retry-After": "0"}
+        )
+        httpx_mock.add_response(url=f"{API_BASE_URL}/pages", json={"id": "page-1"})
+
+        with NotionClient("secret_test") as client:
+            result = client.create_page("ds-1", {"名前": {"title": [{"text": {"content": "x"}}]}})
+
+        assert result == {"id": "page-1"}
+
 
 class TestQueryDataSourceAll:
     def test_paginates_until_has_more_is_false(self, httpx_mock: HTTPXMock) -> None:
