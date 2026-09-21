@@ -231,12 +231,39 @@ def import_command(
         "--deck-name",
         help="1ページに複数デッキが含まれる場合に対象デッキ名を指定する",
     ),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "実行エラー(設定読み込み失敗、デッキ情報取得・Notion読取失敗、Notionへの"
+            "書き込み失敗など)の場合のみ、人間向けメッセージの代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message)をstdoutへ出力する。"
+            "--error-json は対話確認(この内容でNotionに登録しますか?)をbypassしない"
+            "(--yes・--applyに相当する動作はない)。確認を拒否した場合・--dry-run・"
+            "重複デッキのためスキップした場合は実行エラーではないため対象外"
+            "(既存の出力・終了コード0を変更しない)。確認後の書き込み(create_page)は"
+            "非べき等でありタイムアウト時は自動リトライしない設計のため、書き込み試行後に"
+            "発生したエラーでは、JSONの有無にかかわらずNotion側の書き込みが完了していない"
+            "ことの証明にはならない(自動リトライしないこと。再実行前に既存デッキ・重複状態を"
+            "手動で確認すること)。messageは診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
-    """デッキ情報を取得してNotionのMTG統率者DBに登録する。"""
+    """デッキ情報を取得してNotionのMTG統率者DBに登録する。
+
+    --error-json は実行エラー(設定読み込み失敗・デッキ情報取得失敗・Notion書き込み失敗)
+    だけを対象にする。対話確認・--dry-run・重複スキップは対象外で、既存の出力・終了コード0を
+    変更しない。確認後の唯一の書き込み(create_page)は非べき等でありタイムアウト時に
+    自動リトライしないため、書き込み試行後のエラーはNotion側の状態が不明である可能性がある
+    (詳細はREADMEの安全上の注意を参照)。
+    """
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("import", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
@@ -280,7 +307,10 @@ def import_command(
             console.print("[green]Notionに登録しました。[/green]")
 
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("import", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
 

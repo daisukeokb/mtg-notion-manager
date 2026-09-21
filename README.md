@@ -48,9 +48,9 @@ mtg-notion-manager import <URL>
 - 発売セット名・色名はNotion側の選択肢と完全一致する必要がある。未知の値は `src/mtg_notion_manager/mapping.py` に追記してから再実行すること。マッピングされていない値でNotionに新しい選択肢を自動追加することはしない。
 - 外部ページの取得失敗、パース失敗、Notion API失敗時は、不完全なレコードを書き込まずエラー終了する。
 
-## `--error-json`(構造化エラー出力、対応: `import-article` / `apply-single-title-update` / `verify-import` / `doctor` / `audit-duplicates` / `review-duplicate-conflicts` / `plan-title-updates`)
+## `--error-json`(構造化エラー出力、対応: `import` / `import-article` / `apply-single-title-update` / `verify-import` / `doctor` / `audit-duplicates` / `review-duplicate-conflicts` / `plan-title-updates`)
 
-`import-article`・`apply-single-title-update`・`verify-import`・`doctor`・`audit-duplicates`・`review-duplicate-conflicts`・`plan-title-updates` の7コマンドは `--error-json` フラグをサポートする。
+`import`・`import-article`・`apply-single-title-update`・`verify-import`・`doctor`・`audit-duplicates`・`review-duplicate-conflicts`・`plan-title-updates` の8コマンドは `--error-json` フラグをサポートする。
 
 - **成功時の出力・終了コードは一切変更しない**(`--error-json` を付けても付けなくても同じ)。
 - **失敗時のみ**、人間向けメッセージの代わりに、以下5フィールドだけを持つ1行の純粋なJSONオブジェクトをstdoutへ出力する(Rich装飾・ANSIエスケープ・前後の文言は一切含まない)。
@@ -64,11 +64,16 @@ mtg-notion-manager import <URL>
   - `ok` / `details` / `exception_type` / `retryable` / mutation状態を示すフィールドはこのMVPには含まれない。
 - **既存の終了コードは変更しない**(`--error-json` の有無で終了コードは変わらない)。
 - **本出力は診断情報であり、Notion側の状態変化(mutation)を証明する記録ではない**。特に `error_category: PRODUCTION_API` は、書き込みがNotion側へ実際に到達したかどうかを保証しない。retry安全性の判定にも使用できない。
+- **`import` 固有の安全上の注意**(対応コマンドの中で唯一Notionへ書き込みを行いうるコマンド):
+  - `--error-json` は対話確認(「この内容でNotionに登録しますか?」)を一切bypassしない。`--yes` 相当のオプションは存在せず、確認は従来どおり必要。
+  - **確認を拒否した場合はError Contract JSONを出力しない**(実行エラーではなく、意図的なキャンセルであるため)。`--dry-run`・重複デッキによるスキップも同様に対象外(いずれも終了コード0・既存の出力のまま)。
+  - `import` の書き込みは最大1回(`create_page()`)。このAPI呼び出しは非べき等であり、タイムアウト時は自動リトライしない設計になっている(このWork Unitではこの設計を一切変更していない)。**書き込み試行後に発生した実行エラー(特にタイムアウト系)では、Error JSONの有無にかかわらずNotion側にページが作成されていないことの証明にはならない**。自動化スクリプトはこの状態でblind retryしてはならない。再実行前に、対象デッキが既にNotion側に存在していないか(重複状態)を手動で確認すること。
+  - **`import` の書き込みエラー(確認後・`create_page()`失敗)に限り、stdout全体が純粋な1個のJSONにはならない場合がある**。対話確認の前に人間向けのプレビュー(デッキ名・統率者・色などの内容)が既にstdoutへ表示されているため(確認自体が何を承認しているか人間に見える必要があるため、このプレビュー表示は `--error-json` でも抑制しない)、書き込みエラー発生時はプレビュー出力の後に1行のError Contract JSONが追記される。この1ケースに限り、Error Contract JSONはstdoutの**末尾の1行**として解釈すること(他の7コマンド、および `import` 自身の設定読み込み失敗・デッキ情報取得失敗のような対話確認より前に起きるエラーでは、従来どおりstdout全体が純粋なJSONになる)。
 - **`verify-import` は3-way終了コード(0=検証成功 / 1=登録状態に差分あり / 2=実行エラー)を持つが、`--error-json` が対象とするのは終了コード2(実行エラー)のときだけ**。終了コード1(差分あり)は例外ではなく検証結果であり、`--error-json` を指定していてもJSONは出力しない(既存のdiff出力・終了コード1をそのまま維持する)。
 - **`doctor` は「doctorコマンド自体が実行できなかった場合(設定読み込み失敗・Notion接続確立の失敗などの実行エラー)」だけが `--error-json` の対象**。個々のチェック項目の合否(診断結果そのもの、たとえばスキーマ不一致の検出)は診断が正常に実行された結果であり実行エラーではないため、`--error-json` を指定していてもJSONへ変換しない(既存の診断テーブル出力・終了コードをそのまま維持する)。
 - **`audit-duplicates`・`review-duplicate-conflicts` は監査・分類結果そのものが `--error-json` の対象外**。両コマンドとも、対象グループの分類分布(自動統合可能/要確認/手動指定/除外対象/意図的重複、あるいはprice-only/special-version/identity-conflict/other/manual-representative)がどのような内訳であっても正常終了(終了コード0)であり、実行エラーではない。`--error-json` を指定していても既存の集計出力・レポート生成(JSON/CSV/Markdown)は変更しない。さらに `review-duplicate-conflicts` の不明な `--category` 指定は既存どおりCLIの使い方の誤り(人間向けメッセージ・終了コード1)のままとし、Error Contract JSONへは変換しない。
 - **`plan-title-updates` は「1件以上のentryが適用不可(ブロック)」という結果が `--error-json` の対象外**。これはdry-run計画が正常に実行された結果であり実行エラーではないため、`--error-json` を指定していても既存のdry-run出力・終了コード1・レポート生成(JSON/Markdown)を変更しない。対象となるのはマニフェスト不正・件数不一致・Notion読み取りエラーなど、コマンド自体が実行できなかった場合のみ。なお本コマンドはNotionへは一切書き込まない(読み取り専用)が、**ファイルシステムへの書き込みは行う**(成功時に毎回dry-runレポートを`--output-dir`へ出力する)。`--error-json` はこのレポート生成を無効化・変更しない。
-- Typer/Clickのusage error(必須引数欠落など)や、この7コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
+- Typer/Clickのusage error(必須引数欠落など)や、この8コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
 
 ## 開発
 
