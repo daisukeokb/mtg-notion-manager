@@ -48,9 +48,9 @@ mtg-notion-manager import <URL>
 - 発売セット名・色名はNotion側の選択肢と完全一致する必要がある。未知の値は `src/mtg_notion_manager/mapping.py` に追記してから再実行すること。マッピングされていない値でNotionに新しい選択肢を自動追加することはしない。
 - 外部ページの取得失敗、パース失敗、Notion API失敗時は、不完全なレコードを書き込まずエラー終了する。
 
-## `--error-json`(構造化エラー出力、pilot: `import-article` / `apply-single-title-update` / `verify-import`)
+## `--error-json`(構造化エラー出力、pilot: `import-article` / `apply-single-title-update` / `verify-import` / `doctor`)
 
-`import-article`・`apply-single-title-update`・`verify-import` の3コマンドは `--error-json` フラグをサポートする。
+`import-article`・`apply-single-title-update`・`verify-import`・`doctor` の4コマンドは `--error-json` フラグをサポートする。
 
 - **成功時の出力・終了コードは一切変更しない**(`--error-json` を付けても付けなくても同じ)。
 - **失敗時のみ**、人間向けメッセージの代わりに、以下5フィールドだけを持つ1行の純粋なJSONオブジェクトをstdoutへ出力する(Rich装飾・ANSIエスケープ・前後の文言は一切含まない)。
@@ -65,7 +65,8 @@ mtg-notion-manager import <URL>
 - **既存の終了コードは変更しない**(`--error-json` の有無で終了コードは変わらない)。
 - **本出力は診断情報であり、Notion側の状態変化(mutation)を証明する記録ではない**。特に `error_category: PRODUCTION_API` は、書き込みがNotion側へ実際に到達したかどうかを保証しない。retry安全性の判定にも使用できない。
 - **`verify-import` は3-way終了コード(0=検証成功 / 1=登録状態に差分あり / 2=実行エラー)を持つが、`--error-json` が対象とするのは終了コード2(実行エラー)のときだけ**。終了コード1(差分あり)は例外ではなく検証結果であり、`--error-json` を指定していてもJSONは出力しない(既存のdiff出力・終了コード1をそのまま維持する)。
-- Typer/Clickのusage error(必須引数欠落など)や、この3コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
+- **`doctor` は「doctorコマンド自体が実行できなかった場合(設定読み込み失敗・Notion接続確立の失敗などの実行エラー)」だけが `--error-json` の対象**。個々のチェック項目の合否(診断結果そのもの、たとえばスキーマ不一致の検出)は診断が正常に実行された結果であり実行エラーではないため、`--error-json` を指定していてもJSONへ変換しない(既存の診断テーブル出力・終了コードをそのまま維持する)。
+- Typer/Clickのusage error(必須引数欠落など)や、この4コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
 
 ## 開発
 

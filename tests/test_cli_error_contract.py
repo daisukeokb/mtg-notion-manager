@@ -1,4 +1,5 @@
-"""CLI_ERROR_CONTRACT v1(--error-json)のpilot(import-article / apply-single-title-update)テスト。
+"""CLI_ERROR_CONTRACT v1(--error-json)の対応コマンド
+(import-article / apply-single-title-update / verify-import / doctor)テスト。
 
 Notion/外部サイトへは一切接続しない(すべてfake/monkeypatch)。
 """
@@ -20,6 +21,7 @@ from mtg_notion_manager.exceptions import (
     NotionAPIError,
 )
 from mtg_notion_manager.models import DeckCard, ParsedDeckList
+from mtg_notion_manager.services.doctor import CheckResult
 from mtg_notion_manager.services.import_article import ArticleImportLogPaths, ArticleImportPlan
 from mtg_notion_manager.services.import_cards import ImportCardsPlan
 from mtg_notion_manager.services.single_card_title_update import (
@@ -931,6 +933,181 @@ def test_verify_import_unhandled_exception_falls_back_to_internal(
     _assert_pure_json_error(
         structured.stdout,
         command="verify-import",
+        category=ErrorCategory.INTERNAL,
+        code=ErrorCode.UNHANDLED_EXCEPTION,
+    )
+    # human modeでは既存動作(例外がそのまま伝播しCliRunnerがexit_code=1として捕捉)を変更しない。
+    assert human.exit_code == 1
+    assert human.exception is not None
+
+
+# --- doctor ---------------------------------------------------------------------
+
+
+def _patch_doctor_notion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
+
+
+def test_doctor_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["doctor", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_doctor_healthy_human_mode_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_doctor_notion(monkeypatch)
+    monkeypatch.setattr(
+        cli, "run_doctor", lambda config, client: [CheckResult("Notion認証", True, "OK")]
+    )
+
+    result = runner.invoke(cli.app, ["doctor"])
+
+    assert result.exit_code == 0
+    assert "すべてのチェックに合格しました" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_doctor_healthy_error_json_flag_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_doctor_notion(monkeypatch)
+    monkeypatch.setattr(
+        cli, "run_doctor", lambda config, client: [CheckResult("Notion認証", True, "OK")]
+    )
+
+    human = runner.invoke(cli.app, ["doctor"])
+    structured = runner.invoke(cli.app, ["doctor", "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    # 診断成功時にはJSONスキーマが存在しないため、stdout全体はJSONとして解釈できない。
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_doctor_finding_human_mode_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_doctor_notion(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "run_doctor",
+        lambda config, client: [CheckResult("MTG統率者DB接続", False, "スキーマ不一致")],
+    )
+
+    result = runner.invoke(cli.app, ["doctor"])
+
+    assert result.exit_code == 1
+    assert "一部のチェックに失敗しました" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_doctor_finding_error_json_flag_still_no_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """診断チェック失敗(exit 1)はexecution errorではないため、--error-jsonでもJSONを出力しない。
+
+    doctorのExit 1は「設定/Notion接続の実行エラー」と「診断チェック失敗」の両方に
+    使われるが、この2つを混同しないことが本Work Unitで最も重要な契約である。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_doctor_notion(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "run_doctor",
+        lambda config, client: [CheckResult("MTG統率者DB接続", False, "スキーマ不一致")],
+    )
+
+    human = runner.invoke(cli.app, ["doctor"])
+    structured = runner.invoke(cli.app, ["doctor", "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 1
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_doctor_config_error_human_and_json_exit_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    human = runner.invoke(cli.app, ["doctor"])
+    structured = runner.invoke(cli.app, ["doctor", "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human.stdout)
+
+
+def test_doctor_config_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    result = runner.invoke(cli.app, ["doctor", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="doctor",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_doctor_notion_api_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """run_doctor自体(またはNotionClient確立)がNotionAPIErrorを送出するケース。
+
+    実運用ではrun_doctor内部の各チェックがNotionAPIErrorを個別に捕捉し
+    CheckResult(診断結果)へ変換するため、この例外がcli.pyまで到達するのは
+    NotionClient確立失敗など稀なケースに限られるが、doctor_command側の
+    except節自体は既存コードに実在するため、そのexecution error経路を検証する。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_doctor_notion(monkeypatch)
+
+    def _raise(config: Config, client: object) -> list[CheckResult]:
+        raise NotionAPIError("Notion API呼び出しに失敗しました (500): boom")
+
+    monkeypatch.setattr(cli, "run_doctor", _raise)
+
+    result = runner.invoke(cli.app, ["doctor", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="doctor",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+
+
+def test_doctor_unhandled_exception_falls_back_to_internal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MtgNotionManagerErrorの階層に属さない、真に想定外の例外のケース。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_doctor_notion(monkeypatch)
+
+    def _raise(config: Config, client: object) -> list[CheckResult]:
+        raise ValueError("想定外の内部エラー")
+
+    monkeypatch.setattr(cli, "run_doctor", _raise)
+
+    structured = runner.invoke(cli.app, ["doctor", "--error-json"])
+    human = runner.invoke(cli.app, ["doctor"])
+
+    _assert_pure_json_error(
+        structured.stdout,
+        command="doctor",
         category=ErrorCategory.INTERNAL,
         code=ErrorCode.UNHANDLED_EXCEPTION,
     )

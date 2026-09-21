@@ -154,20 +154,49 @@ def main() -> None:
 
 
 @app.command(name="doctor")
-def doctor_command() -> None:
-    """Notion認証・DB接続・スキーマの健全性を診断する。"""
+def doctor_command(
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "doctorコマンド自体が実行できなかった場合(実行エラー)のみ、人間向けメッセージの"
+            "代わりに1行の構造化JSON(schema_version/command/error_category/error_code/message)"
+            "をstdoutへ出力する。診断が正常に実行された結果としての「チェック失敗」は"
+            "実行エラーではないため対象外(既存の診断出力・終了コードを変更しない)。"
+            "messageは診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
+) -> None:
+    """Notion認証・DB接続・スキーマの健全性を診断する。
+
+    --error-json はdoctorコマンド自体が実行できなかった場合(設定読み込み失敗・
+    Notion接続確立の失敗など)だけを対象にする。個々のチェック項目の合否
+    (診断結果そのもの)は既存の診断テーブル・終了コードのまま変更しない。
+    """
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("doctor", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
         with NotionClient(config.notion_api_key) as client:
             results = run_doctor(config, client)
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("doctor", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    except Exception as exc:  # noqa: BLE001 — 想定外例外もerror_json時はINTERNALとして通知する
+        if error_json:
+            emit_error_json(
+                "doctor", ErrorCategory.INTERNAL, ErrorCode.UNHANDLED_EXCEPTION, str(exc)
+            )
+        raise
 
     table = Table(title="doctor診断結果")
     table.add_column("チェック項目")
