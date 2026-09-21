@@ -17,8 +17,20 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 class NotionClient:
     """Notion REST API(data source対応)の薄いラッパー。
 
-    429/5xx・タイムアウトは指数バックオフ(Retry-Afterがあれば優先)で
-    最大 MAX_RETRIES 回まで自動リトライする。
+    429/5xxは指数バックオフ(Retry-Afterがあれば優先)で最大 MAX_RETRIES 回まで
+    自動リトライする(サーバーが応答を返しており、実際に処理が失敗したことが
+    ほぼ確実なため)。
+
+    タイムアウト(応答が一切得られない状態)は、べき等なリクエストに限り同様に
+    リトライする。POST /pages によるページ作成はべき等ではない
+    (サーバー側で実際には作成が成功していたが応答がクライアントに届かない
+    だけ、という可能性を排除できない)ため、タイムアウト時に自動リトライすると
+    同一ページを二重作成しうる。そのため create_page() は
+    _request(..., idempotent=False) を指定し、タイムアウト時は自動リトライせず
+    即座にエラーを送出する(実際に2026-09-08、この二重作成が発生したことを
+    確認済み)。呼び出し側(import_cards等)は既存カードの検索を経てから
+    create_page() を呼ぶ設計のため、エラー後に呼び出し側から再実行すれば
+    安全に収束する。
     """
 
     def __init__(self, api_key: str, timeout: float = 15.0) -> None:
@@ -139,9 +151,11 @@ class NotionClient:
             "parent": {"type": "data_source_id", "data_source_id": data_source_id},
             "properties": properties,
         }
-        return self._request("POST", "/pages", json=payload)
+        return self._request("POST", "/pages", json=payload, idempotent=False)
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> dict:
+    def _request(
+        self, method: str, path: str, idempotent: bool = True, **kwargs: Any
+    ) -> dict:
         attempt = 0
         while True:
             try:
@@ -157,11 +171,20 @@ class NotionClient:
                     f"Notion API呼び出しに失敗しました ({status}): {exc.response.text}"
                 ) from exc
             except httpx.TimeoutException as exc:
-                if attempt < MAX_RETRIES:
+                if idempotent and attempt < MAX_RETRIES:
                     time.sleep(_backoff_seconds(attempt))
                     attempt += 1
                     continue
-                raise NotionAPIError(f"Notion APIへの接続がタイムアウトしました: {exc}") from exc
+                if idempotent:
+                    raise NotionAPIError(
+                        f"Notion APIへの接続がタイムアウトしました: {exc}"
+                    ) from exc
+                raise NotionAPIError(
+                    "Notion APIへの接続がタイムアウトしました。この操作("
+                    f"{method} {path})はべき等ではなく、サーバー側で実際には"
+                    "処理が完了していた可能性を排除できないため自動リトライしません"
+                    f"(手動で状態を確認してから再実行してください): {exc}"
+                ) from exc
             except httpx.HTTPError as exc:
                 raise NotionAPIError(f"Notion APIへの接続に失敗しました: {exc}") from exc
             else:
