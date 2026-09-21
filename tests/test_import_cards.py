@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from mtg_notion_manager.exceptions import AmbiguousCardMatchError
+from mtg_notion_manager.exceptions import AmbiguousCardMatchError, NotionAPIError
 from mtg_notion_manager.models import CardDecision, DeckCard, ExistingCard, ParsedDeckList
 from mtg_notion_manager.notion.card_repository import CardMatch
 from mtg_notion_manager.services import import_cards
@@ -70,6 +70,218 @@ class FakeCardRepository:
 
 def _existing(page_id: str) -> ExistingCard:
     return ExistingCard(page_id=page_id, page_url=f"https://notion.so/{page_id}", properties={})
+
+
+def _unverifiable_card(name_en: str) -> DeckCard:
+    """日本語名が取得できない(英語記事由来・confirmed_mapping未指定)カード。
+
+    _apply_one()内でresolve_new_card(confirmed_mapping=None)が呼ばれ、
+    verified_cardがNoneのままUnverifiedNewCardErrorが送出される。
+    """
+    return DeckCard(
+        name_ja=None, name_en=name_en, quantity=1, is_commander=False, source_url=SOURCE_URL
+    )
+
+
+class FailingCreateCardRepository(FakeCardRepository):
+    """指定したカード名でcreate_card()呼び出し時にNotionAPIErrorを送出する。
+
+    それ以外の挙動はFakeCardRepositoryと同じ(継続動作の既存挙動を検証するため)。
+    """
+
+    def __init__(self, fail_on_name_ja: set[str], **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.fail_on_name_ja = fail_on_name_ja
+
+    def create_card(self, card: DeckCard, deck_page_id: str, note: str = "") -> dict:
+        if card.name_ja in self.fail_on_name_ja:
+            raise NotionAPIError(f"Notion API呼び出しに失敗しました (500): {card.name_ja}")
+        return super().create_card(card, deck_page_id, note=note)
+
+
+class TestPartialResultPreservationOnAbort:
+    """UnverifiedNewCardErrorによる中断時、それより前のCardApplyResultが
+    PartialImportAbortedError.completed_resultsとして回収可能であることを検証する。
+
+    中断semantics自体(同じ中断位置・以降のカード未処理・書き込み回数/順序不変)を
+    変更していないことも併せて確認する。
+    """
+
+    def test_first_card_abort_produces_empty_completed_results(self) -> None:
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([aborting_card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=aborting_card, action="create")],
+        )
+        repo = FakeCardRepository()
+
+        with pytest.raises(import_cards.PartialImportAbortedError) as exc_info:
+            import_cards.execute_import_cards(plan, repo)
+
+        assert exc_info.value.completed_results == ()
+        assert repo.created == []  # 中断したカード自身への書き込みも試行されない
+        assert repo.relation_updates == []
+
+    def test_successful_prefix_is_preserved_and_ordered(self) -> None:
+        card_a = _card("カードA")
+        card_b = _card("カードB")
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card_a, card_b, aborting_card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[
+                CardDecision(card=card_a, action="create"),
+                CardDecision(card=card_b, action="create"),
+                CardDecision(card=aborting_card, action="create"),
+            ],
+        )
+        repo = FakeCardRepository()
+
+        with pytest.raises(import_cards.PartialImportAbortedError) as exc_info:
+            import_cards.execute_import_cards(plan, repo)
+
+        completed = exc_info.value.completed_results
+        assert len(completed) == 2
+        assert completed[0].card is card_a
+        assert completed[0].action == "created"
+        assert completed[1].card is card_b
+        assert completed[1].action == "created"
+        # 中断したカード自身へは書き込みが試行されない(A・Bの2件だけがcreate_card対象)。
+        assert len(repo.created) == 2
+
+    def test_mixed_completed_outcomes_including_notion_api_error(self) -> None:
+        """A: 成功 / B: NotionAPIErrorでfailed / C: 成功 / D: 中断 / E: 未処理、の順序。"""
+        card_a = _card("カードA")
+        card_b = _card("カードB")
+        card_c = _card("カードC")
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        card_e = _card("カードE")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card_a, card_b, card_c, aborting_card, card_e]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[
+                CardDecision(card=card_a, action="create"),
+                CardDecision(card=card_b, action="create"),
+                CardDecision(card=card_c, action="create"),
+                CardDecision(card=aborting_card, action="create"),
+                CardDecision(card=card_e, action="create"),
+            ],
+        )
+        repo = FailingCreateCardRepository(fail_on_name_ja={"カードB"})
+
+        with pytest.raises(import_cards.PartialImportAbortedError) as exc_info:
+            import_cards.execute_import_cards(plan, repo)
+
+        completed = exc_info.value.completed_results
+        assert [r.action for r in completed] == ["created", "failed", "created"]
+        assert completed[0].card is card_a
+        assert completed[1].card is card_b
+        assert completed[1].error is not None  # NotionAPIError由来のfailed結果も保持される
+        assert completed[2].card is card_c
+        # 中断カード(D)・後続カード(E)のいずれもcreate_card対象に含まれない。
+        assert [c.name_ja for c, _, _ in repo.created] == ["カードA", "カードC"]
+
+    def test_no_notion_write_attempted_for_the_aborting_card(self) -> None:
+        """resolve_new_card()の失敗はcard_repo.create_card()到達前に検知されるため、
+        中断したカード自身へのNotion書き込みは一切試行されない。"""
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([aborting_card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=aborting_card, action="create")],
+        )
+        repo = FakeCardRepository()
+
+        with pytest.raises(import_cards.PartialImportAbortedError):
+            import_cards.execute_import_cards(plan, repo)
+
+        assert repo.created == []
+
+    def test_later_cards_are_not_processed_at_all(self) -> None:
+        """中断より後のdecisionはcreate_card/get_deck_relation_ids/apply_relation_update
+        のいずれも一切呼ばれない(単に書き込み件数だけでなく、処理自体が発生しないことを確認)。
+        """
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        later_create = _card("後続カード(create)")
+        later_existing = _existing("later-p1")
+        later_update_card = _card("後続カード(relation_update)")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([aborting_card, later_create, later_update_card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[
+                CardDecision(card=aborting_card, action="create"),
+                CardDecision(card=later_create, action="create"),
+                CardDecision(
+                    card=later_update_card, action="relation_update", existing=later_existing
+                ),
+            ],
+        )
+        repo = FakeCardRepository()
+
+        with pytest.raises(import_cards.PartialImportAbortedError):
+            import_cards.execute_import_cards(plan, repo)
+
+        assert repo.created == []
+        assert repo.relation_updates == []
+
+    def test_original_cause_is_preserved_via_exception_chaining(self) -> None:
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([aborting_card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=aborting_card, action="create")],
+        )
+        repo = FakeCardRepository()
+
+        with pytest.raises(import_cards.PartialImportAbortedError) as exc_info:
+            import_cards.execute_import_cards(plan, repo)
+
+        cause = exc_info.value.__cause__
+        assert cause is not None
+        assert type(cause) is import_cards.UnverifiedNewCardError
+        assert str(cause) == str(exc_info.value)  # carrierのstr()は元の例外と同一
+
+    def test_carrier_is_still_an_unverified_new_card_error(self) -> None:
+        """既存の互換性gate: isinstance(exc, UnverifiedNewCardError) を維持する
+        (このモジュールではUnverifiedNewCardErrorへのexcept依存は現状存在しないが、
+        将来のcatch境界のためにhierarchy互換性を保つ)。
+        """
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([aborting_card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=aborting_card, action="create")],
+        )
+        repo = FakeCardRepository()
+
+        try:
+            import_cards.execute_import_cards(plan, repo)
+            pytest.fail("PartialImportAbortedError was not raised")
+        except import_cards.UnverifiedNewCardError as exc:
+            assert isinstance(exc, import_cards.PartialImportAbortedError)
+
+    def test_existing_notion_api_error_continue_on_error_is_unchanged(self) -> None:
+        """本Work Unitより前から存在するNotionAPIError継続動作の回帰確認
+        (このケース単体では新carrier例外は一切関与しない)。"""
+        card_a = _card("カードA")
+        card_b = _card("カードB")
+        card_c = _card("カードC")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card_a, card_b, card_c]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[
+                CardDecision(card=card_a, action="create"),
+                CardDecision(card=card_b, action="create"),
+                CardDecision(card=card_c, action="create"),
+            ],
+        )
+        repo = FailingCreateCardRepository(fail_on_name_ja={"カードB"})
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        assert [r.action for r in result.results] == ["created", "failed", "created"]
+        assert len(repo.created) == 2  # AとCのみ(Bは例外送出のため未記録)
 
 
 class TestBuildImportCardsPlan:
