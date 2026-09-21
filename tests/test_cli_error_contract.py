@@ -27,6 +27,11 @@ from mtg_notion_manager.services.single_card_title_update import (
     SingleUpdatePreflightResult,
 )
 from mtg_notion_manager.services.title_update_dry_run import ConfirmedTitleUpdateEntry
+from mtg_notion_manager.services.verify_import import (
+    ArticleVerifyReport,
+    DeckVerifyEntry,
+    VerifyReportPaths,
+)
 
 runner = CliRunner()
 URL = "https://magic.wizards.com/ja/news/announcements/secrets-of-strixhaven-commander-decklists"
@@ -662,6 +667,276 @@ def test_apply_single_title_update_write_guard_rejected_is_classified(
         category=ErrorCategory.INTEGRITY,
         code=ErrorCode.WRITE_GUARD_REJECTED,
     )
+
+
+# --- verify-import ------------------------------------------------------------
+
+
+def _verify_verified_entry(deck_name: str = "デッキA") -> DeckVerifyEntry:
+    return DeckVerifyEntry(
+        deck_name=deck_name,
+        verification_status="verified",
+        verification_errors=[],
+        deck_page_id="deck-1",
+        deck_page_url="https://notion.so/deck-1",
+        extracted_card_count=100,
+        unique_card_count=87,
+        existing_card_count=87,
+        new_card_count=0,
+        ambiguous_match_count=0,
+        error_count=0,
+        overrides_used=[],
+        expected_relation_page_ids=["p1", "p2"],
+        actual_relation_page_ids=["p1", "p2"],
+        missing_relation_page_ids=[],
+        unexpected_relation_page_ids=[],
+    )
+
+
+def _verify_mismatch_entry(deck_name: str = "デッキB") -> DeckVerifyEntry:
+    return DeckVerifyEntry(
+        deck_name=deck_name,
+        verification_status="mismatch",
+        verification_errors=["新規カードが1件あります(カードDB未登録の可能性)"],
+        deck_page_id="deck-2",
+        deck_page_url="https://notion.so/deck-2",
+        extracted_card_count=100,
+        unique_card_count=85,
+        existing_card_count=84,
+        new_card_count=1,
+        ambiguous_match_count=0,
+        error_count=0,
+        overrides_used=[],
+        expected_relation_page_ids=["p3"],
+        actual_relation_page_ids=["p3"],
+        missing_relation_page_ids=[],
+        unexpected_relation_page_ids=[],
+    )
+
+
+def _verify_report(entries: list[DeckVerifyEntry]) -> ArticleVerifyReport:
+    return ArticleVerifyReport(
+        source_url=URL, all_deck_names=[e.deck_name for e in entries], entries=entries
+    )
+
+
+def _patch_verify_write_report(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "write_verify_report",
+        lambda report, output_dir, timestamp=None: VerifyReportPaths(
+            json_path=output_dir / "verify-import-x.json"
+        ),
+    )
+
+
+def test_verify_import_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["verify-import", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_verify_import_verified_human_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_verify_write_report(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "build_verify_import_plan",
+        lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _verify_report(
+            [_verify_verified_entry()]
+        ),
+    )
+
+    result = runner.invoke(cli.app, ["verify-import", URL, "--output-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "成功数: 1" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_verify_import_verified_error_json_flag_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_verify_write_report(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "build_verify_import_plan",
+        lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _verify_report(
+            [_verify_verified_entry()]
+        ),
+    )
+
+    human = runner.invoke(cli.app, ["verify-import", URL, "--output-dir", str(tmp_path)])
+    structured = runner.invoke(
+        cli.app, ["verify-import", URL, "--output-dir", str(tmp_path), "--error-json"]
+    )
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    # 検証成功時にはJSONスキーマが存在しないため、stdout全体はJSONとして解釈できない。
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_verify_import_diff_human_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_verify_write_report(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "build_verify_import_plan",
+        lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _verify_report(
+            [_verify_verified_entry(), _verify_mismatch_entry()]
+        ),
+    )
+
+    result = runner.invoke(cli.app, ["verify-import", URL, "--output-dir", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "失敗数: 1" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_verify_import_diff_error_json_flag_still_no_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: object
+) -> None:
+    """差分あり(exit 1)はexecution errorではないため、--error-jsonでもJSONを出力しない。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    _patch_verify_write_report(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "build_verify_import_plan",
+        lambda url, client, writer, card_repo, include_deck_names=None, **kwargs: _verify_report(
+            [_verify_verified_entry(), _verify_mismatch_entry()]
+        ),
+    )
+
+    human = runner.invoke(cli.app, ["verify-import", URL, "--output-dir", str(tmp_path)])
+    structured = runner.invoke(
+        cli.app, ["verify-import", URL, "--output-dir", str(tmp_path), "--error-json"]
+    )
+
+    assert human.exit_code == structured.exit_code == 1
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_verify_import_config_error_human_and_json_exit_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    human = runner.invoke(cli.app, ["verify-import", URL])
+    structured = runner.invoke(cli.app, ["verify-import", URL, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 2
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human.stdout)
+
+
+def test_verify_import_config_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    result = runner.invoke(cli.app, ["verify-import", URL, "--error-json"])
+
+    assert result.exit_code == 2
+    _assert_pure_json_error(
+        result.stdout,
+        command="verify-import",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_verify_import_notion_api_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+
+    def _raise(*args: object, **kwargs: object) -> ArticleVerifyReport:
+        raise NotionAPIError("Notion API呼び出しに失敗しました (500): boom")
+
+    monkeypatch.setattr(cli, "build_verify_import_plan", _raise)
+
+    result = runner.invoke(cli.app, ["verify-import", URL, "--error-json"])
+
+    assert result.exit_code == 2
+    _assert_pure_json_error(
+        result.stdout,
+        command="verify-import",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+
+
+def test_verify_import_mapping_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """verify-importはbuild_article_import_planを内部で再利用するため、MappingError等の
+    import-article由来の既存分類例外もそのまま到達し得る(§Phase B調査結果の回帰確認)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+
+    def _raise(*args: object, **kwargs: object) -> ArticleVerifyReport:
+        raise MappingError("セット名 'SPM' はマッピングできません。")
+
+    monkeypatch.setattr(cli, "build_verify_import_plan", _raise)
+
+    result = runner.invoke(cli.app, ["verify-import", URL, "--error-json"])
+
+    assert result.exit_code == 2
+    _assert_pure_json_error(
+        result.stdout,
+        command="verify-import",
+        category=ErrorCategory.MAPPING,
+        code=ErrorCode.UNMAPPED_VALUE,
+    )
+
+
+def test_verify_import_unhandled_exception_falls_back_to_internal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MtgNotionManagerErrorの階層に属さない、真に想定外の例外のケース。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+
+    def _raise(*args: object, **kwargs: object) -> ArticleVerifyReport:
+        raise ValueError("想定外の内部エラー")
+
+    monkeypatch.setattr(cli, "build_verify_import_plan", _raise)
+
+    structured = runner.invoke(cli.app, ["verify-import", URL, "--error-json"])
+    human = runner.invoke(cli.app, ["verify-import", URL])
+
+    _assert_pure_json_error(
+        structured.stdout,
+        command="verify-import",
+        category=ErrorCategory.INTERNAL,
+        code=ErrorCode.UNHANDLED_EXCEPTION,
+    )
+    # human modeでは既存動作(例外がそのまま伝播しCliRunnerがexit_code=1として捕捉)を変更しない。
+    assert human.exit_code == 1
+    assert human.exception is not None
 
 
 # --- 汎用契約テスト ------------------------------------------------------------

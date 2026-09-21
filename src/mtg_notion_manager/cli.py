@@ -1148,6 +1148,17 @@ def verify_import_command(
     output_dir: str = typer.Option(
         "reports", "--output-dir", help="検証レポートの出力先ディレクトリ"
     ),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "終了コード2(実行エラー)の場合のみ、人間向けメッセージの代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message)をstdoutへ出力する。"
+            "終了コード0(検証成功)・1(差分あり)の出力・終了コードは変更しない"
+            "(差分あり はexecution errorではないためJSONを出力しない)。"
+            "messageは診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
     """記事から抽出できるカード・relationが、Notion上に既に正しく登録されているかを検証する。
 
@@ -1160,16 +1171,26 @@ def verify_import_command(
     (デッキページの解決方法が両コマンドで食い違うことはない)。
 
     終了コード: 0=全デッキ検証成功 / 1=登録状態に差分あり / 2=入力・設定・記事取得・
-    Notion読取などの実行エラー。
+    Notion読取などの実行エラー。--error-json は終了コード2のときだけ構造化JSONを
+    出力する(0・1の出力・終了コードは変更しない)。
     """
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("verify-import", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=2) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "verify-import", ErrorCategory.CONFIGURATION, ErrorCode.CONFIG_LOAD_FAILED, message
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=2)
 
     try:
@@ -1189,8 +1210,17 @@ def verify_import_command(
                 confirmed_card_map_path=Path(confirmed_card_map) if confirmed_card_map else None,
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("verify-import", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=2) from exc
+    except Exception as exc:  # noqa: BLE001 — 想定外例外もerror_json時はINTERNALとして通知する
+        if error_json:
+            emit_error_json(
+                "verify-import", ErrorCategory.INTERNAL, ErrorCode.UNHANDLED_EXCEPTION, str(exc)
+            )
+        raise
 
     print_verify_import_summary(console, report)
     console.print()
