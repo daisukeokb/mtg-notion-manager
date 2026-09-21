@@ -516,26 +516,57 @@ def audit_duplicates_command(
     output_dir: str = typer.Option(
         "reports", "--output-dir", help="レポート(JSON/CSV/Markdown)の出力先ディレクトリ"
     ),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "このコマンド自体が実行できなかった場合(実行エラー)のみ、人間向けメッセージの"
+            "代わりに1行の構造化JSON(schema_version/command/error_category/error_code/message)"
+            "をstdoutへ出力する。監査が正常に実行された結果としての重複グループの分類内容"
+            "(自動統合可能/要確認/手動指定/除外対象/意図的重複、いずれの分布でも)は"
+            "実行エラーではないため対象外(既存の集計出力・終了コード・レポート生成を"
+            "変更しない)。messageは診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
     """残りの重複カードグループを監査し、統合可否を分類したレポートを出力する。
 
     Notionへは一切書き込まない(読み取り専用)。
+
+    --error-json はこのコマンド自体が実行できなかった場合(設定読み込み失敗・
+    intentional_duplicate_cards.json不正・Notion読取失敗など)だけを対象にする。
+    監査結果そのもの(各グループの分類)は既存の集計出力・終了コード0のまま変更しない。
     """
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("audit-duplicates", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "audit-duplicates",
+                ErrorCategory.CONFIGURATION,
+                ErrorCode.CONFIG_LOAD_FAILED,
+                message,
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     exclusions = load_exclusions()
     try:
         intentional_duplicates = load_intentional_duplicates()
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("audit-duplicates", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
@@ -548,8 +579,17 @@ def audit_duplicates_command(
                 intentional_duplicates=intentional_duplicates,
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("audit-duplicates", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    except Exception as exc:  # noqa: BLE001 — 想定外例外もerror_json時はINTERNALとして通知する
+        if error_json:
+            emit_error_json(
+                "audit-duplicates", ErrorCategory.INTERNAL, ErrorCode.UNHANDLED_EXCEPTION, str(exc)
+            )
+        raise
 
     paths = write_audit_reports(audits, Path(output_dir))
 
@@ -730,10 +770,30 @@ def review_duplicate_conflicts_command(
     output_dir: str = typer.Option(
         "reports", "--output-dir", help="レポート(JSON/CSV/Markdown)の出力先ディレクトリ"
     ),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "このコマンド自体が実行できなかった場合(実行エラー)のみ、人間向けメッセージの"
+            "代わりに1行の構造化JSON(schema_version/command/error_category/error_code/message)"
+            "をstdoutへ出力する。詳細分類の結果(price-only/special-version/identity-conflict/"
+            "other/manual-representative、いずれの分布でも)は実行エラーではないため対象外"
+            "(既存の集計出力・終了コード・レポート生成を変更しない)。不明な --category の指定は"
+            "コマンド自体の使い方の誤りでありexecution errorではないため、このflagの対象外のまま"
+            "既存の人間向けメッセージ・終了コード1を維持する(Error Contract JSONは出力しない)。"
+            "messageは診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
     """「要確認」グループをさらに詳細分類する(価格差異のみ/特殊仕様/同一性競合/その他/手動指定)。
 
     Notionへは一切書き込まない(読み取り専用)。
+
+    --error-json はこのコマンド自体が実行できなかった場合(設定読み込み失敗・
+    intentional_duplicate_cards.json不正・Notion読取失敗など)だけを対象にする。
+    詳細分類の結果そのものは既存の集計出力・終了コード0のまま変更しない。
+    不明な --category の指定は既存どおり人間向けメッセージ・終了コード1のままとし、
+    Error Contract JSONへは変換しない(コマンドの使い方の誤りであり実行エラーではない)。
     """
     category_map = {
         "price-only": "price_only",
@@ -755,18 +815,33 @@ def review_duplicate_conflicts_command(
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("review-duplicate-conflicts", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "review-duplicate-conflicts",
+                ErrorCategory.CONFIGURATION,
+                ErrorCode.CONFIG_LOAD_FAILED,
+                message,
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     exclusions = load_exclusions()
     try:
         intentional_duplicates = load_intentional_duplicates()
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("review-duplicate-conflicts", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
@@ -780,8 +855,20 @@ def review_duplicate_conflicts_command(
                 intentional_duplicates=intentional_duplicates,
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("review-duplicate-conflicts", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    except Exception as exc:  # noqa: BLE001 — 想定外例外もerror_json時はINTERNALとして通知する
+        if error_json:
+            emit_error_json(
+                "review-duplicate-conflicts",
+                ErrorCategory.INTERNAL,
+                ErrorCode.UNHANDLED_EXCEPTION,
+                str(exc),
+            )
+        raise
 
     paths = write_review_reports(reviews, Path(output_dir))
 
@@ -1277,6 +1364,17 @@ def plan_title_updates_command(
     output_dir: str = typer.Option(
         "reports", "--output-dir", help="dry-runレポート(JSON/Markdown)の出力先ディレクトリ"
     ),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "このコマンド自体が実行できなかった場合(実行エラー)のみ、人間向けメッセージの"
+            "代わりに1行の構造化JSON(schema_version/command/error_category/error_code/message)"
+            "をstdoutへ出力する。1件以上のentryが適用不可(ブロック)という結果は実行エラーでは"
+            "ないため対象外(既存のdry-run結果・終了コード1・レポート生成を変更しない)。"
+            "messageは診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
     """人間確認済みの日本語タイトルへの変更計画を、読み取り専用で作成する(dry-run専用)。
 
@@ -1286,15 +1384,30 @@ def plan_title_updates_command(
 
     終了コード: 0=対象件数が期待値と一致し全件適用可能 / 1=マニフェスト不正・
     件数不一致・Notion読み取りエラー・1件でも適用不可(ブロック)のいずれか。
+    --error-json は終了コード1のうち実行エラー(マニフェスト不正・件数不一致・
+    Notion読み取りエラー)のときだけ構造化JSONを出力する。1件でも適用不可(ブロック)という
+    正常なdry-run結果は対象外(既存のdry-run出力・終了コード1をそのまま維持する)。
     """
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("plan-title-updates", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "plan-title-updates",
+                ErrorCategory.CONFIGURATION,
+                ErrorCode.CONFIG_LOAD_FAILED,
+                message,
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     manifest_path = Path(manifest)
@@ -1303,7 +1416,10 @@ def plan_title_updates_command(
             manifest_path, expected_entry_count=expected_count
         )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("plan-title-updates", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
@@ -1317,8 +1433,20 @@ def plan_title_updates_command(
                 str(manifest_path),
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("plan-title-updates", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+    except Exception as exc:  # noqa: BLE001 — 想定外例外もerror_json時はINTERNALとして通知する
+        if error_json:
+            emit_error_json(
+                "plan-title-updates",
+                ErrorCategory.INTERNAL,
+                ErrorCode.UNHANDLED_EXCEPTION,
+                str(exc),
+            )
+        raise
 
     write_ops = sum(1 for call in http_call_log if not call.allowed)
     data = to_json_dict(report, write_operations=write_ops, write_attempts=write_ops)

@@ -21,6 +21,7 @@ from mtg_notion_manager.exceptions import (
     DeckCountMismatchError,
     DeckPageMappingConfigError,
     FetchError,
+    IntentionalDuplicateConfigError,
     MappingError,
     MtgNotionManagerError,
     MultipleDecksFoundError,
@@ -67,6 +68,7 @@ class ErrorCode:
     AMBIGUOUS_CARD_MATCH = "AMBIGUOUS_CARD_MATCH"
     CARD_OVERRIDE_CONFIG_INVALID = "CARD_OVERRIDE_CONFIG_INVALID"
     DECK_PAGE_MAP_CONFIG_INVALID = "DECK_PAGE_MAP_CONFIG_INVALID"
+    INTENTIONAL_DUPLICATE_CONFIG_INVALID = "INTENTIONAL_DUPLICATE_CONFIG_INVALID"
     SINGLE_UPDATE_CONFIG_INVALID = "SINGLE_UPDATE_CONFIG_INVALID"
     MANIFEST_INVALID = "MANIFEST_INVALID"
     WRITE_GUARD_REJECTED = "WRITE_GUARD_REJECTED"
@@ -99,6 +101,11 @@ _EXCEPTION_CLASSIFICATION: tuple[tuple[type[Exception], str, str], ...] = (
         DeckPageMappingConfigError,
         ErrorCategory.CONFIGURATION,
         ErrorCode.DECK_PAGE_MAP_CONFIG_INVALID,
+    ),
+    (
+        IntentionalDuplicateConfigError,
+        ErrorCategory.CONFIGURATION,
+        ErrorCode.INTENTIONAL_DUPLICATE_CONFIG_INVALID,
     ),
     (SingleUpdateGuardError, ErrorCategory.INTEGRITY, ErrorCode.WRITE_GUARD_REJECTED),
     (
