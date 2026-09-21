@@ -29,6 +29,7 @@ from mtg_notion_manager.exceptions import (
     ParseError,
     UnsupportedSourceError,
 )
+from mtg_notion_manager.mutation_contract import MutationSummary
 from mtg_notion_manager.services.single_card_title_update import (
     SingleUpdateConfigError,
     SingleUpdateGuardError,
@@ -36,6 +37,7 @@ from mtg_notion_manager.services.single_card_title_update import (
 from mtg_notion_manager.services.title_update_dry_run import TitleUpdateManifestConfigError
 
 SCHEMA_VERSION = 1
+SCHEMA_VERSION_V2 = 2
 
 
 class ErrorCategory:
@@ -133,17 +135,32 @@ def classify_exception(exc: BaseException) -> tuple[str, str]:
     return ErrorCategory.INTERNAL, ErrorCode.UNHANDLED_EXCEPTION
 
 
-def emit_error_json(command: str, category: str, code: str, message: str) -> None:
+def emit_error_json(
+    command: str,
+    category: str,
+    code: str,
+    message: str,
+    *,
+    mutation: MutationSummary | None = None,
+) -> None:
     """Write exactly one pure JSON object to stdout for ``--error-json`` mode.
 
     No Rich rendering, no ANSI, no surrounding prose. Field ordering is not
     part of the public contract.
+
+    ``mutation`` is an optional, keyword-only Error Contract v2 extension
+    (see ``mutation_contract.py``). Every existing call site that omits it
+    keeps emitting the exact same schema_version-1 payload as before this
+    parameter existed — passing ``mutation`` is what selects schema_version 2,
+    never a caller-supplied version number, so the two can never disagree.
     """
     payload = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION if mutation is None else SCHEMA_VERSION_V2,
         "command": command,
         "error_category": category,
         "error_code": code,
         "message": message,
     }
+    if mutation is not None:
+        payload["mutation"] = mutation.to_dict()
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
