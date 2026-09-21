@@ -200,7 +200,20 @@ def import_command(
     deck_name: str = typer.Option(
         None,
         "--deck-name",
-        help="1ページに複数デッキが含まれる場合に対象デッキ名を指定する",
+        help="1ページに複数デッキが含まれる場合に対象デッキ名を指定する(記事側のdeck-title属性と完全一致する値)",
+    ),
+    name: str = typer.Option(
+        None,
+        "--name",
+        help="Notionに登録する「名前」を上書きする(省略時は記事側のdeck-title属性をそのまま使う。"
+        "英語記事でdeck-titleが英語表記のままの場合などに指定する。--deck-nameによる"
+        "記事側のデッキ選択には影響しない)",
+    ),
+    commander: str = typer.Option(
+        None,
+        "--commander",
+        help="Notionに登録する「統率者」を上書きする(省略時は記事側の統率者名をそのまま使う。"
+        "英語記事で統率者名が英語表記のままの場合などに指定する)",
     ),
 ) -> None:
     """デッキ情報を取得してNotionのMTG統率者DBに登録する。"""
@@ -213,7 +226,9 @@ def import_command(
     try:
         with NotionClient(config.notion_api_key) as client:
             writer = NotionWriter(client, config.commander_data_source_id)
-            plan = build_import_plan(url, writer, deck_name)
+            plan = build_import_plan(
+                url, writer, deck_name, name_override=name, commander_override=commander
+            )
 
             console.print("[bold]プレビュー[/bold]")
             console.print_json(json.dumps(plan.record.to_preview_dict(), ensure_ascii=False))

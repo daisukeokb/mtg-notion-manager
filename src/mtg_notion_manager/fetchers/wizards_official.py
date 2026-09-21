@@ -69,7 +69,8 @@ class WizardsOfficialFetcher(BaseFetcher):
         if not commander:
             raise ParseError(f"統率者名を抽出できませんでした: {source_url}")
 
-        colors_raw = _extract_colors(soup, name, source_url)
+        deck_index = deck_list_tags.index(deck_tag)
+        colors_raw = _extract_colors(soup, name, deck_index, source_url)
 
         return RawDeckData(
             name=name,
@@ -101,13 +102,47 @@ def _select_deck_tag(deck_list_tags: list[Tag], deck_name: str | None, source_ur
     return deck_list_tags[0]
 
 
-def _extract_colors(soup: BeautifulSoup, deck_name: str, source_url: str) -> list[str]:
-    pattern = re.compile(rf"^\s*{re.escape(deck_name)}\s*\(([^)]+)\)")
+_FIGCAPTION_RE = re.compile(r"^\s*「?(.+?)」?\s*[(（]([^)）]+)[)）]")
+_JA_COLOR_CHARS = frozenset("白青黒赤緑無")
+
+
+def _split_color_tokens(colors_text: str) -> list[str]:
+    """色トークン文字列を分割する。
+
+    英語表記(例: "Red-Green")はハイフン等で区切られた単語単位、
+    日本語表記(例: "赤緑")は区切り文字なしで色を表す漢字が連結されているため、
+    1文字ずつに分割する(サイト側の表記言語の違いを吸収する)。
+    """
+    if colors_text and all(ch in _JA_COLOR_CHARS for ch in colors_text):
+        return list(colors_text)
+    return [token.strip() for token in re.split(r"[-/,]", colors_text) if token.strip()]
+
+
+def _extract_colors(
+    soup: BeautifulSoup, deck_name: str, deck_index: int, source_url: str
+) -> list[str]:
+    """デッキ名と対になった色情報をfigcaptionから取得する。
+
+    記事によってfigcaptionの言語(デッキ名の英語/日本語、括弧の全角/半角)が
+    異なる(2024年Bloomburrow記事は英語figcaptionだったが、2026年時点の
+    マーベル記事等は日本語figcaptionへ変わっている)。まずdeck-title属性と
+    完全一致する名前を探し、見つからなければfigcaptionの出現順とdeck-listタグの
+    出現順が対応している前提でdeck_index番目にフォールバックする
+    (deck-title属性がページ側で誤って重複しているケースがあるため、
+    名前一致を最優先しつつ、名前だけでは解決できない場合の保険とする)。
+    """
+    parsed: list[tuple[str, str]] = []
     for figcaption in soup.find_all("figcaption"):
         text = figcaption.get_text(strip=True)
-        match = pattern.match(text)
+        match = _FIGCAPTION_RE.match(text)
         if match:
-            colors_text = match.group(1)
-            return [token.strip() for token in re.split(r"[-/,]", colors_text) if token.strip()]
+            parsed.append((match.group(1).strip(), match.group(2).strip()))
+
+    for name, colors_text in parsed:
+        if name == deck_name:
+            return _split_color_tokens(colors_text)
+
+    if 0 <= deck_index < len(parsed):
+        return _split_color_tokens(parsed[deck_index][1])
 
     raise ParseError(f"デッキ '{deck_name}' の色情報が見つかりませんでした: {source_url}")

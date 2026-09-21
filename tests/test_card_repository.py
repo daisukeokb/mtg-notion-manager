@@ -448,3 +448,57 @@ class TestFindMatchWithOverrides:
 
         assert match.card is not None
         assert match.card.page_id == "p2"  # p1(リスト先頭)ではなく明示指定したp2
+
+    def test_override_resolves_when_no_candidates_at_all(self) -> None:
+        # 複数統率者デッキ共通の汎用カードを記事側がデッキ名付きの別表記
+        # (例: "Arcane Signet Avengers")で掲載しているケース。英語名・日本語名
+        # どちらでも候補が0件でも、overrideが設定されていれば既存の代表ページへ
+        # 直接一致させ、同名重複の新規作成を避ける。
+        pages = [_card_page("p1", "秘儀の印鑑", name_en="Arcane Signet")]
+        client = FakeNotionClient(pages)
+        overrides = CardMatchOverrides(
+            by_japanese_name={},
+            by_english_name={
+                "arcane signet avengers": OverrideEntry(
+                    canonical_page_id="p1",
+                    reason="Wizards公式記事のデッキ名付き別表記(mtg-jp.comで同一Oracleカードと確認済み)",
+                )
+            },
+        )
+        repo = CardRepository(client, DATA_SOURCE_ID, overrides=overrides)
+        repo.load()
+
+        match = repo.find_match(_deck_card(name_en="Arcane Signet Avengers"))
+
+        assert match.card is not None
+        assert match.card.page_id == "p1"
+        assert not match.is_ambiguous
+        assert match.override_reason is not None and "Wizards公式記事" in match.override_reason
+
+    def test_no_override_and_no_candidates_returns_none(self) -> None:
+        pages = [_card_page("p1", "山")]
+        client = FakeNotionClient(pages)
+        repo = CardRepository(client, DATA_SOURCE_ID)  # overrides未指定
+        repo.load()
+
+        match = repo.find_match(_deck_card(name_en="Totally Unknown Card"))
+
+        assert match.card is None
+        assert not match.is_ambiguous
+
+    def test_override_target_missing_from_card_db_raises(self) -> None:
+        pages = [_card_page("p1", "山")]
+        client = FakeNotionClient(pages)
+        overrides = CardMatchOverrides(
+            by_japanese_name={},
+            by_english_name={
+                "arcane signet avengers": OverrideEntry(
+                    canonical_page_id="p999-does-not-exist", reason="誤設定"
+                )
+            },
+        )
+        repo = CardRepository(client, DATA_SOURCE_ID, overrides=overrides)
+        repo.load()
+
+        with pytest.raises(CardMatchOverrideError):
+            repo.find_match(_deck_card(name_en="Arcane Signet Avengers"))

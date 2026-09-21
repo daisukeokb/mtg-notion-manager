@@ -7,6 +7,18 @@
     "独創のタリスマン": {
       "canonical_page_id": "39ba97c8-7142-8112-86d1-ee10535229f9",
       "reason": "2026-09-08ユーザー確認済み: 3caa97c8-7142-81ae-af65-f859063936ea は所持=false・無関係なメモ(カウンターインテリジェンス...)が付いた別用途の誤登録の可能性が高く、39ba97c8-7142-8112-86d1-ee10535229f9(所持=true, import-article由来, 既存デッキ1件とリレーション済み)を正規レコードとして採用する"
+    },
+    "組み直しの骸骨": {
+      "canonical_page_id": "3caa97c8-7142-818d-9c8f-cf5fbacce17f",
+      "reason": "2026-09-11ユーザー確認済み: 3cca97c8-7142-81e0-b8fe-c179ff8bd308 は所持=false・メモなし・作成日2026-08-30の可能性が高い誤登録で、3caa97c8-7142-818d-9c8f-cf5fbacce17f(所持=true, 所持枚数=1, メモあり「『ゲームナイト：フリー・フォー・オール』所持品由来。Wizards日本公式デッキリスト（2022-10-14発売）を根拠に登録」, 作成日2026-08-28)を正規レコードとして採用する"
+    },
+    "祖先の道": {
+      "canonical_page_id": "af7c8219-930c-4c2a-a6c4-30bb52faff8f",
+      "reason": "2026-09-13ユーザー確認済み: 3d9a97c8-7142-8173-a83a-c526d14d5016 は所持=false・採用デッキ0件・メモ「2026-09-12 ドラーナFinal100構築で新規登録」の別デッキインポート時に作られた重複ページの可能性が高く、af7c8219-930c-4c2a-a6c4-30bb52faff8f(所持=true, 採用デッキ23件, メモ「[統合] 2026-07-11: 重複ページ2件を統合」)を正規レコードとして採用する"
+    },
+    "勝者の戦旗": {
+      "canonical_page_id": "dfbf4a04-7b75-4f7c-9bf6-bd246b2403cf",
+      "reason": "2026-09-13ユーザー確認済み: 3d9a97c8-7142-815f-a169-e7d6aae304de は所持=false・採用デッキ0件・メモ「2026-09-12 ドラーナFinal100構築で新規登録」の別デッキインポート時に作られた重複ページの可能性が高く、dfbf4a04-7b75-4f7c-9bf6-bd246b2403cf(所持=true)を正規レコードとして採用する"
     }
   },
   "by_english_name": {
@@ -17,6 +29,54 @@
     "Talisman of Creativity": {
       "canonical_page_id": "39ba97c8-7142-8112-86d1-ee10535229f9",
       "reason": "2026-09-08ユーザー確認済み(独創のタリスマン、日本語名・英語名どちらの照合でも同じ代表ページを使う): 3caa97c8-7142-81ae-af65-f859063936ea は所持=false・無関係なメモ(カウンターインテリジェンス...)が付いた別用途の誤登録の可能性が高く、39ba97c8-7142-8112-86d1-ee10535229f9(所持=true, import-article由来)を正規レコードとして採用する"
+    },
+    "Arcane Signet Avengers": {
+      "canonical_page_id": "f19001d6-650a-4e74-a909-12fc39f8c41c",
+      "reason": "2026-09-11ユーザー確認済み: 『マーベル スーパー・ヒーローズ』統率者デッキ発表記事(magic.wizards.com)は、複数デッキ共通の汎用カードをデッキ名付きの別表記(Arcane Signet Avengers/Wakanda/The Fantastic Four/(Villains))で掲載する。mtg-jp.com公式デッキリスト記事(https://mtg-jp.com/reading/publicity/0039563/)で同一Oracleカード「Arcane Signet」(秘儀の印鑑)であることを確認済み。find_match()が英語名・日本語名とも候補0件の場合にoverrideを参照するよう修正した(候補0件時はこれまでoverrideを一切見ていなかったため)。"
+    },
+    "Sol Ring Avengers": {
+      "canonical_page_id": "20dd9eb7-0b82-4fdf-831a-d9e35943478c",
+      "reason": "2026-09-11ユーザー確認済み: 上記Arcane Signet Avengersと同じ理由。Oracleカード「Sol Ring」(太陽の指輪)であることをmtg-jp.com公式デッキリスト記事で確認済み。"
+    },
+    "Command Tower Avengers": {
+      "canonical_page_id": "0b218d51-726a-4d29-b34f-a2828ebeeeab",
+      "reason": "2026-09-11ユーザー確認済み: 上記Arcane Signet Avengersと同じ理由。Oracleカード「Command Tower」(統率の塔)であることをmtg-jp.com公式デッキリスト記事で確認済み。"
+    },
+    "Arcane Signet The Fantastic Four": {
+      "canonical_page_id": "f19001d6-650a-4e74-a909-12fc39f8c41c",
+      "reason": "2026-09-11ユーザー確認済み: Arcane Signet Avengersと同じ理由(同一記事内の別デッキ「The Fantastic Four」向け別表記)。"
+    },
+    "Sol Ring The Fantastic Four": {
+      "canonical_page_id": "20dd9eb7-0b82-4fdf-831a-d9e35943478c",
+      "reason": "2026-09-11ユーザー確認済み: 上記と同じ理由。"
+    },
+    "Command Tower The Fantastic Four": {
+      "canonical_page_id": "0b218d51-726a-4d29-b34f-a2828ebeeeab",
+      "reason": "2026-09-11ユーザー確認済み: 上記と同じ理由。"
+    },
+    "Arcane Signet Wakanda": {
+      "canonical_page_id": "f19001d6-650a-4e74-a909-12fc39f8c41c",
+      "reason": "2026-09-11ユーザー確認済み: Arcane Signet Avengersと同じ理由(同一記事内の別デッキ「ワカンダは永遠なり」向け別表記)。"
+    },
+    "Sol Ring Wakanda": {
+      "canonical_page_id": "20dd9eb7-0b82-4fdf-831a-d9e35943478c",
+      "reason": "2026-09-11ユーザー確認済み: 上記と同じ理由。"
+    },
+    "Command Tower Wakanda": {
+      "canonical_page_id": "0b218d51-726a-4d29-b34f-a2828ebeeeab",
+      "reason": "2026-09-11ユーザー確認済み: 上記と同じ理由。"
+    },
+    "Reassembling Skeleton": {
+      "canonical_page_id": "3caa97c8-7142-818d-9c8f-cf5fbacce17f",
+      "reason": "2026-09-11ユーザー確認済み(組み直しの骸骨、日本語名・英語名どちらの照合でも同じ代表ページを使う): 3cca97c8-7142-81e0-b8fe-c179ff8bd308 は所持=false・メモなし・作成日2026-08-30の可能性が高い誤登録で、3caa97c8-7142-818d-9c8f-cf5fbacce17f(所持=true, 所持枚数=1, メモあり「『ゲームナイト：フリー・フォー・オール』所持品由来。Wizards日本公式デッキリスト（2022-10-14発売）を根拠に登録」, 作成日2026-08-28)を正規レコードとして採用する"
+    },
+    "Path of Ancestry": {
+      "canonical_page_id": "af7c8219-930c-4c2a-a6c4-30bb52faff8f",
+      "reason": "2026-09-13ユーザー確認済み(祖先の道、日本語名・英語名どちらの照合でも同じ代表ページを使う): 3d9a97c8-7142-8173-a83a-c526d14d5016 は所持=false・採用デッキ0件・メモ「2026-09-12 ドラーナFinal100構築で新規登録」の別デッキインポート時に作られた重複ページの可能性が高く、af7c8219-930c-4c2a-a6c4-30bb52faff8f(所持=true, 採用デッキ23件, メモ「[統合] 2026-07-11: 重複ページ2件を統合」)を正規レコードとして採用する"
+    },
+    "Vanquisher's Banner": {
+      "canonical_page_id": "dfbf4a04-7b75-4f7c-9bf6-bd246b2403cf",
+      "reason": "2026-09-13ユーザー確認済み(勝者の戦旗、日本語名・英語名どちらの照合でも同じ代表ページを使う): 3d9a97c8-7142-815f-a169-e7d6aae304de は所持=false・採用デッキ0件・メモ「2026-09-12 ドラーナFinal100構築で新規登録」の別デッキインポート時に作られた重複ページの可能性が高く、dfbf4a04-7b75-4f7c-9bf6-bd246b2403cf(所持=true)を正規レコードとして採用する"
     }
   }
 }

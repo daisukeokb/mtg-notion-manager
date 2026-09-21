@@ -20,6 +20,7 @@ from mtg_notion_manager.exceptions import (
 )
 from mtg_notion_manager.fetchers.base import download
 from mtg_notion_manager.fetchers.mtg_jp import (
+    _collect_decklist_table_names,
     _extract_commander,
     _find_deck_headings,
     _select_deck_heading,
@@ -60,8 +61,13 @@ def parse_mtg_jp_decklist(
 
     headings = _find_deck_headings(soup)
     if not headings:
-        raise ParseError(f"デッキ見出し(「デッキ名」形式のh4)が見つかりませんでした: {source_url}")
-    heading_tag, name = _select_deck_heading(headings, deck_name, source_url)
+        raise ParseError(
+            f"デッキ見出し(「デッキ名」または「デッキ名（色）」形式のh4)が見つかりませんでした: {source_url}"
+        )
+    known_table_names = _collect_decklist_table_names(soup)
+    heading_tag, name, _inline_colors = _select_deck_heading(
+        headings, deck_name, source_url, known_table_names
+    )
 
     table = heading_tag.find_next("table", class_="decklist")
     if table is None:

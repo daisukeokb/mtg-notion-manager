@@ -30,7 +30,7 @@ def _sample_plan(existing: ExistingDeck | None = None, diff: list | None = None)
 def test_dry_run_does_not_write(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     monkeypatch.setattr(
-        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_plan()
+        cli, "build_import_plan", lambda url, writer, deck_name=None, name_override=None, commander_override=None: _sample_plan()
     )
 
     executed = {"value": False}
@@ -51,7 +51,7 @@ def test_duplicate_deck_is_skipped_without_prompt(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         cli,
         "build_import_plan",
-        lambda url, writer, deck_name=None: _sample_plan(existing=existing),
+        lambda url, writer, deck_name=None, name_override=None, commander_override=None: _sample_plan(existing=existing),
     )
 
     executed = {"value": False}
@@ -69,7 +69,7 @@ def test_duplicate_deck_is_skipped_without_prompt(monkeypatch: pytest.MonkeyPatc
 def test_confirmed_import_executes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     monkeypatch.setattr(
-        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_plan()
+        cli, "build_import_plan", lambda url, writer, deck_name=None, name_override=None, commander_override=None: _sample_plan()
     )
 
     executed = {"value": False}
@@ -86,7 +86,7 @@ def test_confirmed_import_executes(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_declined_confirmation_does_not_write(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     monkeypatch.setattr(
-        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_plan()
+        cli, "build_import_plan", lambda url, writer, deck_name=None, name_override=None, commander_override=None: _sample_plan()
     )
 
     executed = {"value": False}

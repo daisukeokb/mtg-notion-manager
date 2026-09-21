@@ -106,6 +106,10 @@ class CardRepository:
         英語名で一致すれば日本語名は見ない(仕様どおり英語名を第一候補とする)。
         複数候補になった場合は card_match_overrides を確認し、指定page_idが
         候補内にあればそれを採用する(fuzzy matchや自動選択は一切行わない)。
+        英語名・日本語名のどちらでも候補が0件の場合も card_match_overrides を確認する
+        (例: 複数統率者デッキ共通の汎用カードを記事側がデッキ名付きの別表記で
+        掲載しているケース。同名重複の新規作成を避けるため、既存の代表ページへ
+        直接リレーションする)。
         """
         if not self._loaded:
             raise RuntimeError("CardRepository.load() を先に呼んでください")
@@ -124,7 +128,7 @@ class CardRepository:
             if len(candidates) > 1:
                 return self._resolve_ambiguous(card, candidates)
 
-        return CardMatch(card=None, ambiguous_candidates=[])
+        return self._resolve_unmatched(card)
 
     def _resolve_ambiguous(self, card: DeckCard, candidates: list[ExistingCard]) -> CardMatch:
         override = self._overrides.resolve(card.name_ja, card.name_en)
@@ -143,6 +147,20 @@ class CardRepository:
                 " config/card_match_overrides.json を確認してください。"
             )
         return CardMatch(card=matched, ambiguous_candidates=[], override_reason=override.reason)
+
+    def _resolve_unmatched(self, card: DeckCard) -> CardMatch:
+        override = self._overrides.resolve(card.name_ja, card.name_en)
+        if override is None:
+            return CardMatch(card=None, ambiguous_candidates=[])
+
+        page = self._by_page_id.get(override.canonical_page_id)
+        if page is None:
+            raise CardMatchOverrideError(
+                f"カード '{card.display_name}' のオーバーライド指定"
+                f" page_id '{override.canonical_page_id}' がカードDB内に見つかりません。"
+                " config/card_match_overrides.json を確認してください。"
+            )
+        return CardMatch(card=page, ambiguous_candidates=[], override_reason=override.reason)
 
     def get_deck_relation_ids(self, existing: ExistingCard) -> list[str]:
         """「採用デッキ」リレーションの全ページIDを取得する(25件超はページングして取得)。"""

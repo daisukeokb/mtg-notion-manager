@@ -25,8 +25,10 @@ class FakeWriter:
         self.existing = existing
         self.diff = diff or []
         self.created: list = []
+        self.find_existing_deck_calls: list[str] = []
 
     def find_existing_deck(self, name: str) -> ExistingDeck | None:
+        self.find_existing_deck_calls.append(name)
         return self.existing
 
     def diff_against(self, existing: ExistingDeck, record) -> list:
@@ -79,6 +81,40 @@ class TestBuildImportPlan:
 
         with pytest.raises(MappingError):
             import_deck.build_import_plan(SOURCE_URL, writer)
+
+    def test_name_override_replaces_registered_name_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 英語記事でdeck-titleが英語表記のまま(例: Bloomburrow記事の"Animated Army")の
+        # 場合、--name で登録名だけを日本語の正式名称に上書きできる。重複判定も
+        # 上書き後の名前で行われる(記事側のデッキ選択=deck_nameには影響しない)。
+        monkeypatch.setattr(
+            import_deck, "get_fetcher", lambda url: FakeFetcher(_raw_deck(name="Animated Army"))
+        )
+        writer = FakeWriter(existing=None)
+
+        plan = import_deck.build_import_plan(
+            SOURCE_URL, writer, deck_name="Animated Army", name_override="動き出した兵隊"
+        )
+
+        assert plan.record.name == "動き出した兵隊"
+        assert writer.find_existing_deck_calls == ["動き出した兵隊"]
+
+    def test_commander_override_replaces_registered_commander_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            import_deck,
+            "get_fetcher",
+            lambda url: FakeFetcher(_raw_deck(commander="Bello, Bard of the Brambles")),
+        )
+        writer = FakeWriter(existing=None)
+
+        plan = import_deck.build_import_plan(
+            SOURCE_URL, writer, commander_override="茨の吟遊詩人、べロ"
+        )
+
+        assert plan.record.commander == "茨の吟遊詩人、べロ"
 
     def test_unknown_color_raises_mapping_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
