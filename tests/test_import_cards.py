@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import httpx
 import pytest
 
 from mtg_notion_manager.exceptions import AmbiguousCardMatchError, NotionAPIError
@@ -97,6 +98,61 @@ class FailingCreateCardRepository(FakeCardRepository):
         if card.name_ja in self.fail_on_name_ja:
             raise NotionAPIError(f"Notion API呼び出しに失敗しました (500): {card.name_ja}")
         return super().create_card(card, deck_page_id, note=note)
+
+
+def _http_status_error(status_code: int = 400) -> httpx.HTTPStatusError:
+    """実際のNotionClientが送出するNotionAPIErrorのcauseを模す(定義済みのHTTP
+    エラー応答 = サーバーが明示的に拒否した、という構造的signal)。"""
+    request = httpx.Request("POST", "https://api.notion.com/v1/pages")
+    response = httpx.Response(status_code, request=request, text="notion error body")
+    return httpx.HTTPStatusError("HTTP error", request=request, response=response)
+
+
+def _timeout_exception() -> httpx.TimeoutException:
+    """実際のNotionClientが送出するNotionAPIErrorのcauseを模す(応答が一切
+    得られない = 完了状態が不明、という構造的signal)。"""
+    return httpx.TimeoutException("timed out")
+
+
+class FailingCreateWithCauseCardRepository(FakeCardRepository):
+    """指定したカード名でcreate_card()呼び出し時に、指定したcauseを持つ
+    NotionAPIErrorを送出する(実際のNotionClient._request()の
+    `raise NotionAPIError(...) from exc` 連鎖をそのまま模したfake)。
+
+    create_card()の呼び出し回数も記録し、「1回だけ試行される」ことを検証できる
+    ようにする。
+    """
+
+    def __init__(self, fail_on_name_ja: dict[str, BaseException], **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.fail_on_name_ja = fail_on_name_ja
+        self.create_attempts: list[str | None] = []
+
+    def create_card(self, card: DeckCard, deck_page_id: str, note: str = "") -> dict:
+        self.create_attempts.append(card.name_ja)
+        cause = self.fail_on_name_ja.get(card.name_ja or "")
+        if cause is not None:
+            raise NotionAPIError(f"Notion API呼び出しに失敗しました: {card.name_ja}") from cause
+        return super().create_card(card, deck_page_id, note=note)
+
+
+class FailingRelationUpdateWithCauseCardRepository(FakeCardRepository):
+    """指定したpage_idでapply_relation_update()呼び出し時に、指定したcauseを持つ
+    NotionAPIErrorを送出する(update_page()経由の失敗を模す)。"""
+
+    def __init__(self, fail_on_page_id: dict[str, BaseException], **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self.fail_on_page_id = fail_on_page_id
+
+    def apply_relation_update(
+        self, existing: ExistingCard, deck_page_id: str, current_deck_ids: list[str]
+    ) -> dict:
+        cause = self.fail_on_page_id.get(existing.page_id)
+        if cause is not None:
+            raise NotionAPIError(
+                f"Notion API呼び出しに失敗しました: {existing.page_id}"
+            ) from cause
+        return super().apply_relation_update(existing, deck_page_id, current_deck_ids)
 
 
 class TestPartialResultPreservationOnAbort:
@@ -282,6 +338,199 @@ class TestPartialResultPreservationOnAbort:
 
         assert [r.action for r in result.results] == ["created", "failed", "created"]
         assert len(repo.created) == 2  # AとCのみ(Bは例外送出のため未記録)
+
+
+class TestFailedWriteMetadata:
+    """CardApplyResult(action="failed")のfailed_operation/failed_completionが、
+    NotionAPIError.__cause__の型だけから(メッセージ文字列を一切見ずに)構造的に
+    決まることを検証する。"""
+
+    def test_known_failed_create_via_http_status_error(self) -> None:
+        card = _card("カードA")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="create")],
+        )
+        repo = FailingCreateWithCauseCardRepository(
+            fail_on_name_ja={"カードA": _http_status_error()}
+        )
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.action == "failed"
+        assert r.failed_operation == import_cards.FailedWriteOperation.CREATE
+        assert r.failed_completion == import_cards.WriteCompletion.KNOWN_FAILED
+        assert r.error == "Notion API呼び出しに失敗しました: カードA"  # human文字列は不変
+        assert repo.create_attempts == ["カードA"]  # 1回だけ試行される
+
+    def test_unknown_completion_create_via_timeout(self) -> None:
+        card = _card("カードA")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="create")],
+        )
+        repo = FailingCreateWithCauseCardRepository(
+            fail_on_name_ja={"カードA": _timeout_exception()}
+        )
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.action == "failed"
+        assert r.failed_operation == import_cards.FailedWriteOperation.CREATE
+        assert r.failed_completion == import_cards.WriteCompletion.UNKNOWN
+        assert repo.create_attempts == ["カードA"]  # 非べき等操作は1回だけ試行される
+
+    def test_relation_update_known_failed_via_http_status_error(self) -> None:
+        card = _card("既存カード")
+        existing = _existing("p1")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="relation_update", existing=existing)],
+        )
+        repo = FailingRelationUpdateWithCauseCardRepository(
+            fail_on_page_id={"p1": _http_status_error()}
+        )
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.failed_operation == import_cards.FailedWriteOperation.RELATION_UPDATE
+        assert r.failed_completion == import_cards.WriteCompletion.KNOWN_FAILED
+
+    def test_relation_update_unknown_completion_via_timeout(self) -> None:
+        """update_page()はタイムアウト時に自動リトライされる(idempotent)が、
+        リトライを使い切った後の完了状態は依然として不明であるため、
+        KNOWN_FAILEDではなくUNKNOWNのままとする。"""
+        card = _card("既存カード")
+        existing = _existing("p1")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="relation_update", existing=existing)],
+        )
+        repo = FailingRelationUpdateWithCauseCardRepository(
+            fail_on_page_id={"p1": _timeout_exception()}
+        )
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.failed_operation == import_cards.FailedWriteOperation.RELATION_UPDATE
+        assert r.failed_completion == import_cards.WriteCompletion.UNKNOWN
+
+    def test_successful_create_has_no_failure_metadata(self) -> None:
+        card = _card("新カード")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="create")],
+        )
+        repo = FakeCardRepository()
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.action == "created"
+        assert r.failed_operation is None
+        assert r.failed_completion is None
+
+    def test_unchanged_has_no_failure_metadata(self) -> None:
+        card = _card("既存カード")
+        existing = _existing("p1")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="unchanged", existing=existing)],
+        )
+        repo = FakeCardRepository()
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.failed_operation is None
+        assert r.failed_completion is None
+
+    def test_partial_abort_preserves_structured_failure_metadata(self) -> None:
+        """A: 成功 / B: NotionAPIError(known_failed)でfailed / C: 中断、の順序。
+        completed_resultsにBのstructured metadataがそのまま残ることを確認する。"""
+        card_a = _card("カードA")
+        card_b = _card("カードB")
+        aborting_card = _unverifiable_card("Unresolvable Card")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card_a, card_b, aborting_card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[
+                CardDecision(card=card_a, action="create"),
+                CardDecision(card=card_b, action="create"),
+                CardDecision(card=aborting_card, action="create"),
+            ],
+        )
+        repo = FailingCreateWithCauseCardRepository(
+            fail_on_name_ja={"カードB": _http_status_error()}
+        )
+
+        with pytest.raises(import_cards.PartialImportAbortedError) as exc_info:
+            import_cards.execute_import_cards(plan, repo)
+
+        completed = exc_info.value.completed_results
+        assert [r.action for r in completed] == ["created", "failed"]
+        assert completed[0].card is card_a
+        assert completed[0].failed_operation is None
+        assert completed[0].failed_completion is None
+        assert completed[1].card is card_b
+        assert completed[1].failed_operation == import_cards.FailedWriteOperation.CREATE
+        assert completed[1].failed_completion == import_cards.WriteCompletion.KNOWN_FAILED
+
+    def test_classification_is_independent_of_message_text(self) -> None:
+        """メッセージ文言が何であっても、__cause__の型だけで分類されることを証明する
+        (メッセージに「タイムアウト」という語を含めても、causeがHTTPStatusErrorなら
+        KNOWN_FAILEDのまま――文字列解析への依存が無いことの直接的な証拠)。"""
+        card = _card("カードA")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="create")],
+        )
+
+        class MisleadingTextRepository(FakeCardRepository):
+            def create_card(
+                self, card: DeckCard, deck_page_id: str, note: str = ""
+            ) -> dict:
+                raise NotionAPIError(
+                    "タイムアウトしましたが実際には成功している可能性があります"
+                ) from _http_status_error()
+
+        result = import_cards.execute_import_cards(plan, MisleadingTextRepository())
+
+        assert result.results[0].failed_completion == import_cards.WriteCompletion.KNOWN_FAILED
+
+    def test_existing_notion_api_error_regression_still_passes_with_new_fields(self) -> None:
+        """既存のFailingCreateCardRepository(causeなしのbare NotionAPIError)は
+        引き続きaction="failed"へ変換され、continue-on-error動作は不変(新metadata
+        フィールドの追加後もこの既存回帰は無変更で成立する)。"""
+        card_a = _card("カードA")
+        card_b = _card("カードB")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card_a, card_b]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[
+                CardDecision(card=card_a, action="create"),
+                CardDecision(card=card_b, action="create"),
+            ],
+        )
+        repo = FailingCreateCardRepository(fail_on_name_ja={"カードB"})
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        assert [r.action for r in result.results] == ["created", "failed"]
+        # cause無しのNotionAPIErrorはUNKNOWN側へ倒す(安全側のデフォルト)。
+        assert result.results[1].failed_completion == import_cards.WriteCompletion.UNKNOWN
+        assert result.results[1].failed_operation == import_cards.FailedWriteOperation.CREATE
 
 
 class TestBuildImportCardsPlan:
