@@ -72,6 +72,24 @@ class ImportCardsResult:
         return [r for r in self.results if r.action == "failed"]
 
 
+class PartialImportAbortedError(UnverifiedNewCardError):
+    """UnverifiedNewCardErrorによるバッチ中断時、それより前に完了していた
+    CardApplyResult(成功・NotionAPIError由来のfailedを含む)を保持して運ぶ。
+
+    UnverifiedNewCardErrorのsubclassのため、isinstance(exc, UnverifiedNewCardError)
+    は引き続きTrueになり、既存のMtgNotionManagerError系catchとの互換性を壊さない。
+    str(self)は元の例外メッセージと同一(コンストラクタへ渡した message そのまま)。
+
+    中断semantics自体は変更しない(このカードおよびそれ以降のカードへは
+    引き続き一切書き込みを行わない)。completed_resultsは、中断より前に
+    _apply_one()が正常returnした結果だけを、処理順のimmutable snapshotとして持つ。
+    """
+
+    def __init__(self, message: str, *, completed_results: tuple[CardApplyResult, ...]) -> None:
+        super().__init__(message)
+        self.completed_results = completed_results
+
+
 def build_import_cards_plan(
     url: str,
     deck_page_id: str,
@@ -183,7 +201,15 @@ def execute_import_cards(
 
     results: list[CardApplyResult] = []
     for decision in plan.decisions:
-        results.append(_apply_one(decision, plan.deck_page_id, card_repo, note, plan.parsed))
+        try:
+            result = _apply_one(decision, plan.deck_page_id, card_repo, note, plan.parsed)
+        except UnverifiedNewCardError as exc:
+            # 中断semantics自体は変更しない(このカード・以降のカードへは書き込まない)。
+            # それより前に完了していた結果だけを、外部から回収可能なsnapshotとして運ぶ。
+            raise PartialImportAbortedError(
+                str(exc), completed_results=tuple(results)
+            ) from exc
+        results.append(result)
 
     return ImportCardsResult(results=results)
 

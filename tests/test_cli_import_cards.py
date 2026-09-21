@@ -193,6 +193,39 @@ def test_ambiguous_match_error_is_reported(monkeypatch: pytest.MonkeyPatch) -> N
     assert "曖昧" in result.stdout
 
 
+def test_partial_import_aborted_error_is_reported_like_other_domain_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PartialImportAbortedError(UnverifiedNewCardErrorのsubclass)は既存の
+    `except MtgNotionManagerError` へそのまま捕捉され、human-readable出力・終了コードは
+    他のdomain error(AmbiguousCardMatchError等)と同じ既存contractのまま変化しない
+    (本Work Unitはservice層のresult fidelity修正のみが目的であり、CLI出力への
+    partial-result反映はNon-Goalのため、ここでは既存contractの不変性だけを検証する)。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion_client(monkeypatch)
+    decisions = [CardDecision(card=_card("未確認カード"), action="create")]
+    _patch_build_plan(monkeypatch, decisions)
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        from mtg_notion_manager.services.import_cards import PartialImportAbortedError
+
+        raise PartialImportAbortedError(
+            "カード '未確認カード' は日本語名が未確認のため 新規作成できません(安全機構違反)。",
+            completed_results=(),
+        )
+
+    monkeypatch.setattr(cli, "execute_import_cards", _raise)
+
+    result = runner.invoke(
+        cli.app, ["import-cards", URL, "--deck-page-id", DECK_PAGE_ID, "--apply"]
+    )
+
+    assert result.exit_code == 1
+    assert "エラー" in result.stdout
+    assert "安全機構違反" in result.stdout
+
+
 def test_missing_card_data_source_id_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config_without_card_db))
 
