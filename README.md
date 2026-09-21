@@ -48,9 +48,9 @@ mtg-notion-manager import <URL>
 - 発売セット名・色名はNotion側の選択肢と完全一致する必要がある。未知の値は `src/mtg_notion_manager/mapping.py` に追記してから再実行すること。マッピングされていない値でNotionに新しい選択肢を自動追加することはしない。
 - 外部ページの取得失敗、パース失敗、Notion API失敗時は、不完全なレコードを書き込まずエラー終了する。
 
-## `--error-json`(構造化エラー出力、対応: `import` / `import-article` / `apply-single-title-update` / `verify-import` / `doctor` / `audit-duplicates` / `review-duplicate-conflicts` / `plan-title-updates`)
+## `--error-json`(構造化エラー出力、対応: `import` / `import-article` / `apply-single-title-update` / `verify-import` / `doctor` / `audit-duplicates` / `review-duplicate-conflicts` / `plan-title-updates` / `import-cards`)
 
-`import`・`import-article`・`apply-single-title-update`・`verify-import`・`doctor`・`audit-duplicates`・`review-duplicate-conflicts`・`plan-title-updates` の8コマンドは `--error-json` フラグをサポートする。
+`import`・`import-article`・`apply-single-title-update`・`verify-import`・`doctor`・`audit-duplicates`・`review-duplicate-conflicts`・`plan-title-updates`・`import-cards` の9コマンドは `--error-json` フラグをサポートする(12コマンド中9)。
 
 - **成功時の出力・終了コードは一切変更しない**(`--error-json` を付けても付けなくても同じ)。
 - **失敗時のみ**、人間向けメッセージの代わりに、以下5フィールドだけを持つ1行の純粋なJSONオブジェクトをstdoutへ出力する(Rich装飾・ANSIエスケープ・前後の文言は一切含まない)。
@@ -73,7 +73,14 @@ mtg-notion-manager import <URL>
 - **`doctor` は「doctorコマンド自体が実行できなかった場合(設定読み込み失敗・Notion接続確立の失敗などの実行エラー)」だけが `--error-json` の対象**。個々のチェック項目の合否(診断結果そのもの、たとえばスキーマ不一致の検出)は診断が正常に実行された結果であり実行エラーではないため、`--error-json` を指定していてもJSONへ変換しない(既存の診断テーブル出力・終了コードをそのまま維持する)。
 - **`audit-duplicates`・`review-duplicate-conflicts` は監査・分類結果そのものが `--error-json` の対象外**。両コマンドとも、対象グループの分類分布(自動統合可能/要確認/手動指定/除外対象/意図的重複、あるいはprice-only/special-version/identity-conflict/other/manual-representative)がどのような内訳であっても正常終了(終了コード0)であり、実行エラーではない。`--error-json` を指定していても既存の集計出力・レポート生成(JSON/CSV/Markdown)は変更しない。さらに `review-duplicate-conflicts` の不明な `--category` 指定は既存どおりCLIの使い方の誤り(人間向けメッセージ・終了コード1)のままとし、Error Contract JSONへは変換しない。
 - **`plan-title-updates` は「1件以上のentryが適用不可(ブロック)」という結果が `--error-json` の対象外**。これはdry-run計画が正常に実行された結果であり実行エラーではないため、`--error-json` を指定していても既存のdry-run出力・終了コード1・レポート生成(JSON/Markdown)を変更しない。対象となるのはマニフェスト不正・件数不一致・Notion読み取りエラーなど、コマンド自体が実行できなかった場合のみ。なお本コマンドはNotionへは一切書き込まない(読み取り専用)が、**ファイルシステムへの書き込みは行う**(成功時に毎回dry-runレポートを`--output-dir`へ出力する)。`--error-json` はこのレポート生成を無効化・変更しない。
-- Typer/Clickのusage error(必須引数欠落など)や、この8コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
+- **`import-cards` は、書き込みを1件以上試みた後の結果に応じてschema_versionが変わる唯一のコマンド**(Error Contract v2の最初の実接続例):
+  - **書き込み以前に終了する実行エラー**(設定読み込み失敗・`NOTION_CARD_DATA_SOURCE_ID`未設定・`--deck-page-id`/`--deck-name`両方省略・デッキ未検出・曖昧一致による事前ゲートなど)は、他コマンドと同じ `schema_version: 1`(`mutation`フィールドなし)のまま。
+  - **1件以上のNotion書き込みを試みたうえでの部分失敗・完了状態不明・中断**は `schema_version: 2` となり、`error_category`/`error_code`/`message` に加えて `mutation` フィールド(`state`/`attempted`/`succeeded`/`failed`/`unknown`/`recovery_action`、失敗・不明分のみの `operations` 配列)を含む。
+  - `execute_import_cards()` が正常returnしたうえで1件以上失敗・不明だった場合は `error_category: PARTIAL_MUTATION` / `error_code: CARD_WRITE_PARTIAL_FAILURE`。カード識別確認失敗による中断(`PartialImportAbortedError`)は、`PARTIAL_MUTATION` へは潰さず実際の原因分類(`error_category: IDENTITY_AMBIGUITY` / `error_code: UNVERIFIED_NEW_CARD`)のまま、それに加えて中断までに完了していた書き込みの `mutation` を付与する。
+  - `mutation.state` が `MUTATION_STATE_UNKNOWN`(完了状態が不明な書き込みを含む――例: 新規作成のタイムアウトは非べき等でありリトライしない設計のため、サーバー側で実際には成功していた可能性を排除できない)の場合、`recovery_action` は必ず `RECONCILE_BEFORE_RETRY` であり、**盲目的な自動リトライを許可する `RETRY_ALLOWED` にはならない**。既知の失敗のみ(`MUTATION_FAILED`/一部成功のみの`PARTIAL_MUTATION`)の場合も、rerunの安全性が別途証明されるまでは当面 `RETRY_ALLOWED` を出力せず `MANUAL_REVIEW_REQUIRED` に留める。自動化スクリプトは `recovery_action` の値に関わらず、このJSONだけを根拠に自動リトライしてはならない。
+  - **`--error-json` は `--apply` を意味しない**。`--dry-run`・`--apply`省略時の意味は変更されておらず、正常終了(終了コード0)の出力・内容も変更しない。
+  - `--error-json` モード時は、計画表示(サマリ・詳細テーブル)を含むすべての人間向け出力を一時バッファへ書き、成功が確定した場合のみそのままstdoutへ出力する。エラーJSONを出力する場合はバッファの内容を破棄するため、**`import`とは異なり、`import-cards`のエラー出力は常にstdout全体が純粋な1個のJSONオブジェクトになる**(末尾行のみの例外はない)。
+- Typer/Clickのusage error(必須引数欠落など)や、この9コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
 
 ## 開発
 

@@ -30,6 +30,7 @@ from mtg_notion_manager.exceptions import (
     UnsupportedSourceError,
 )
 from mtg_notion_manager.mutation_contract import MutationSummary
+from mtg_notion_manager.services.card_resolution import UnverifiedNewCardError
 from mtg_notion_manager.services.single_card_title_update import (
     SingleUpdateConfigError,
     SingleUpdateGuardError,
@@ -53,6 +54,11 @@ class ErrorCategory:
     EXTERNAL_SOURCE = "EXTERNAL_SOURCE"
     PRODUCTION_API = "PRODUCTION_API"
     INTERNAL = "INTERNAL"
+    #: execute_import_cards()が正常returnしたが、1件以上の書き込み結果が
+    #: failed/unknownだった場合専用(例外ではない――normal returnのcommand-level
+    #: partial failureを表す)。PartialImportAbortedError等の実際のmid-loop
+    #: domain exceptionはこのcategoryへ潰さず、実際の原因のclassificationを使う。
+    PARTIAL_MUTATION = "PARTIAL_MUTATION"
 
 
 class ErrorCode:
@@ -82,6 +88,12 @@ class ErrorCode:
     POST_VERIFICATION_FAILED = "POST_VERIFICATION_FAILED"
     UNCLASSIFIED_DOMAIN_ERROR = "UNCLASSIFIED_DOMAIN_ERROR"
     UNHANDLED_EXCEPTION = "UNHANDLED_EXCEPTION"
+    DECK_IDENTIFIER_REQUIRED = "DECK_IDENTIFIER_REQUIRED"
+    DECK_NOT_FOUND = "DECK_NOT_FOUND"
+    UNVERIFIED_NEW_CARD = "UNVERIFIED_NEW_CARD"
+    #: ErrorCategory.PARTIAL_MUTATION専用。execute_import_cards()の正常return後、
+    #: 1件以上の書き込みがfailed/unknownだった場合(mutationフィールドで詳細を返す)。
+    CARD_WRITE_PARTIAL_FAILURE = "CARD_WRITE_PARTIAL_FAILURE"
 
 
 # Exception type -> (error_category, error_code). Checked in order; a subtype
@@ -116,6 +128,10 @@ _EXCEPTION_CLASSIFICATION: tuple[tuple[type[Exception], str, str], ...] = (
         ErrorCode.SINGLE_UPDATE_CONFIG_INVALID,
     ),
     (TitleUpdateManifestConfigError, ErrorCategory.CONFIGURATION, ErrorCode.MANIFEST_INVALID),
+    # UnverifiedNewCardErrorのsubclass(import-cardsのPartialImportAbortedError含む)も
+    # isinstance判定によりここへ一致する。PARTIAL_MUTATION/CARD_WRITE_PARTIAL_FAILUREへは
+    # 潰さず、identity/card-resolution系の実際の原因分類のまま返す。
+    (UnverifiedNewCardError, ErrorCategory.IDENTITY_AMBIGUITY, ErrorCode.UNVERIFIED_NEW_CARD),
     (NotionAPIError, ErrorCategory.PRODUCTION_API, ErrorCode.NOTION_API_ERROR),
     (MtgNotionManagerError, ErrorCategory.INTERNAL, ErrorCode.UNCLASSIFIED_DOMAIN_ERROR),
 )

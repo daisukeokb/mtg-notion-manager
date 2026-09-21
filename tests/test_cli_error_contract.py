@@ -15,20 +15,38 @@ import pytest
 from typer.testing import CliRunner
 
 from mtg_notion_manager import cli
-from mtg_notion_manager.config import Config
+from mtg_notion_manager.config import Config, ConfigError
 from mtg_notion_manager.error_contract import SCHEMA_VERSION, ErrorCategory, ErrorCode
 from mtg_notion_manager.exceptions import (
+    AmbiguousCardMatchError,
     IntentionalDuplicateConfigError,
     MappingError,
     MultipleDecksFoundError,
     NotionAPIError,
 )
-from mtg_notion_manager.models import DeckCard, DeckRecord, ExistingDeck, ParsedDeckList
+from mtg_notion_manager.import_cards_mutation_adapter import (
+    ResultFidelityViolationError,
+    build_import_cards_mutation_summary,
+)
+from mtg_notion_manager.models import (
+    CardDecision,
+    DeckCard,
+    DeckRecord,
+    ExistingDeck,
+    ParsedDeckList,
+)
 from mtg_notion_manager.services import title_update_dry_run as planner
 from mtg_notion_manager.services.audit_duplicates import AuditReportPaths, GroupAudit
 from mtg_notion_manager.services.doctor import CheckResult
 from mtg_notion_manager.services.import_article import ArticleImportLogPaths, ArticleImportPlan
-from mtg_notion_manager.services.import_cards import ImportCardsPlan
+from mtg_notion_manager.services.import_cards import (
+    CardApplyResult,
+    FailedWriteOperation,
+    ImportCardsPlan,
+    ImportCardsResult,
+    PartialImportAbortedError,
+    WriteCompletion,
+)
 from mtg_notion_manager.services.import_deck import ImportPlan
 from mtg_notion_manager.services.review_duplicate_conflicts import (
     CATEGORY_PRICE_ONLY,
@@ -2239,3 +2257,652 @@ def test_usage_error_unchanged_by_error_json() -> None:
         json.loads(without_flag.output)
     with pytest.raises(json.JSONDecodeError):
         json.loads(with_flag.output)
+
+
+# --- import-cards --------------------------------------------------------------
+
+IMPORT_CARDS_URL = "https://mtg-jp.com/reading/publicity/0035593/"
+IMPORT_CARDS_DECK_PAGE_ID = "39aa97c8-7142-81cb-af6e-d7a0446dea2c"
+
+
+def _import_cards_card(name_ja: str) -> DeckCard:
+    return DeckCard(
+        name_ja=name_ja, name_en=None, quantity=1, is_commander=False, source_url=IMPORT_CARDS_URL
+    )
+
+
+def _import_cards_sample_plan(decisions: list[CardDecision]) -> ImportCardsPlan:
+    parsed = ParsedDeckList(
+        deck_name="吸血鬼の血統",
+        commander_name="マウアーの太祖、ストレイファン",
+        cards=[d.card for d in decisions],
+        source_url=IMPORT_CARDS_URL,
+    )
+    return ImportCardsPlan(
+        parsed=parsed, deck_page_id=IMPORT_CARDS_DECK_PAGE_ID, decisions=decisions
+    )
+
+
+def _patch_import_cards_build_plan(
+    monkeypatch: pytest.MonkeyPatch, decisions: list[CardDecision]
+) -> None:
+    def _fake_build_plan(
+        url: str,
+        deck_page_id: str,
+        repo: object,
+        deck_name: str | None = None,
+        allow_count_mismatch: bool = False,
+        confirmed_mapping: object = None,
+    ) -> ImportCardsPlan:
+        return _import_cards_sample_plan(decisions)
+
+    monkeypatch.setattr(cli, "build_import_cards_plan", _fake_build_plan)
+
+
+def _assert_pure_json_v2_mutation_error(
+    stdout: str, *, command: str, category: str, code: str
+) -> dict:
+    """v2(mutation付き)Error JSONがstdout全体で純粋な1個のJSONオブジェクトであることを確認する。"""
+    assert "\x1b" not in stdout, "stdoutにANSIエスケープが含まれてはならない"
+    payload = json.loads(stdout)
+    assert isinstance(payload, dict)
+    assert payload["schema_version"] == 2
+    assert payload["command"] == command
+    assert payload["error_category"] == category
+    assert payload["error_code"] == code
+    assert isinstance(payload["message"], str) and payload["message"]
+    assert "mutation" in payload
+    assert not (_PROHIBITED_JSON_KEYS & payload.keys())
+    return payload
+
+
+def test_import_cards_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["import-cards", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_import_cards_no_apply_error_json_matches_human_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--apply省略時(normal outcome)は--error-jsonの有無で出力・終了コードが変わらない。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [CardDecision(card=_import_cards_card("新カード"), action="create")]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+
+    def _fail_if_called(*args: object, **kwargs: object) -> None:
+        raise AssertionError("--apply省略時にexecute_import_cardsが呼ばれてはならない")
+
+    monkeypatch.setattr(cli, "execute_import_cards", _fail_if_called)
+
+    args = ["import-cards", IMPORT_CARDS_URL, "--deck-page-id", IMPORT_CARDS_DECK_PAGE_ID]
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_cards_dry_run_error_json_matches_human_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [CardDecision(card=_import_cards_card("新カード"), action="create")]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+
+    args = [
+        "import-cards",
+        IMPORT_CARDS_URL,
+        "--deck-page-id",
+        IMPORT_CARDS_DECK_PAGE_ID,
+        "--dry-run",
+    ]
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_cards_full_success_error_json_matches_human_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [CardDecision(card=_import_cards_card("新カード"), action="create")]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+    apply_result = ImportCardsResult(
+        results=[
+            CardApplyResult(card=_import_cards_card("新カード"), action="created", page_id="p1"),
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_import_cards", lambda plan, repo, note="": apply_result)
+
+    args = [
+        "import-cards",
+        IMPORT_CARDS_URL,
+        "--deck-page-id",
+        IMPORT_CARDS_DECK_PAGE_ID,
+        "--apply",
+    ]
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_cards_error_json_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_config() -> Config:
+        raise ConfigError("APIキーが未設定です")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config))
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_import_cards_error_json_missing_card_data_source_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _config_without_card_db() -> Config:
+        return Config(
+            notion_api_key="secret_test",
+            commander_data_source_id="commander-ds-id",
+            card_data_source_id=None,
+        )
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_config_without_card_db))
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_import_cards_error_json_missing_deck_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    result = runner.invoke(cli.app, ["import-cards", IMPORT_CARDS_URL, "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.INPUT_VALIDATION,
+        code=ErrorCode.DECK_IDENTIFIER_REQUIRED,
+    )
+
+
+def test_import_cards_error_json_deck_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+
+    class FakeWriter:
+        def __init__(self, client: object, data_source_id: str) -> None:
+            pass
+
+        def find_existing_deck(self, name: str) -> None:
+            return None
+
+    monkeypatch.setattr(cli, "NotionWriter", FakeWriter)
+
+    result = runner.invoke(
+        cli.app,
+        ["import-cards", IMPORT_CARDS_URL, "--deck-name", "存在しないデッキ", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.PRECONDITION,
+        code=ErrorCode.DECK_NOT_FOUND,
+    )
+
+
+def test_import_cards_error_json_ambiguous_card_match_pre_write_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AmbiguousCardMatchErrorはexecute_import_cards()の書き込みループに入る前の
+    gateで送出されるため、mutationを付けないv1のまま(§9/§28)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [
+        CardDecision(card=_import_cards_card("曖昧カード"), action="ambiguous", detail="2件の候補")
+    ]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise AmbiguousCardMatchError("曖昧一致のため中止しました")
+
+    monkeypatch.setattr(cli, "execute_import_cards", _raise)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.IDENTITY_AMBIGUITY,
+        code=ErrorCode.AMBIGUOUS_CARD_MATCH,
+    )
+    assert "mutation" not in payload
+
+
+def _known_failed_result(
+    name_ja: str, *, operation: str = FailedWriteOperation.CREATE
+) -> CardApplyResult:
+    return CardApplyResult(
+        card=_import_cards_card(name_ja),
+        action="failed",
+        error=f"Notion API呼び出しに失敗しました (400): {name_ja}",
+        failed_operation=operation,
+        failed_completion=WriteCompletion.KNOWN_FAILED,
+    )
+
+
+def _unknown_completion_result(
+    name_ja: str, *, operation: str = FailedWriteOperation.CREATE
+) -> CardApplyResult:
+    return CardApplyResult(
+        card=_import_cards_card(name_ja),
+        action="failed",
+        error=f"Notion APIへの接続がタイムアウトしました: {name_ja}",
+        failed_operation=operation,
+        failed_completion=WriteCompletion.UNKNOWN,
+    )
+
+
+def test_import_cards_error_json_known_partial_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [
+        CardDecision(card=_import_cards_card("カードA"), action="create"),
+        CardDecision(card=_import_cards_card("カードB"), action="create"),
+        CardDecision(card=_import_cards_card("カードC"), action="relation_update"),
+    ]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+    apply_result = ImportCardsResult(
+        results=[
+            CardApplyResult(card=_import_cards_card("カードA"), action="created", page_id="p-a"),
+            _known_failed_result("カードB"),
+            CardApplyResult(
+                card=_import_cards_card("カードC"), action="relation_updated", page_id="p-c"
+            ),
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_import_cards", lambda plan, repo, note="": apply_result)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.CARD_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "PARTIAL_MUTATION"
+    assert mutation["attempted"] == 3
+    assert mutation["succeeded"] == 2
+    assert mutation["failed"] == 1
+    assert mutation["unknown"] == 0
+    assert mutation["recovery_action"] == "MANUAL_REVIEW_REQUIRED"
+    assert mutation["operations"] == [{"key": "カードB", "action": "create", "state": "failed"}]
+
+
+def test_import_cards_error_json_unknown_create(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [
+        CardDecision(card=_import_cards_card("カードA"), action="create"),
+        CardDecision(card=_import_cards_card("カードB"), action="create"),
+    ]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+    apply_result = ImportCardsResult(
+        results=[
+            CardApplyResult(card=_import_cards_card("カードA"), action="created", page_id="p-a"),
+            _unknown_completion_result("カードB"),
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_import_cards", lambda plan, repo, note="": apply_result)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.CARD_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["attempted"] == 2
+    assert mutation["succeeded"] == 1
+    assert mutation["failed"] == 0
+    assert mutation["unknown"] == 1
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+    assert mutation["operations"] == [{"key": "カードB", "action": "create", "state": "unknown"}]
+
+
+def test_import_cards_error_json_unknown_relation_update(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [
+        CardDecision(card=_import_cards_card("カードA"), action="relation_update"),
+    ]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+    apply_result = ImportCardsResult(
+        results=[
+            _unknown_completion_result("カードA", operation=FailedWriteOperation.RELATION_UPDATE),
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_import_cards", lambda plan, repo, note="": apply_result)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.CARD_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+    assert mutation["operations"] == [
+        {"key": "カードA", "action": "relation_update", "state": "unknown"}
+    ]
+
+
+def test_import_cards_error_json_all_known_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [
+        CardDecision(card=_import_cards_card("カードA"), action="create"),
+        CardDecision(card=_import_cards_card("カードB"), action="create"),
+    ]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+    apply_result = ImportCardsResult(
+        results=[
+            _known_failed_result("カードA"),
+            _known_failed_result("カードB"),
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_import_cards", lambda plan, repo, note="": apply_result)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.CARD_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_FAILED"
+    assert mutation["succeeded"] == 0
+    assert mutation["failed"] == 2
+    assert mutation["recovery_action"] == "MANUAL_REVIEW_REQUIRED"
+
+
+def test_import_cards_error_json_first_card_abort(monkeypatch: pytest.MonkeyPatch) -> None:
+    """完了済みresultが1件もないままの中断(§26)。write loopには入っているためv2
+    (mutation付き、NO_MUTATION/recovery=NONE)として扱う――pre-write gateの
+    AmbiguousCardMatchError(v1)とはここで区別される。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [CardDecision(card=_import_cards_card("未確認カード"), action="create")]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise PartialImportAbortedError(
+            "カード '未確認カード' は日本語名が未確認のため 新規作成できません(安全機構違反)。",
+            completed_results=(),
+        )
+
+    monkeypatch.setattr(cli, "execute_import_cards", _raise)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.IDENTITY_AMBIGUITY,
+        code=ErrorCode.UNVERIFIED_NEW_CARD,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "NO_MUTATION"
+    assert mutation["attempted"] == 0
+    assert mutation["recovery_action"] == "NONE"
+
+
+def test_import_cards_error_json_successful_prefix_then_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """成功済みの書き込みがあった後の中断(§25/§36-B)。
+
+    Work Unit本文の例は recovery=MANUAL_REVIEW_REQUIRED を期待しているが、
+    MutationSummary(state=MUTATION_SUCCEEDED)へ許容されるrecovery_actionは
+    NONEのみ(Phase 2Eで確定・検証済みのmutation_contract.pyの不変条件、
+    tests/test_mutation_contract.py::test_no_mutation_with_reconcile...等参照)。
+    「MUTATION_SUCCEEDED はattempted writesが全件成功しただけでcommand全体の
+    成功を意味しない」というWork Unit自身の注記どおり、コマンド中断そのものへの
+    manual review要否は、mutation.recovery_actionではなくtop-levelの
+    error_category/error_code(実際の中断原因の分類)で表現する。
+    この関数は意図的にrecovery=NONEを検証する(§25の文言をそのまま実装すると
+    MutationSummaryのバリデーションでValueErrorになり、v2 infrastructureの
+    既存の安全側の不変条件に違反するため)。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [
+        CardDecision(card=_import_cards_card("カードA"), action="create"),
+        CardDecision(card=_import_cards_card("カードB"), action="relation_update"),
+        CardDecision(card=_import_cards_card("未確認カード"), action="create"),
+    ]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+
+    completed = (
+        CardApplyResult(card=_import_cards_card("カードA"), action="created", page_id="p-a"),
+        CardApplyResult(
+            card=_import_cards_card("カードB"), action="relation_updated", page_id="p-b"
+        ),
+    )
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise PartialImportAbortedError(
+            "カード '未確認カード' は日本語名が未確認のため 新規作成できません(安全機構違反)。",
+            completed_results=completed,
+        )
+
+    monkeypatch.setattr(cli, "execute_import_cards", _raise)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.IDENTITY_AMBIGUITY,
+        code=ErrorCode.UNVERIFIED_NEW_CARD,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_SUCCEEDED"
+    assert mutation["attempted"] == 2
+    assert mutation["succeeded"] == 2
+    assert mutation["recovery_action"] == "NONE"
+
+
+def test_import_cards_error_json_unknown_prefix_then_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """完了済みresultの中に完了状態不明の失敗が含まれたままの中断(§36-C)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_notion(monkeypatch)
+    decisions = [
+        CardDecision(card=_import_cards_card("カードA"), action="create"),
+        CardDecision(card=_import_cards_card("未確認カード"), action="create"),
+    ]
+    _patch_import_cards_build_plan(monkeypatch, decisions)
+
+    completed = (_unknown_completion_result("カードA"),)
+
+    def _raise(*args: object, **kwargs: object) -> None:
+        raise PartialImportAbortedError(
+            "カード '未確認カード' は日本語名が未確認のため 新規作成できません(安全機構違反)。",
+            completed_results=completed,
+        )
+
+    monkeypatch.setattr(cli, "execute_import_cards", _raise)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "import-cards",
+            IMPORT_CARDS_URL,
+            "--deck-page-id",
+            IMPORT_CARDS_DECK_PAGE_ID,
+            "--apply",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="import-cards",
+        category=ErrorCategory.IDENTITY_AMBIGUITY,
+        code=ErrorCode.UNVERIFIED_NEW_CARD,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+
+
+def test_import_cards_mutation_adapter_fail_closed_on_missing_metadata() -> None:
+    """action=="failed"なのにfailed_operation/failed_completionが欠落した
+    CardApplyResultは、誤ったmutation JSONへ変換せずfail closedする(§14/§37)。
+    message文字列からの推測は行わない。
+    """
+    broken_result = CardApplyResult(
+        card=_import_cards_card("壊れたカード"), action="failed", error="何か失敗しました"
+    )
+
+    with pytest.raises(ResultFidelityViolationError):
+        build_import_cards_mutation_summary([broken_result])

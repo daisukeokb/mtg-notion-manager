@@ -17,6 +17,9 @@ from mtg_notion_manager.error_contract import (
     emit_error_json,
 )
 from mtg_notion_manager.exceptions import MtgNotionManagerError
+from mtg_notion_manager.import_cards_mutation_adapter import (
+    build_import_cards_mutation_summary,
+)
 from mtg_notion_manager.intentional_duplicates import load_intentional_duplicates
 from mtg_notion_manager.notion.card_repository import CardRepository
 from mtg_notion_manager.notion.client import NotionClient
@@ -93,7 +96,11 @@ from mtg_notion_manager.services.import_article import (
     execute_article_import,
     write_article_import_log,
 )
-from mtg_notion_manager.services.import_cards import build_import_cards_plan, execute_import_cards
+from mtg_notion_manager.services.import_cards import (
+    PartialImportAbortedError,
+    build_import_cards_plan,
+    execute_import_cards,
+)
 from mtg_notion_manager.services.import_deck import build_import_plan, execute_import
 from mtg_notion_manager.services.review_duplicate_conflicts import (
     CATEGORY_INTENTIONAL,
@@ -358,6 +365,26 @@ def import_cards_command(
     show_detail: bool = typer.Option(
         True, "--detail/--no-detail", help="カード別詳細テーブルを表示する"
     ),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "実行結果が成功でない場合のみ、人間向け出力の代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message、書き込み結果を"
+            "伴う場合はmutationも含む)をstdoutへ出力する。--error-json は --apply を"
+            "意味しない(--dry-run・--apply省略時の意味は変更しない)。書き込み以前に"
+            "終了する実行エラー(設定読み込み失敗・デッキ未検出・曖昧一致など)は"
+            "schema_version 1(mutationなし)、書き込みを1件以上試みたうえでの部分失敗・"
+            "完了状態不明・中断はschema_version 2(mutation付き)。mutation.stateが"
+            "MUTATION_STATE_UNKNOWNの場合は完了状態が不明な書き込みが含まれるため、"
+            "何もせず再実行しない(RECONCILE_BEFORE_RETRYはNotion側の状態を手動確認して"
+            "からの判断を促すものであり、自動リトライ可を意味しない)。known failureのみの"
+            "場合もRETRY_ALLOWEDは出力しない(再実行の安全性が未証明のため、当面は"
+            "MANUAL_REVIEW_REQUIREDに留める)。成功時(--apply省略・--dry-run・全件成功)の"
+            "出力・終了コードは変更しない。messageは診断用でありスクリプトから"
+            "パースしないこと。"
+        ),
+    ),
 ) -> None:
     """デッキのカード一式をMTGカードDBへ登録し、対象デッキとリレーションする。"""
     del update  # 将来の拡張用に予約(現バージョンでは挙動に影響しない)
@@ -365,18 +392,42 @@ def import_cards_command(
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("import-cards", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "import-cards", ErrorCategory.CONFIGURATION, ErrorCode.CONFIG_LOAD_FAILED, message
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     if deck_page_id is None and deck_name is None:
-        console.print(
-            "[red]エラー:[/red] --deck-page-id か --deck-name のいずれかを指定してください。"
-        )
+        message = "--deck-page-id か --deck-name のいずれかを指定してください。"
+        if error_json:
+            emit_error_json(
+                "import-cards",
+                ErrorCategory.INPUT_VALIDATION,
+                ErrorCode.DECK_IDENTIFIER_REQUIRED,
+                message,
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {message}")
         raise typer.Exit(code=1)
+
+    # --error-json モードでは、計画表示(print_plan_summary等)が既に成功した後で
+    # execute_import_cards()が部分失敗・中断するケースがあり得る。そのケースでも
+    # stdoutを純粋なJSON1件だけにするため、成功が確定するまでこれらの出力を一時
+    # バッファへ書き、エラーJSON確定時は破棄する(成功時はこのバッファの内容を
+    # そのまま実コンソールへ出力するため、成功時の出力内容自体は変更しない)。
+    error_buffer = io.StringIO()
+    render_console = Console(file=error_buffer) if error_json else console
 
     try:
         with NotionClient(config.notion_api_key) as client:
@@ -385,10 +436,19 @@ def import_cards_command(
                 writer = NotionWriter(client, config.commander_data_source_id)
                 existing_deck = writer.find_existing_deck(deck_name)
                 if existing_deck is None:
-                    console.print(
-                        f"[red]エラー:[/red] MTG統率者DBに '{deck_name}' が見つかりません。"
+                    message = (
+                        f"MTG統率者DBに '{deck_name}' が見つかりません。"
                         " 先に `import` コマンドでデッキを登録してください。"
                     )
+                    if error_json:
+                        emit_error_json(
+                            "import-cards",
+                            ErrorCategory.PRECONDITION,
+                            ErrorCode.DECK_NOT_FOUND,
+                            message,
+                        )
+                    else:
+                        console.print(f"[red]エラー:[/red] {message}")
                     raise typer.Exit(code=1)
                 resolved_deck_page_id = existing_deck.page_id
 
@@ -407,33 +467,53 @@ def import_cards_command(
                 confirmed_mapping=confirmed_mapping,
             )
 
-            print_plan_summary(console, plan)
-            console.print()
+            print_plan_summary(render_console, plan)
+            render_console.print()
             if show_detail:
-                print_plan_detail(console, plan)
+                print_plan_detail(render_console, plan)
 
             if plan.has_blocking_issues:
-                console.print(
+                render_console.print(
                     "[red]曖昧一致または未解決のカードがあるため、"
                     "--apply を指定しても書き込みは行われません。[/red]"
                 )
 
             if dry_run or not apply:
-                console.print(
+                render_console.print(
                     "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません。[/cyan]"
                 )
+                if error_json:
+                    print(error_buffer.getvalue(), end="")
                 raise typer.Exit(code=0)
 
             note = f"{plan.parsed.deck_name}プレコン由来"
             result = execute_import_cards(plan, card_repo, note=note)
-            console.print()
-            print_apply_result(console, result)
+            render_console.print()
+            print_apply_result(render_console, result)
 
             if result.failed:
+                if error_json:
+                    mutation = build_import_cards_mutation_summary(result.results)
+                    emit_error_json(
+                        "import-cards",
+                        ErrorCategory.PARTIAL_MUTATION,
+                        ErrorCode.CARD_WRITE_PARTIAL_FAILURE,
+                        f"{len(result.succeeded)}件成功、{len(result.failed)}件失敗しました。",
+                        mutation=mutation,
+                    )
                 raise typer.Exit(code=1)
 
+            if error_json:
+                print(error_buffer.getvalue(), end="")
+
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            mutation = None
+            if isinstance(exc, PartialImportAbortedError):
+                mutation = build_import_cards_mutation_summary(exc.completed_results)
+            emit_error_json("import-cards", *classify_exception(exc), str(exc), mutation=mutation)
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
 
