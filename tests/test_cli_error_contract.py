@@ -1,5 +1,6 @@
 """CLI_ERROR_CONTRACT v1(--error-json)の対応コマンド
-(import-article / apply-single-title-update / verify-import / doctor)テスト。
+(import-article / apply-single-title-update / verify-import / doctor /
+audit-duplicates / review-duplicate-conflicts / plan-title-updates)テスト。
 
 Notion/外部サイトへは一切接続しない(すべてfake/monkeypatch)。
 """
@@ -8,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -16,14 +18,22 @@ from mtg_notion_manager import cli
 from mtg_notion_manager.config import Config
 from mtg_notion_manager.error_contract import SCHEMA_VERSION, ErrorCategory, ErrorCode
 from mtg_notion_manager.exceptions import (
+    IntentionalDuplicateConfigError,
     MappingError,
     MultipleDecksFoundError,
     NotionAPIError,
 )
 from mtg_notion_manager.models import DeckCard, ParsedDeckList
+from mtg_notion_manager.services import title_update_dry_run as planner
+from mtg_notion_manager.services.audit_duplicates import AuditReportPaths, GroupAudit
 from mtg_notion_manager.services.doctor import CheckResult
 from mtg_notion_manager.services.import_article import ArticleImportLogPaths, ArticleImportPlan
 from mtg_notion_manager.services.import_cards import ImportCardsPlan
+from mtg_notion_manager.services.review_duplicate_conflicts import (
+    CATEGORY_PRICE_ONLY,
+    DetailedGroupReview,
+    ReviewReportPaths,
+)
 from mtg_notion_manager.services.single_card_title_update import (
     GuardedHttpCallRecord,
     SingleUpdatePreflightResult,
@@ -1112,6 +1122,804 @@ def test_doctor_unhandled_exception_falls_back_to_internal(
         code=ErrorCode.UNHANDLED_EXCEPTION,
     )
     # human modeでは既存動作(例外がそのまま伝播しCliRunnerがexit_code=1として捕捉)を変更しない。
+    assert human.exit_code == 1
+    assert human.exception is not None
+
+
+# --- audit-duplicates -----------------------------------------------------------
+
+
+def _sample_group_audit() -> GroupAudit:
+    return GroupAudit(
+        card_name="沼",
+        pages=[{"id": "p1"}, {"id": "p2"}],
+        category="auto",
+        recommended_representative_id="p1",
+        representative_reasons=["英語名あり"],
+        conflicts=[],
+        special_version_flags=[],
+        price_link_differs=False,
+        merged_deck_relation_count=1,
+        estimated_quantity=2,
+        risks=[],
+        recommended_action="dedupe-cards --card-name で自動統合可能",
+    )
+
+
+def _patch_audit_dedupe_notion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
+    monkeypatch.setattr(cli, "DedupeRepository", lambda client, data_source_id: object())
+    monkeypatch.setattr(cli, "load_exclusions", lambda: object())
+    monkeypatch.setattr(cli, "load_intentional_duplicates", lambda: object())
+
+
+def _patch_write_audit_reports(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    calls: list[tuple] = []
+
+    def fake_write(
+        audits: list, output_dir: Path, timestamp: str | None = None
+    ) -> AuditReportPaths:
+        calls.append((audits, output_dir))
+        return AuditReportPaths(
+            json_path=output_dir / "a.json",
+            csv_path=output_dir / "a.csv",
+            markdown_path=output_dir / "a.md",
+        )
+
+    monkeypatch.setattr(cli, "write_audit_reports", fake_write)
+    return calls
+
+
+def test_audit_duplicates_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["audit-duplicates", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_audit_duplicates_finding_human_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+    write_calls = _patch_write_audit_reports(monkeypatch)
+    monkeypatch.setattr(
+        cli, "audit_duplicate_groups", lambda *a, **k: [_sample_group_audit()]
+    )
+
+    result = runner.invoke(cli.app, ["audit-duplicates", "--output-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert len(write_calls) == 1
+    assert "自動統合可能: 1" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_audit_duplicates_finding_error_json_flag_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """監査結果(重複グループの分類分布)はexecution errorではないため、
+    --error-jsonでもJSONを出力せず既存出力・レポート生成を維持する。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+    write_calls = _patch_write_audit_reports(monkeypatch)
+    monkeypatch.setattr(
+        cli, "audit_duplicate_groups", lambda *a, **k: [_sample_group_audit()]
+    )
+
+    human = runner.invoke(cli.app, ["audit-duplicates", "--output-dir", str(tmp_path)])
+    write_calls.clear()
+    structured = runner.invoke(
+        cli.app, ["audit-duplicates", "--output-dir", str(tmp_path), "--error-json"]
+    )
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    assert len(write_calls) == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_audit_duplicates_config_error_human_and_json_exit_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    human = runner.invoke(cli.app, ["audit-duplicates"])
+    structured = runner.invoke(cli.app, ["audit-duplicates", "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human.stdout)
+
+
+def test_audit_duplicates_config_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    result = runner.invoke(cli.app, ["audit-duplicates", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="audit-duplicates",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_audit_duplicates_missing_card_data_source_id_is_pure_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_config_without_card_db() -> Config:
+        return Config(
+            notion_api_key="secret_test",
+            commander_data_source_id="commander-ds-id",
+            card_data_source_id=None,
+        )
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config_without_card_db))
+
+    result = runner.invoke(cli.app, ["audit-duplicates", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="audit-duplicates",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_audit_duplicates_intentional_duplicate_config_error_is_pure_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """新規分類(IntentionalDuplicateConfigError)がINTERNALへフォールバックしないことの回帰確認。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    def _raise() -> object:
+        raise IntentionalDuplicateConfigError("intentional_duplicate_cards.jsonが不正です")
+
+    monkeypatch.setattr(cli, "load_intentional_duplicates", _raise)
+
+    result = runner.invoke(cli.app, ["audit-duplicates", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="audit-duplicates",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.INTENTIONAL_DUPLICATE_CONFIG_INVALID,
+    )
+
+
+def test_audit_duplicates_notion_api_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+
+    def _raise(*args: object, **kwargs: object) -> list:
+        raise NotionAPIError("Notion API呼び出しに失敗しました (500): boom")
+
+    monkeypatch.setattr(cli, "audit_duplicate_groups", _raise)
+
+    result = runner.invoke(cli.app, ["audit-duplicates", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="audit-duplicates",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+
+
+def test_audit_duplicates_unhandled_exception_falls_back_to_internal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+
+    def _raise(*args: object, **kwargs: object) -> list:
+        raise ValueError("想定外の内部エラー")
+
+    monkeypatch.setattr(cli, "audit_duplicate_groups", _raise)
+
+    structured = runner.invoke(cli.app, ["audit-duplicates", "--error-json"])
+    human = runner.invoke(cli.app, ["audit-duplicates"])
+
+    _assert_pure_json_error(
+        structured.stdout,
+        command="audit-duplicates",
+        category=ErrorCategory.INTERNAL,
+        code=ErrorCode.UNHANDLED_EXCEPTION,
+    )
+    assert human.exit_code == 1
+    assert human.exception is not None
+
+
+# --- review-duplicate-conflicts ---------------------------------------------------
+
+
+def _sample_detailed_review() -> DetailedGroupReview:
+    return DetailedGroupReview(
+        card_name="沼",
+        pages=[{"id": "p1"}, {"id": "p2"}],
+        review_category=CATEGORY_PRICE_ONLY,
+        representative_candidate_id="p1",
+        representative_reasons=["英語名あり"],
+        prices=[100, 200],
+        links=[],
+        conflicts=[],
+        role_conflict=False,
+        special_flags=[],
+        merged_deck_relation_count=1,
+        merged_commander_tags=[],
+        estimated_quantity=2,
+        recommended_price_link_handling="3案を比較",
+        integrable=True,
+        risks=[],
+    )
+
+
+def _patch_write_review_reports(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
+    calls: list[tuple] = []
+
+    def fake_write(
+        reviews: list, output_dir: Path, timestamp: str | None = None
+    ) -> ReviewReportPaths:
+        calls.append((reviews, output_dir))
+        return ReviewReportPaths(
+            json_path=output_dir / "r.json",
+            csv_path=output_dir / "r.csv",
+            markdown_path=output_dir / "r.md",
+        )
+
+    monkeypatch.setattr(cli, "write_review_reports", fake_write)
+    return calls
+
+
+def test_review_duplicate_conflicts_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["review-duplicate-conflicts", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_review_duplicate_conflicts_finding_human_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+    write_calls = _patch_write_review_reports(monkeypatch)
+    monkeypatch.setattr(
+        cli, "review_duplicate_conflicts", lambda *a, **k: [_sample_detailed_review()]
+    )
+
+    result = runner.invoke(cli.app, ["review-duplicate-conflicts", "--output-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert len(write_calls) == 1
+    assert "対象グループ数: 1" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_review_duplicate_conflicts_finding_error_json_flag_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """要確認グループの詳細分類結果はexecution errorではないため、
+    --error-jsonでもJSONを出力せず既存出力・レポート生成を維持する。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+    write_calls = _patch_write_review_reports(monkeypatch)
+    monkeypatch.setattr(
+        cli, "review_duplicate_conflicts", lambda *a, **k: [_sample_detailed_review()]
+    )
+
+    human = runner.invoke(cli.app, ["review-duplicate-conflicts", "--output-dir", str(tmp_path)])
+    write_calls.clear()
+    structured = runner.invoke(
+        cli.app, ["review-duplicate-conflicts", "--output-dir", str(tmp_path), "--error-json"]
+    )
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    assert len(write_calls) == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_review_duplicate_conflicts_config_error_is_pure_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    result = runner.invoke(cli.app, ["review-duplicate-conflicts", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="review-duplicate-conflicts",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_review_duplicate_conflicts_intentional_duplicate_config_error_is_pure_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    def _raise() -> object:
+        raise IntentionalDuplicateConfigError("intentional_duplicate_cards.jsonが不正です")
+
+    monkeypatch.setattr(cli, "load_intentional_duplicates", _raise)
+
+    result = runner.invoke(cli.app, ["review-duplicate-conflicts", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="review-duplicate-conflicts",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.INTENTIONAL_DUPLICATE_CONFIG_INVALID,
+    )
+
+
+def test_review_duplicate_conflicts_notion_api_error_is_pure_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+
+    def _raise(*args: object, **kwargs: object) -> list:
+        raise NotionAPIError("Notion API呼び出しに失敗しました (500): boom")
+
+    monkeypatch.setattr(cli, "review_duplicate_conflicts", _raise)
+
+    result = runner.invoke(cli.app, ["review-duplicate-conflicts", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="review-duplicate-conflicts",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+
+
+def test_review_duplicate_conflicts_unhandled_exception_falls_back_to_internal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_audit_dedupe_notion(monkeypatch)
+
+    def _raise(*args: object, **kwargs: object) -> list:
+        raise ValueError("想定外の内部エラー")
+
+    monkeypatch.setattr(cli, "review_duplicate_conflicts", _raise)
+
+    structured = runner.invoke(cli.app, ["review-duplicate-conflicts", "--error-json"])
+    human = runner.invoke(cli.app, ["review-duplicate-conflicts"])
+
+    _assert_pure_json_error(
+        structured.stdout,
+        command="review-duplicate-conflicts",
+        category=ErrorCategory.INTERNAL,
+        code=ErrorCode.UNHANDLED_EXCEPTION,
+    )
+    assert human.exit_code == 1
+    assert human.exception is not None
+
+
+def test_review_duplicate_conflicts_invalid_category_human_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    result = runner.invoke(
+        cli.app, ["review-duplicate-conflicts", "--category", "not-a-real-category"]
+    )
+
+    assert result.exit_code == 1
+    assert "不明な --category" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_review_duplicate_conflicts_invalid_category_error_json_flag_still_no_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """不明な--categoryはCLIの使い方の誤りでありexecution errorではないため、
+    --error-jsonを指定しても既存の人間向けメッセージ・終了コード1のまま、JSONは出力しない。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    human = runner.invoke(
+        cli.app, ["review-duplicate-conflicts", "--category", "not-a-real-category"]
+    )
+    structured = runner.invoke(
+        cli.app,
+        ["review-duplicate-conflicts", "--category", "not-a-real-category", "--error-json"],
+    )
+
+    assert human.exit_code == structured.exit_code == 1
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+# --- plan-title-updates -----------------------------------------------------------
+
+
+def _patch_plan_title_updates_notion(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
+    monkeypatch.setattr(cli, "install_http_write_guard", lambda client: [])
+    monkeypatch.setattr(cli, "ReadOnlyNotionClient", lambda client: object())
+
+
+def _plan_entry(**overrides: object) -> dict:
+    base = {
+        "page_id": "page-1",
+        "expected_current_title": "Elusive Otter",
+        "confirmed_new_title": "神出鬼没のカワウソ",
+        "expected_english_name": "Elusive Otter",
+        "source_deck_ids": ["deck-1"],
+        "verification_status": "human_confirmed",
+        "verification_actor": "user",
+        "verification_note": "Japanese card title explicitly confirmed by the user",
+    }
+    base.update(overrides)
+    return base
+
+
+def _write_plan_manifest(tmp_path: Path, entries: list[dict]) -> Path:
+    data = {
+        "schema_version": 1,
+        "purpose": "plan_existing_card_title_updates",
+        "source_audit_report": None,
+        "entries": entries,
+    }
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    return path
+
+
+def _plan_entries(entries: list[dict]) -> list[planner.TitleUpdatePlanEntry]:
+    return [
+        planner.TitleUpdatePlanEntry(
+            page_id=e["page_id"],
+            current_title=e["expected_current_title"],
+            expected_current_title=e["expected_current_title"],
+            confirmed_new_title=e["confirmed_new_title"],
+            current_english_name=e["expected_english_name"],
+            expected_english_name=e["expected_english_name"],
+            verification_status="human_confirmed",
+            verification_actor="user",
+            verification_note="note",
+            current_title_matches=True,
+            english_name_matches=True,
+            is_archived_or_trashed=False,
+            same_title_check=planner.SameTitleCheck("x", "no_existing_same_title", []),
+            relation_snapshot=planner.RelationSnapshot([], 0, True, True, []),
+            eligible_for_future_update=True,
+            blocking_reasons=[],
+        )
+        for e in entries
+    ]
+
+
+def _eligible_dry_run_report(entries: list[dict]) -> planner.TitleUpdateDryRunReport:
+    return planner.TitleUpdateDryRunReport(
+        audit_timestamp="2026-07-14T00:00:00",
+        manifest_path="manifest.json",
+        expected_target_count=len(entries),
+        entries=_plan_entries(entries),
+        method_call_log=["get_page"],
+        http_call_log=[],
+    )
+
+
+def _blocked_dry_run_report(entries: list[dict]) -> planner.TitleUpdateDryRunReport:
+    report = _eligible_dry_run_report(entries)
+    first = report.entries[0]
+    blocked_first = planner.TitleUpdatePlanEntry(
+        **{**first.__dict__, "eligible_for_future_update": False, "blocking_reasons": ["x"]}
+    )
+    return planner.TitleUpdateDryRunReport(
+        audit_timestamp=report.audit_timestamp,
+        manifest_path=report.manifest_path,
+        expected_target_count=report.expected_target_count,
+        entries=[blocked_first, *report.entries[1:]],
+        method_call_log=report.method_call_log,
+        http_call_log=[],
+    )
+
+
+def test_plan_title_updates_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["plan-title-updates", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_plan_title_updates_eligible_human_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_plan_title_updates_notion(monkeypatch)
+    entries = [_plan_entry()]
+    manifest_path = _write_plan_manifest(tmp_path, entries)
+    monkeypatch.setattr(
+        cli, "build_title_update_dry_run_plan", lambda *a, **k: _eligible_dry_run_report(entries)
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "plan-title-updates",
+            "--manifest",
+            str(manifest_path),
+            "--expected-count",
+            "1",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "適用可能: 1" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_plan_title_updates_eligible_error_json_flag_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_plan_title_updates_notion(monkeypatch)
+    entries = [_plan_entry()]
+    manifest_path = _write_plan_manifest(tmp_path, entries)
+    monkeypatch.setattr(
+        cli, "build_title_update_dry_run_plan", lambda *a, **k: _eligible_dry_run_report(entries)
+    )
+
+    common_args = [
+        "plan-title-updates",
+        "--manifest",
+        str(manifest_path),
+        "--expected-count",
+        "1",
+        "--output-dir",
+        str(tmp_path / "out"),
+    ]
+    human = runner.invoke(cli.app, common_args)
+    structured = runner.invoke(cli.app, [*common_args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_plan_title_updates_blocked_human_mode_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_plan_title_updates_notion(monkeypatch)
+    entries = [_plan_entry(page_id="p1"), _plan_entry(page_id="p2")]
+    manifest_path = _write_plan_manifest(tmp_path, entries)
+    monkeypatch.setattr(
+        cli, "build_title_update_dry_run_plan", lambda *a, **k: _blocked_dry_run_report(entries)
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "plan-title-updates",
+            "--manifest",
+            str(manifest_path),
+            "--expected-count",
+            "2",
+            "--output-dir",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_plan_title_updates_blocked_error_json_flag_still_no_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """1件でも適用不可(ブロック)は正常なdry-run結果でありexecution errorではないため、
+    --error-jsonでもJSONを出力せず既存出力・終了コード1・レポート生成を維持する。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_plan_title_updates_notion(monkeypatch)
+    entries = [_plan_entry(page_id="p1"), _plan_entry(page_id="p2")]
+    manifest_path = _write_plan_manifest(tmp_path, entries)
+    monkeypatch.setattr(
+        cli, "build_title_update_dry_run_plan", lambda *a, **k: _blocked_dry_run_report(entries)
+    )
+
+    common_args = [
+        "plan-title-updates",
+        "--manifest",
+        str(manifest_path),
+        "--expected-count",
+        "2",
+        "--output-dir",
+        str(tmp_path / "out"),
+    ]
+    human = runner.invoke(cli.app, common_args)
+    structured = runner.invoke(cli.app, [*common_args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 1
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_plan_title_updates_config_error_human_and_json_exit_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    human = runner.invoke(
+        cli.app, ["plan-title-updates", "--manifest", "x.json", "--expected-count", "1"]
+    )
+    structured = runner.invoke(
+        cli.app,
+        ["plan-title-updates", "--manifest", "x.json", "--expected-count", "1", "--error-json"],
+    )
+
+    assert human.exit_code == structured.exit_code == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human.stdout)
+
+
+def test_plan_title_updates_config_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    result = runner.invoke(
+        cli.app,
+        ["plan-title-updates", "--manifest", "x.json", "--expected-count", "1", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="plan-title-updates",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_plan_title_updates_manifest_config_error_is_pure_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """件数不一致(既存のTitleUpdateManifestConfigError分類、apply-single-title-updateと共通)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    called = {"value": False}
+    monkeypatch.setattr(cli, "NotionClient", lambda api_key: called.__setitem__("value", True))
+    manifest_path = _write_plan_manifest(tmp_path, [_plan_entry()])
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "plan-title-updates",
+            "--manifest",
+            str(manifest_path),
+            "--expected-count",
+            "7",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert called["value"] is False  # Notionへ接続する前に失敗している
+    _assert_pure_json_error(
+        result.stdout,
+        command="plan-title-updates",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.MANIFEST_INVALID,
+    )
+
+
+def test_plan_title_updates_notion_api_error_is_pure_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_plan_title_updates_notion(monkeypatch)
+    manifest_path = _write_plan_manifest(tmp_path, [_plan_entry()])
+
+    def _raise(*args: object, **kwargs: object) -> planner.TitleUpdateDryRunReport:
+        raise NotionAPIError("Notion API呼び出しに失敗しました (500): boom")
+
+    monkeypatch.setattr(cli, "build_title_update_dry_run_plan", _raise)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "plan-title-updates",
+            "--manifest",
+            str(manifest_path),
+            "--expected-count",
+            "1",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="plan-title-updates",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+
+
+def test_plan_title_updates_unhandled_exception_falls_back_to_internal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_plan_title_updates_notion(monkeypatch)
+    manifest_path = _write_plan_manifest(tmp_path, [_plan_entry()])
+
+    def _raise(*args: object, **kwargs: object) -> planner.TitleUpdateDryRunReport:
+        raise ValueError("想定外の内部エラー")
+
+    monkeypatch.setattr(cli, "build_title_update_dry_run_plan", _raise)
+
+    common_args = [
+        "plan-title-updates",
+        "--manifest",
+        str(manifest_path),
+        "--expected-count",
+        "1",
+    ]
+    structured = runner.invoke(cli.app, [*common_args, "--error-json"])
+    human = runner.invoke(cli.app, common_args)
+
+    _assert_pure_json_error(
+        structured.stdout,
+        command="plan-title-updates",
+        category=ErrorCategory.INTERNAL,
+        code=ErrorCode.UNHANDLED_EXCEPTION,
+    )
     assert human.exit_code == 1
     assert human.exception is not None
 
