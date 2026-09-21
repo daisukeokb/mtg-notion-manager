@@ -1,5 +1,5 @@
 """CLI_ERROR_CONTRACT v1(--error-json)の対応コマンド
-(import-article / apply-single-title-update / verify-import / doctor /
+(import / import-article / apply-single-title-update / verify-import / doctor /
 audit-duplicates / review-duplicate-conflicts / plan-title-updates)テスト。
 
 Notion/外部サイトへは一切接続しない(すべてfake/monkeypatch)。
@@ -23,12 +23,13 @@ from mtg_notion_manager.exceptions import (
     MultipleDecksFoundError,
     NotionAPIError,
 )
-from mtg_notion_manager.models import DeckCard, ParsedDeckList
+from mtg_notion_manager.models import DeckCard, DeckRecord, ExistingDeck, ParsedDeckList
 from mtg_notion_manager.services import title_update_dry_run as planner
 from mtg_notion_manager.services.audit_duplicates import AuditReportPaths, GroupAudit
 from mtg_notion_manager.services.doctor import CheckResult
 from mtg_notion_manager.services.import_article import ArticleImportLogPaths, ArticleImportPlan
 from mtg_notion_manager.services.import_cards import ImportCardsPlan
+from mtg_notion_manager.services.import_deck import ImportPlan
 from mtg_notion_manager.services.review_duplicate_conflicts import (
     CATEGORY_PRICE_ONLY,
     DetailedGroupReview,
@@ -1922,6 +1923,256 @@ def test_plan_title_updates_unhandled_exception_falls_back_to_internal(
     )
     assert human.exit_code == 1
     assert human.exception is not None
+
+
+# --- import ----------------------------------------------------------------------
+
+IMPORT_URL = "https://mtg-jp.com/reading/publicity/0038046/"
+
+
+def _sample_import_deck_plan(
+    existing: ExistingDeck | None = None, diff: list | None = None
+) -> ImportPlan:
+    record = DeckRecord(
+        name="動き出した兵隊",
+        commander="茨の吟遊詩人、べロ",
+        set_name="ブルームバロウ",
+        colors=["赤", "緑"],
+        deck_list_url=IMPORT_URL,
+    )
+    return ImportPlan(record=record, existing=existing, diff=diff or [])
+
+
+def _patch_execute_import_counter(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    executed = {"count": 0}
+
+    def _fake_execute_import(plan: object, writer: object) -> None:
+        executed["count"] += 1
+
+    monkeypatch.setattr(cli, "execute_import", _fake_execute_import)
+    return executed
+
+
+def test_import_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["import", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_import_confirmed_human_and_error_json_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """confirmation=yesで実際に書き込みが行われるケース。成功時の出力はerror_jsonの有無で
+    変わらない(--error-jsonは対話確認をbypassしない)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(
+        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_import_deck_plan()
+    )
+    executed = _patch_execute_import_counter(monkeypatch)
+
+    human = runner.invoke(cli.app, ["import", IMPORT_URL], input="y\n")
+    executed["count"] = 0
+    structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"], input="y\n")
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    assert executed["count"] == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_declined_confirmation_human_and_error_json_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """確認拒否(decline)はexecution errorではないため、--error-jsonでもJSONを出力しない。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(
+        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_import_deck_plan()
+    )
+    executed = _patch_execute_import_counter(monkeypatch)
+
+    human = runner.invoke(cli.app, ["import", IMPORT_URL], input="n\n")
+    structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"], input="n\n")
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    assert executed["count"] == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_eof_non_interactive_behaves_like_decline(monkeypatch: pytest.MonkeyPatch) -> None:
+    """非対話環境(stdin未提供/EOF)は、このプロジェクトの実行基盤(CliRunner)上では
+    click.Abortではなくdefault値(confirm拒否相当)に解決される(実測で確認済み)。
+    --error-jsonはこの挙動を変更しない。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(
+        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_import_deck_plan()
+    )
+    executed = _patch_execute_import_counter(monkeypatch)
+
+    human = runner.invoke(cli.app, ["import", IMPORT_URL], input="")
+    structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"], input="")
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.exception is None
+    assert structured.exception is None
+    assert human.stdout == structured.stdout
+    assert executed["count"] == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_dry_run_human_and_error_json_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(
+        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_import_deck_plan()
+    )
+    executed = _patch_execute_import_counter(monkeypatch)
+
+    human = runner.invoke(cli.app, ["import", IMPORT_URL, "--dry-run"])
+    structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--dry-run", "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    assert executed["count"] == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_duplicate_skip_human_and_error_json_parity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    existing = ExistingDeck(page_id="p1", page_url="https://notion.so/p1", properties={})
+    monkeypatch.setattr(
+        cli,
+        "build_import_plan",
+        lambda url, writer, deck_name=None: _sample_import_deck_plan(existing=existing),
+    )
+    executed = _patch_execute_import_counter(monkeypatch)
+
+    human = runner.invoke(cli.app, ["import", IMPORT_URL])
+    structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    assert executed["count"] == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_import_config_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ConfigErrorは何も印字される前に発生するため、真の意味でstdout全体が純粋なJSONになる。"""
+
+    def _raise_config_error() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("NOTION_API_KEY が設定されていません")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config_error))
+
+    human = runner.invoke(cli.app, ["import", IMPORT_URL])
+    structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(human.stdout)
+    _assert_pure_json_error(
+        structured.stdout,
+        command="import",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_import_preflight_domain_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """build_import_plan()由来のエラーはプレビュー印字の前に発生するため、
+    真の意味でstdout全体が純粋なJSONになる(書き込みは一切試行されない)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    def _raise(url: str, writer: object, deck_name: str | None = None) -> ImportPlan:
+        raise MappingError("セット名 'SPM' はマッピングできません。")
+
+    monkeypatch.setattr(cli, "build_import_plan", _raise)
+    executed = _patch_execute_import_counter(monkeypatch)
+
+    result = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"])
+
+    assert result.exit_code == 1
+    assert executed["count"] == 0
+    _assert_pure_json_error(
+        result.stdout,
+        command="import",
+        category=ErrorCategory.MAPPING,
+        code=ErrorCode.UNMAPPED_VALUE,
+    )
+
+
+def test_import_create_page_notion_api_error_after_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execute_import()(create_page())の失敗はconfirmationの後にしか起こり得ない。
+
+    その時点で既にプレビューが人間向けにstdoutへ印字済みであり、対話確認自体は
+    Rich console経由ではなくclick自身が行うため、この1ケースに限りstdout全体を
+    純粋な1個のJSONにすることは(確認内容を人間から隠さない限り)構造上できない。
+    そのためこのテストは「純粋JSON」ではなく「末尾がError Contract JSONであること」
+    「書き込みが正確に1回試行されたこと」「例外メッセージが保持されること」を検証する
+    (README「`import`固有の安全上の注意」を参照)。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(
+        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_import_deck_plan()
+    )
+    call_count = {"value": 0}
+    original_message = (
+        "Notion APIへの接続がタイムアウトしました。この操作(POST /pages)はべき等ではなく、"
+        "サーバー側で実際には処理が完了していた可能性を排除できないため自動リトライしません"
+        "(手動で状態を確認してから再実行してください): boom"
+    )
+
+    def _raise(plan: object, writer: object) -> None:
+        call_count["value"] += 1
+        raise NotionAPIError(original_message)
+
+    monkeypatch.setattr(cli, "execute_import", _raise)
+
+    result = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"], input="y\n")
+
+    assert result.exit_code == 1
+    assert call_count["value"] == 1  # 書き込みはちょうど1回だけ試行された(自動リトライなし)
+    assert "プレビュー" in result.stdout  # 確認前に表示された内容は変更されない
+
+    # 末尾がError Contract JSONであることを確認する(先頭のプレビュー分だけstdout純度が緩和される)。
+    last_line = result.stdout.strip().splitlines()[-1]
+    payload = json.loads(last_line)
+    assert payload["command"] == "import"
+    assert payload["error_category"] == ErrorCategory.PRODUCTION_API
+    assert payload["error_code"] == ErrorCode.NOTION_API_ERROR
+    # timeout特有の「サーバー側で完了していた可能性を排除できない」という安全上重要な文言が
+    # 一切変更・要約されずそのまま保持されていることを確認する。
+    assert payload["message"] == original_message
+
+
+def test_import_human_mode_write_error_message_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """human modeでは既存のエラー表示(赤字の「エラー:」)を変更しない。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(
+        cli, "build_import_plan", lambda url, writer, deck_name=None: _sample_import_deck_plan()
+    )
+
+    def _raise(plan: object, writer: object) -> None:
+        raise NotionAPIError("boom")
+
+    monkeypatch.setattr(cli, "execute_import", _raise)
+
+    result = runner.invoke(cli.app, ["import", IMPORT_URL], input="y\n")
+
+    assert result.exit_code == 1
+    assert "エラー" in result.stdout
+    assert "boom" in result.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
 
 
 # --- 汎用契約テスト ------------------------------------------------------------
