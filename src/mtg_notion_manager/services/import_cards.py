@@ -14,6 +14,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import httpx
+
 from mtg_notion_manager.exceptions import AmbiguousCardMatchError, NotionAPIError
 from mtg_notion_manager.models import (
     BLOCKED_CREATION_ACTIONS,
@@ -30,6 +32,40 @@ from mtg_notion_manager.services.card_resolution import (
 )
 
 BLOCKING_ACTIONS = {"ambiguous", "error"} | BLOCKED_CREATION_ACTIONS
+
+
+class FailedWriteOperation:
+    """action="failed"のCardApplyResultで、実際に試行されたNotion書き込み種別。
+
+    decision.actionから決定論的に決まる(_apply_one()の呼び出し側は
+    どちらを試みたか既に知っているため、NotionAPIError自体から
+    推測する必要はない)。
+    """
+
+    CREATE = "create"
+    RELATION_UPDATE = "relation_update"
+
+
+class WriteCompletion:
+    """action="failed"のCardApplyResultで、書き込みの完了状態についてわかっている事実。
+
+    NotionAPIError.__cause__ の型だけから判定する(str(exc)のメッセージ文字列は
+    一切見ない)。サーバーが明示的なHTTPエラー応答を返した場合(NotionClientの
+    再試行方針上、リトライ対象外か、リトライを使い切った後)だけをKNOWN_FAILEDとし、
+    それ以外(タイムアウト・その他の接続エラー・原因不明)はすべて安全側の
+    UNKNOWNへ倒す。update_page()はタイムアウト時に自動リトライされるが、
+    「べき等なので再試行対象」であることと「完了状態が確定している」ことは
+    同義ではないため、リトライを使い切った後のタイムアウトも同様にUNKNOWNとする。
+    """
+
+    KNOWN_FAILED = "known_failed"
+    UNKNOWN = "unknown"
+
+
+def _completion_from_notion_api_error(exc: NotionAPIError) -> str:
+    if isinstance(exc.__cause__, httpx.HTTPStatusError):
+        return WriteCompletion.KNOWN_FAILED
+    return WriteCompletion.UNKNOWN
 
 
 @dataclass(frozen=True)
@@ -57,6 +93,12 @@ class CardApplyResult:
     page_id: str | None = None
     page_url: str | None = None
     error: str | None = None
+    #: action=="failed"のときのみ設定される(FailedWriteOperationの値)。
+    #: human向けerror文字列と異なり、将来のError Contract v2 adapterが
+    #: メッセージ解析なしで機械可読に参照できるようにするための補助情報。
+    failed_operation: str | None = None
+    #: action=="failed"のときのみ設定される(WriteCompletionの値)。
+    failed_completion: str | None = None
 
 
 @dataclass(frozen=True)
@@ -267,4 +309,15 @@ def _apply_one(
             page_url=decision.existing.page_url if decision.existing else None,
         )
     except NotionAPIError as exc:
-        return CardApplyResult(card=decision.card, action="failed", error=str(exc))
+        failed_operation = (
+            FailedWriteOperation.CREATE
+            if decision.action == "create"
+            else FailedWriteOperation.RELATION_UPDATE
+        )
+        return CardApplyResult(
+            card=decision.card,
+            action="failed",
+            error=str(exc),
+            failed_operation=failed_operation,
+            failed_completion=_completion_from_notion_api_error(exc),
+        )
