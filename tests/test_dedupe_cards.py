@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from mtg_notion_manager.exceptions import NotionAPIError
 from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
 from mtg_notion_manager.services import dedupe_cards
 
@@ -99,6 +100,38 @@ def _page(
 
 def _repo(pages: list[dict]) -> tuple[DedupeRepository, FakeNotionClient]:
     client = FakeNotionClient(pages)
+    repo = DedupeRepository(client, DATA_SOURCE_ID)
+    return repo, client
+
+
+class FailingNotionClient(FakeNotionClient):
+    """指定したpage_idへのupdate_page()呼び出し時にNotionAPIErrorを送出する。
+
+    失敗させたページの呼び出しはupdated_pagesへ記録しない(実際にNotion側への
+    書き込みが完了しなかったことを模す)。それ以外の挙動はFakeNotionClientと同じ。
+    """
+
+    def __init__(
+        self,
+        pages: list[dict] | None = None,
+        schema: dict | None = None,
+        fail_on_page_ids: set[str] | None = None,
+    ) -> None:
+        super().__init__(pages, schema)
+        self.fail_on_page_ids = fail_on_page_ids or set()
+        self.attempted_page_ids: list[str] = []
+
+    def update_page(self, page_id: str, properties: dict) -> dict:
+        self.attempted_page_ids.append(page_id)
+        if page_id in self.fail_on_page_ids:
+            raise NotionAPIError(f"Notion API呼び出しに失敗しました: {page_id}")
+        return super().update_page(page_id, properties)
+
+
+def _failing_repo(
+    pages: list[dict], fail_on_page_ids: set[str]
+) -> tuple[DedupeRepository, FailingNotionClient]:
+    client = FailingNotionClient(pages, fail_on_page_ids=fail_on_page_ids)
     repo = DedupeRepository(client, DATA_SOURCE_ID)
     return repo, client
 
@@ -345,6 +378,112 @@ class TestExecuteDedupePlan:
         # p1のみアクティブなので重複グループは存在しない
         assert plan2.merge_plans == []
         assert len(client.updated_pages) == updated_count_before  # 追加の書き込みなし
+
+
+class TestApplyOneGroupResultFidelity:
+    """_apply_one_group()が、NotionAPIErrorによる中断より前に実際に成功した
+    書き込みだけを正確にGroupApplyResultへ反映することを検証する。
+
+    stop-on-first-error(グループ内)・continue-on-error(グループ間)という
+    既存挙動自体は変更していないことも、書き込み試行のassertionで併せて確認する。
+    """
+
+    def test_representative_failure_marks_nothing(self) -> None:
+        """T1: 代表レコード更新自体が失敗した場合、representative_updated=False、
+        marked=[]、重複ページへの書き込みは1件も試行されない。"""
+        pages = [_page("p1", "沼", english_name="Swamp"), _page("p2", "沼")]
+        repo, client = _failing_repo(pages, fail_on_page_ids={"p1"})
+        plan = dedupe_cards.build_dedupe_plan(repo)
+
+        result = dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        group_result = result.results[0]
+        assert group_result.representative_updated is False
+        assert group_result.duplicate_page_ids_marked == []
+        assert group_result.error is not None
+        assert "p2" not in client.attempted_page_ids  # 重複ページへは一切試行されない
+
+    def test_representative_success_then_first_duplicate_failure(self) -> None:
+        """T2: 代表レコード更新は成功したが、最初の重複ページのmarkで失敗した場合、
+        representative_updated=Trueが保持され(Falseへ戻らない)、marked=[]のまま。"""
+        pages = [
+            _page("p1", "沼", english_name="Swamp"),
+            _page("p2", "沼"),
+            _page("p3", "沼"),
+        ]
+        repo, client = _failing_repo(pages, fail_on_page_ids={"p2"})
+        plan = dedupe_cards.build_dedupe_plan(repo)
+
+        result = dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        group_result = result.results[0]
+        assert group_result.representative_updated is True
+        assert group_result.duplicate_page_ids_marked == []
+        assert group_result.error is not None
+        assert client.attempted_page_ids == ["p1", "p2"]  # p3は一切試行されない
+
+    def test_partial_duplicate_prefix_is_preserved_in_order(self) -> None:
+        """T3: 重複ページA・Bのmarkが成功した後、Cで失敗した場合、A・Bのmark記録が
+        実際の書き込み順を保ったまま保持され、C・Dへは書き込みを試行しない。"""
+        pages = [
+            _page("p1", "沼", english_name="Swamp"),
+            _page("p2", "沼"),
+            _page("p3", "沼"),
+            _page("p4", "沼"),
+            _page("p5", "沼"),
+        ]
+        repo, client = _failing_repo(pages, fail_on_page_ids={"p4"})
+        plan = dedupe_cards.build_dedupe_plan(repo)
+
+        result = dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        group_result = result.results[0]
+        assert group_result.representative_updated is True
+        assert group_result.duplicate_page_ids_marked == ["p2", "p3"]  # 順序も維持
+        assert group_result.error is not None
+        assert client.attempted_page_ids == ["p1", "p2", "p3", "p4"]  # p5は未試行
+
+    def test_complete_success_is_fully_compatible(self) -> None:
+        """T4: 全件成功時は既存resultと完全互換(既存test_apply_updates_...と同内容)。"""
+        pages = [_page("p1", "沼", english_name="Swamp"), _page("p2", "沼"), _page("p3", "沼")]
+        repo, client = _repo(pages)
+        plan = dedupe_cards.build_dedupe_plan(repo)
+
+        result = dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        group_result = result.results[0]
+        assert group_result.representative_updated is True
+        assert group_result.duplicate_page_ids_marked == ["p2", "p3"]
+        assert group_result.error is None
+        assert len(client.updated_pages) == 3
+
+    def test_next_group_still_processed_after_partial_failure(self) -> None:
+        """T5: グループ「沼」が部分失敗しても、グループ「島」の処理は継続される
+        (across-group continue-on-error、既存挙動を維持)。"""
+        pages = [
+            _page("p1", "沼", english_name="Swamp"),
+            _page("p2", "沼"),
+            _page("p10", "島", english_name="Island"),
+            _page("p11", "島"),
+        ]
+        repo, client = _failing_repo(pages, fail_on_page_ids={"p2"})
+        plan = dedupe_cards.build_dedupe_plan(repo)
+
+        result = dedupe_cards.execute_dedupe_plan(plan, repo)
+
+        assert len(result.results) == 2
+        swamp_result = next(r for r in result.results if r.card_name == "沼")
+        island_result = next(r for r in result.results if r.card_name == "島")
+
+        assert swamp_result.representative_updated is True
+        assert swamp_result.duplicate_page_ids_marked == []
+        assert swamp_result.error is not None
+
+        # 島グループは沼グループの失敗と無関係に最後まで正常適用される。
+        assert island_result.representative_updated is True
+        assert island_result.duplicate_page_ids_marked == ["p11"]
+        assert island_result.error is None
+        assert "p11" in client.attempted_page_ids
 
 
 class TestPriceLinkMergeHistoryNote:

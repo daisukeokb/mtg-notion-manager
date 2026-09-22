@@ -509,11 +509,22 @@ def execute_dedupe_plan(plan: DedupePlan, repo: DedupeRepository) -> DedupeApply
 
 
 def _apply_one_group(merge_plan: MergePlan, repo: DedupeRepository) -> GroupApplyResult:
+    """1グループへ計画を適用する(代表レコード更新 → 重複ページへの統合済み設定、の順)。
+
+    このグループ内でNotionAPIErrorが発生した時点で即座に中断する
+    (stop-on-first-error、既存挙動を維持――このグループ内の残りの書き込みは
+    試行しない)。中断してもそれまでに実際に成功した書き込み
+    (代表レコード更新・個々の重複ページの統合済み設定)はresultへ正確に反映する。
+    後続の書き込みが失敗したことを理由に、既に成功した代表レコード更新を
+    Falseへ戻したり、既に成功した重複ページのmark記録を失ったりしない。
+    """
+    representative_updated = False
+    marked: list[str] = []
     try:
         representative_properties = build_representative_update(merge_plan)
         repo.update_page(merge_plan.representative_page_id, representative_properties)
+        representative_updated = True
 
-        marked: list[str] = []
         for duplicate_page in merge_plan.duplicate_pages:
             duplicate_properties = build_duplicate_page_update(merge_plan, duplicate_page)
             repo.update_page(duplicate_page["id"], duplicate_properties)
@@ -522,13 +533,14 @@ def _apply_one_group(merge_plan: MergePlan, repo: DedupeRepository) -> GroupAppl
         return GroupApplyResult(
             card_name=merge_plan.group.card_name,
             representative_page_id=merge_plan.representative_page_id,
-            representative_updated=True,
+            representative_updated=representative_updated,
             duplicate_page_ids_marked=marked,
         )
     except NotionAPIError as exc:
         return GroupApplyResult(
             card_name=merge_plan.group.card_name,
             representative_page_id=merge_plan.representative_page_id,
-            representative_updated=False,
+            representative_updated=representative_updated,
+            duplicate_page_ids_marked=marked,
             error=str(exc),
         )
