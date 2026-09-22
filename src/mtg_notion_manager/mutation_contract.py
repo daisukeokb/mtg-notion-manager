@@ -14,6 +14,29 @@ caller cannot construct a self-contradictory state), and ``recovery_action``
 is validated against what that derived state allows — in particular,
 ``MUTATION_STATE_UNKNOWN`` can never be paired with a recovery action that
 would permit a blind retry.
+
+Error Contract v2 output is a deliberate two-layer structure, and
+``recovery_action`` belongs entirely to the second layer:
+
+- Layer A — command failure (``error_category``/``error_code``/``message``,
+  defined in ``error_contract.py``): *why did the command not complete
+  normally?* This is the top-level domain-error classification (e.g. an
+  ``IDENTITY_AMBIGUITY``/card-resolution failure that aborted a batch).
+- Layer B — mutation state (everything in this module): *what happened to
+  the Notion writes that were actually attempted, and what must be done
+  specifically because of THAT mutation state?*
+
+``recovery_action`` (and every other field on ``MutationSummary``) answers
+Layer B only. It never describes, overrides, or substitutes for how to
+resolve the command's top-level domain error — a consumer must always
+inspect ``error_category``/``error_code`` independently of
+``mutation.recovery_action``. In particular, ``recovery_action == NONE``
+means only "no action is required specifically to reconcile Notion mutation
+state" — it is not a claim that the command as a whole succeeded or needs
+no follow-up (see the ``RecoveryAction`` docstring below for the case where
+a batch aborts on a domain error after some writes had already succeeded
+cleanly: ``mutation.state`` can legitimately be ``MUTATION_SUCCEEDED`` with
+``recovery_action: NONE`` while the surrounding command still failed).
 """
 
 from __future__ import annotations
@@ -32,14 +55,52 @@ class MutationState:
 
 
 class RecoveryAction:
-    """What a machine consumer may safely do next. Never auto-inferred from
-    the mutation state alone beyond what :data:`_ALLOWED_RECOVERY_BY_STATE`
-    permits — a command's own contract must justify ``RETRY_ALLOWED``.
+    """What a machine consumer must do to recover/reconcile the reported
+    *Notion mutation state* specifically — never auto-inferred from the
+    mutation state alone beyond what :data:`_ALLOWED_RECOVERY_BY_STATE`
+    permits (a command's own contract must justify ``RETRY_ALLOWED``).
+
+    Scope (frozen by this Work Unit — see the module docstring's Layer A/B
+    split): every value here describes *only* what, if anything, must be
+    done because of the mutation outcome itself. None of these values
+    describe, replace, or imply anything about resolving the command's
+    top-level domain error (``error_category``/``error_code``). A consumer
+    that only checks ``recovery_action`` and skips the top-level
+    classification is misusing this field.
     """
 
+    #: No action is required *specifically to reconcile Notion mutation
+    #: state* (valid only when every attempted write's outcome is fully and
+    #: successfully known: NO_MUTATION or MUTATION_SUCCEEDED). This is NOT a
+    #: claim that "no action is required" in general, and NOT a claim that
+    #: the command succeeded — the same response can carry a NONE mutation
+    #: alongside a top-level error_category/error_code that still needs
+    #: resolving (e.g. a card-identity error that aborted the batch after
+    #: every write attempted so far had already succeeded).
     NONE = "NONE"
+    #: The mutation contract has independently established that another
+    #: write attempt is safe without prior reconciliation (valid only for
+    #: MUTATION_FAILED, where every failure is definitively known —
+    #: never for MUTATION_STATE_UNKNOWN). No current command emits this
+    #: value; rerun safety has not yet been proven for any of them
+    #: (see import_cards_mutation_adapter.py, which deliberately never
+    #: selects this value pending a dedicated rerun-safety Work Unit).
     RETRY_ALLOWED = "RETRY_ALLOWED"
+    #: One or more attempted writes have an unknown completion state (or,
+    #: depending on a command's own contract, a mix of known outcomes where
+    #: reconciling live Notion state is preferred to immediate manual
+    #: escalation). Reconcile current Notion state before any retry —
+    #: never retry blindly on the strength of this value alone.
     RECONCILE_BEFORE_RETRY = "RECONCILE_BEFORE_RETRY"
+    #: Every attempted write's outcome is definitively known (no UNKNOWN
+    #: completions), but at least one write is a known failure and
+    #: automatic retry/recovery safety has not been established for that
+    #: mutation pattern. A human must review the mutation results
+    #: (``mutation.operations``) before another write attempt. This is a
+    #: statement about the *mutation*, not about the command's domain
+    #: error — do not read it as "the whole command needs review" (though
+    #: in practice a command that reports this will usually also have a
+    #: reason to require attention at the top level too).
     MANUAL_REVIEW_REQUIRED = "MANUAL_REVIEW_REQUIRED"
 
 
@@ -142,12 +203,23 @@ class MutationSummary:
 
     invalid state/count/recovery/operationの組み合わせはインスタンス化できない
     (fail-closed: 例外を送出し、無効な状態をserializationしない)。
+
+    scope(このモジュールのdocstring・RecoveryActionのdocstring参照): `state`と
+    `recovery_action`はどちらもmutationそのものについての事実・指示であり、
+    このcommandがtop-levelでなぜ失敗したか(error_category/error_code)を
+    表すものではない。`recovery_action == RecoveryAction.NONE`は
+    「mutation側の追加対応は不要」を意味するだけで、「command全体が成功した」
+    ことを意味しない――例えば書き込みがすべて成功した直後にcard identityの
+    問題でbatchが中断した場合、mutation側はMUTATION_SUCCEEDED/NONEのまま、
+    top-levelのerror_category/error_codeは依然として実際の中断原因を表す。
     """
 
     attempted: int
     succeeded: int
     failed: int
     unknown: int
+    #: このmutationの状態を解消するために必要な対応(RecoveryAction参照)。
+    #: command自体のtop-level domain error解消を代替するものではない。
     recovery_action: str
     operations: tuple[MutationOperation, ...] = ()
     state: str = field(init=False)
