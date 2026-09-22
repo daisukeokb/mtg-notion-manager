@@ -19,6 +19,9 @@ from mtg_notion_manager.mutation_contract import (
 
 
 def test_no_mutation_state() -> None:
+    """T1: NO_MUTATION + NONE is valid. recovery_action here describes only
+    mutation-state recovery ("no write was attempted, nothing to reconcile")
+    — it makes no claim about whether the surrounding command succeeded."""
     summary = MutationSummary(
         attempted=0, succeeded=0, failed=0, unknown=0, recovery_action=RecoveryAction.NONE
     )
@@ -29,6 +32,12 @@ def test_no_mutation_state() -> None:
 
 
 def test_mutation_succeeded_state() -> None:
+    """T2: MUTATION_SUCCEEDED + NONE is valid. This means every attempted
+    write's outcome is known and successful — it does NOT mean the
+    surrounding command succeeded (a command can still abort on a
+    top-level domain error after all of its writes-so-far succeeded; see
+    tests/test_cli_error_contract.py's
+    test_import_cards_error_json_successful_prefix_then_abort)."""
     summary = MutationSummary(
         attempted=3, succeeded=3, failed=0, unknown=0, recovery_action=RecoveryAction.NONE
     )
@@ -123,6 +132,9 @@ def test_no_mutation_with_reconcile_before_retry_is_rejected() -> None:
 
 
 def test_unknown_state_with_none_recovery_is_rejected() -> None:
+    """T3: MUTATION_STATE_UNKNOWN + NONE is invalid — an unresolved,
+    unknown-completion write can never be reported as needing no
+    mutation-state reconciliation."""
     with pytest.raises(ValueError, match="not allowed for state"):
         MutationSummary(
             attempted=1, succeeded=0, failed=0, unknown=1, recovery_action=RecoveryAction.NONE
@@ -142,6 +154,9 @@ def test_unknown_state_cannot_be_marked_retry_allowed() -> None:
 
 
 def test_unknown_state_allows_reconcile_before_retry() -> None:
+    """T5: MUTATION_STATE_UNKNOWN + RECONCILE_BEFORE_RETRY is valid — the
+    only recovery guidance for an unknown completion is to reconcile live
+    Notion state first, never to retry or to treat it as already resolved."""
     summary = MutationSummary(
         attempted=1,
         succeeded=0,

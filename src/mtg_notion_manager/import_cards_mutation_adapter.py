@@ -118,6 +118,11 @@ def build_import_cards_mutation_summary(results: Sequence[CardApplyResult]) -> M
 
 
 def _recovery_action_for(*, unknown: int, failed: int) -> str:
+    """mutation自体の状態だけからrecovery_actionを決める(top-levelの
+    error_category/error_codeは一切参照しない――mutation.recovery_actionは
+    「このmutation stateを解消するには何が必要か」だけを表し、command自体の
+    domain error解消を代替しない。mutation_contract.pyのRecoveryAction参照)。
+    """
     if unknown > 0:
         return RecoveryAction.RECONCILE_BEFORE_RETRY
     if failed > 0:

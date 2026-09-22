@@ -169,6 +169,21 @@ def emit_error_json(
     keeps emitting the exact same schema_version-1 payload as before this
     parameter existed — passing ``mutation`` is what selects schema_version 2,
     never a caller-supplied version number, so the two can never disagree.
+
+    ``category``/``code`` and ``mutation`` answer two separate questions and
+    a caller must never conflate them: ``category``/``code`` (plus
+    ``message``) say *why the command did not complete normally* (the
+    top-level domain error); ``mutation`` — when present — says *what
+    happened to the Notion writes actually attempted, and what
+    mutation-specific recovery/reconciliation that state requires*
+    (``mutation.recovery_action``, see ``mutation_contract.RecoveryAction``).
+    A ``mutation.recovery_action`` of ``NONE`` never implies the command
+    itself succeeded or needs no follow-up — ``category``/``code`` still
+    carry that. A caller can legitimately pass a real domain-error
+    ``category``/``code`` together with a ``mutation`` whose every attempted
+    write succeeded (``MUTATION_SUCCEEDED``/``NONE``) — e.g. a batch that
+    aborts on an identity-resolution error after every write attempted so
+    far had already completed successfully.
     """
     payload = {
         "schema_version": SCHEMA_VERSION if mutation is None else SCHEMA_VERSION_V2,

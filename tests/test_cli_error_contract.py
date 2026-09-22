@@ -2741,9 +2741,15 @@ def test_import_cards_error_json_all_known_failed(monkeypatch: pytest.MonkeyPatc
 
 
 def test_import_cards_error_json_first_card_abort(monkeypatch: pytest.MonkeyPatch) -> None:
-    """完了済みresultが1件もないままの中断(§26)。write loopには入っているためv2
-    (mutation付き、NO_MUTATION/recovery=NONE)として扱う――pre-write gateの
-    AmbiguousCardMatchError(v1)とはここで区別される。"""
+    """T6: 完了済みresultが1件もないままの中断(§26)。write loopには入っているため
+    v2(mutation付き、NO_MUTATION/recovery=NONE)として扱う――pre-write gateの
+    AmbiguousCardMatchError(v1)とはここで区別される。
+
+    mutation.recovery_action=NONEは「mutation側の追加対応は不要」だけを意味し、
+    top-levelのerror_category/error_code(実際の中断原因)の解消は依然として
+    必要であることを、この関数はtop-levelエラーが存在することへの assert とともに
+    確認する。
+    """
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     _patch_notion(monkeypatch)
     decisions = [CardDecision(card=_import_cards_card("未確認カード"), action="create")]
