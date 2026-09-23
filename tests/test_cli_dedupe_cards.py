@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 from mtg_notion_manager import cli
 from mtg_notion_manager.config import Config
+from mtg_notion_manager.exceptions import NotionAPIError
 from mtg_notion_manager.services.dedupe_cards import (
     DedupeApplyResult,
     DedupePlan,
@@ -241,3 +242,100 @@ def test_group_errors_are_shown_in_dry_run(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert result.exit_code == 0
     assert "秘儀の印鑑" in result.stdout
+
+
+def _regression_page(
+    page_id: str, name: str, english_name: str | None = None
+) -> dict:
+    properties: dict = {
+        "カード名": {"type": "title", "title": [{"plain_text": name}]},
+        "所持": {"type": "checkbox", "checkbox": False},
+        "統合済み": {"type": "checkbox", "checkbox": False},
+        "採用デッキ": {
+            "type": "relation",
+            "id": f"rel-{page_id}",
+            "relation": [],
+            "has_more": False,
+        },
+        "メモ": {"type": "rich_text", "rich_text": []},
+    }
+    if english_name is not None:
+        properties["英語名"] = {"type": "rich_text", "rich_text": [{"plain_text": english_name}]}
+    return {
+        "id": page_id,
+        "url": f"https://notion.so/{page_id}",
+        "created_time": "2024-01-01T00:00:00.000Z",
+        "last_edited_time": "2024-01-01T00:00:00.000Z",
+        "properties": properties,
+    }
+
+
+class PartialFailureNotionClientCtx:
+    """dedupe-cards --apply の実際の実行(execute_dedupe_plan()のreal実装を通す)で、
+    代表更新・重複ページ1件目のmarkは成功するが、2件目のmarkでNotionAPIErrorが
+    発生するシナリオを模す。
+
+    Phase 2Iのresult-fidelity修正(GroupApplyResult.duplicate_page_ids_marked)が
+    実際にCLI表示へ反映されることの回帰ロック。CLI production code
+    (cli.py/preview.py)は一切変更しない。
+    """
+
+    def __init__(self, pages: list[dict], fail_on_page_id: str) -> None:
+        self._pages = pages
+        self._fail_on_page_id = fail_on_page_id
+        self.updated_pages: list[tuple[str, dict]] = []
+
+    def __enter__(self) -> PartialFailureNotionClientCtx:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def query_data_source_all(self, data_source_id: str, page_size: int = 100) -> list[dict]:
+        return self._pages
+
+    def get_data_source(self, data_source_id: str) -> dict:
+        return {"properties": {"所持枚数": {"type": "number"}, "統合済み": {"type": "checkbox"}}}
+
+    def update_page(self, page_id: str, properties: dict) -> dict:
+        if page_id == self._fail_on_page_id:
+            raise NotionAPIError(f"Notion API呼び出しに失敗しました: {page_id}")
+        self.updated_pages.append((page_id, properties))
+        return {"id": page_id, "url": f"https://notion.so/{page_id}"}
+
+    def get_page_property_item(
+        self, page_id: str, property_id: str, page_size: int = 100
+    ) -> list[dict]:
+        return []
+
+
+def test_partial_failure_shows_accurate_completed_mark_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 2Iのresult-fidelity修正の回帰ロック(§31)。
+
+    代表更新 + 重複ページp2のmarkが実際に成功した後、p3のmarkでNotionAPIErrorが
+    発生しても、「統合済み設定件数」列には人工的な0ではなく実際に成功した件数
+    (1件)が表示される。これは新しいbehavior追加ではなく、Phase 2Iで既に
+    成立した正しいobserved behaviorを固定するテストであり、CLI production code
+    は一切変更していない。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    pages = [
+        _regression_page("p1", "沼", english_name="Swamp"),
+        _regression_page("p2", "沼"),
+        _regression_page("p3", "沼"),
+    ]
+    client_ctx = PartialFailureNotionClientCtx(pages, fail_on_page_id="p3")
+    monkeypatch.setattr(cli, "NotionClient", lambda api_key: client_ctx)
+
+    result = runner.invoke(cli.app, ["dedupe-cards", "--card-name", "沼", "--apply"])
+
+    assert result.exit_code == 1
+    # 実際にNotionへ書き込みが成功したのはp1(代表)とp2(1件目の重複)だけ。
+    updated_ids = {page_id for page_id, _ in client_ctx.updated_pages}
+    assert updated_ids == {"p1", "p2"}
+    # 「統合済み設定件数」列は実際の成功件数(1件)を表示する(人工的な0ではない)。
+    plain_stdout = result.stdout.replace("\n", "")
+    assert "1" in plain_stdout
+    assert "失敗: 1件" in result.stdout
