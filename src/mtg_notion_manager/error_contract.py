@@ -30,6 +30,7 @@ from mtg_notion_manager.exceptions import (
     UnsupportedSourceError,
 )
 from mtg_notion_manager.mutation_contract import MutationSummary
+from mtg_notion_manager.services.apply_dedupe_plan import DedupeAuditReportLoadError
 from mtg_notion_manager.services.apply_price_link_dedupe import PriceLinkDedupeReportLoadError
 from mtg_notion_manager.services.card_resolution import UnverifiedNewCardError
 from mtg_notion_manager.services.single_card_title_update import (
@@ -104,6 +105,11 @@ class ErrorCode:
     #: apply-price-link-dedupeの--targets-reportが読み込めない/不正な場合
     #: (元はOSError/ValueErrorとして送出される。CLI境界でのみ狭くwrapする)。
     TARGETS_REPORT_LOAD_FAILED = "TARGETS_REPORT_LOAD_FAILED"
+    #: apply-dedupe-planの--audit-reportが読み込めない/不正な場合
+    #: (元はOSError/ValueErrorとして送出される。CLI境界でのみ狭くwrapする)。
+    #: TARGETS_REPORT_LOAD_FAILEDとは意図的に別code(price-link専用のtargets
+    #: reportとは異なる入力artifactのため再利用しない)。
+    AUDIT_REPORT_LOAD_FAILED = "AUDIT_REPORT_LOAD_FAILED"
 
 
 # Exception type -> (error_category, error_code). Checked in order; a subtype
@@ -146,6 +152,11 @@ _EXCEPTION_CLASSIFICATION: tuple[tuple[type[Exception], str, str], ...] = (
         PriceLinkDedupeReportLoadError,
         ErrorCategory.INPUT_VALIDATION,
         ErrorCode.TARGETS_REPORT_LOAD_FAILED,
+    ),
+    (
+        DedupeAuditReportLoadError,
+        ErrorCategory.INPUT_VALIDATION,
+        ErrorCode.AUDIT_REPORT_LOAD_FAILED,
     ),
     (NotionAPIError, ErrorCategory.PRODUCTION_API, ErrorCode.NOTION_API_ERROR),
     (MtgNotionManagerError, ErrorCategory.INTERNAL, ErrorCode.UNCLASSIFIED_DOMAIN_ERROR),

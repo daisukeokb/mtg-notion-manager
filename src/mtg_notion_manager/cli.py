@@ -8,11 +8,11 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from mtg_notion_manager.apply_price_link_dedupe_mutation_adapter import (
-    build_price_link_dedupe_mutation_summary,
-)
 from mtg_notion_manager.card_match_overrides import load_card_match_overrides
 from mtg_notion_manager.config import Config, ConfigError
+from mtg_notion_manager.dedupe_apply_mutation_adapter import (
+    build_dedupe_apply_mutation_summary,
+)
 from mtg_notion_manager.error_contract import (
     ErrorCategory,
     ErrorCode,
@@ -47,6 +47,7 @@ from mtg_notion_manager.services.apply_dedupe_plan import (
     STATUS_PLANNED,
     STATUS_SKIPPED_NOT_DUPLICATE,
     STATUS_SKIPPED_STALE,
+    DedupeAuditReportLoadError,
     apply_dedupe_batch,
     load_audit_report,
     select_target_groups,
@@ -758,6 +759,34 @@ def apply_dedupe_plan_command(
     output_dir: str = typer.Option(
         "reports", "--output-dir", help="実行ログの出力先ディレクトリ"
     ),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "実行結果が成功でない場合のみ、人間向け出力の代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message、書き込み結果を"
+            "伴う場合はmutationも含む)をstdoutへ出力する。--error-json は --apply を"
+            "意味しない(--dry-run・--apply省略時・--classification・--limit・--offset・"
+            "鮮度再チェックの意味は変更しない)。--limit/--offsetは低リスク順のoperator-"
+            "controlledなbatchingであり、コード上強制されるcanaryではない(この点は"
+            "apply-price-link-dedupeの--scope canaryとは異なる)。不明な --classification"
+            "指定のようなCLIの使い方の誤りは実行エラーではないため対象外(既存の人間向け"
+            "メッセージ・終了コード1を維持し、Error Contract JSONへは変換しない)。書き込み"
+            "以前に終了する実行エラー(設定読み込み失敗・監査レポート読み込み失敗など)は"
+            "schema_version 1(mutationなし)、書き込みを1件以上試みたうえでの失敗は"
+            "schema_version 2(mutation付き、apply-price-link-dedupeと同じ共有dedupe"
+            "mutation adapterを使用)。mutation.stateがMUTATION_STATE_UNKNOWNの場合は"
+            "完了状態が不明な書き込みが含まれるため、何もせず再実行しない"
+            "(RECONCILE_BEFORE_RETRYはNotion側の状態を手動確認してからの判断を促すもので"
+            "あり、自動リトライ可を意味しない)。known failureのみの場合もRETRY_ALLOWEDは"
+            "出力しない(dedupe書き込みはidempotentなupdateだが、鮮度状態やグループ構成が"
+            "変化し得るため、計画全体を盲目的に再実行する安全性は未証明であり、当面は"
+            "MANUAL_REVIEW_REQUIREDに留める)。実行ログファイルの生成は--error-jsonの有無に"
+            "関わらず変更しない。成功時(--apply省略・--dry-run・全件成功・鮮度不一致/"
+            "重複解消済みによるスキップのみ)の出力・終了コードは変更しない。messageは"
+            "診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
     """監査レポートの「自動統合可能」グループだけを、鮮度チェックのうえ段階適用する。
 
@@ -773,22 +802,46 @@ def apply_dedupe_plan_command(
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("apply-dedupe-plan", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "apply-dedupe-plan",
+                ErrorCategory.CONFIGURATION,
+                ErrorCode.CONFIG_LOAD_FAILED,
+                message,
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     try:
         groups = load_audit_report(Path(audit_report), classification=classification)
     except (OSError, ValueError) as exc:
-        console.print(f"[red]エラー:[/red] 監査レポートを読み込めませんでした: {exc}")
+        wrapped = DedupeAuditReportLoadError(f"監査レポートを読み込めませんでした: {exc}")
+        if error_json:
+            emit_error_json("apply-dedupe-plan", *classify_exception(wrapped), str(wrapped))
+        else:
+            console.print(f"[red]エラー:[/red] {wrapped}")
         raise typer.Exit(code=1) from exc
 
     targets = select_target_groups(groups, limit=limit, offset=offset)
 
-    console.print(f"対象グループ数: {len(targets)}")
+    # --error-json モードでは、対象一覧表示が既に出力された後でapply_dedupe_batch()が
+    # 部分失敗するケースがあり得る。そのケースでもstdoutを純粋なJSON1件だけにするため、
+    # 成功が確定するまでこれらの出力を一時バッファへ書き、エラーJSON確定時は破棄する
+    # (成功時はこのバッファの内容をそのまま実コンソールへ出力するため、成功時の出力内容
+    # 自体は変更しない)。
+    error_buffer = io.StringIO()
+    render_console = Console(file=error_buffer) if error_json else console
+
+    render_console.print(f"対象グループ数: {len(targets)}")
     table = Table(title="適用対象(低リスク順)")
     table.add_column("カード名")
     table.add_column("重複件数", justify="right")
@@ -801,10 +854,12 @@ def apply_dedupe_plan_command(
             str(group.merged_deck_relation_count),
             group.recommended_representative_id or "",
         )
-    console.print(table)
+    render_console.print(table)
 
     if not targets:
-        console.print("対象がありません。")
+        render_console.print("対象がありません。")
+        if error_json:
+            print(error_buffer.getvalue(), end="")
         raise typer.Exit(code=0)
 
     exclusions = load_exclusions()
@@ -815,10 +870,13 @@ def apply_dedupe_plan_command(
             repo = DedupeRepository(client, config.card_data_source_id)
             outcomes = apply_dedupe_batch(repo, targets, apply=do_apply, exclusions=exclusions)
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("apply-dedupe-plan", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    console.print()
+    render_console.print()
     result_table = Table(title="適用結果")
     result_table.add_column("カード名")
     result_table.add_column("結果")
@@ -831,7 +889,7 @@ def apply_dedupe_plan_command(
             outcome.representative_page_id or "",
             outcome.error or outcome.reason,
         )
-    console.print(result_table)
+    render_console.print(result_table)
 
     counts = {
         STATUS_APPLIED: 0,
@@ -843,29 +901,43 @@ def apply_dedupe_plan_command(
     for outcome in outcomes:
         counts[outcome.status] += 1
 
-    console.print()
-    console.print(f"適用: {counts[STATUS_APPLIED]}件")
-    console.print(f"計画のみ(dry-run): {counts[STATUS_PLANNED]}件")
-    console.print(
+    render_console.print()
+    render_console.print(f"適用: {counts[STATUS_APPLIED]}件")
+    render_console.print(f"計画のみ(dry-run): {counts[STATUS_PLANNED]}件")
+    render_console.print(
         f"スキップ(鮮度不一致): {counts[STATUS_SKIPPED_STALE]}件"
     )
-    console.print(f"スキップ(重複解消済み): {counts[STATUS_SKIPPED_NOT_DUPLICATE]}件")
-    console.print(f"失敗: {counts[STATUS_FAILED]}件")
+    render_console.print(f"スキップ(重複解消済み): {counts[STATUS_SKIPPED_NOT_DUPLICATE]}件")
+    render_console.print(f"失敗: {counts[STATUS_FAILED]}件")
 
     log_paths = write_apply_log(
         outcomes, audit_report_path=audit_report, output_dir=Path(output_dir), applied=do_apply
     )
-    console.print()
-    console.print(f"実行ログ: {log_paths.json_path}")
+    render_console.print()
+    render_console.print(f"実行ログ: {log_paths.json_path}")
 
     if not do_apply:
-        console.print(
+        render_console.print(
             "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません。[/cyan]"
         )
+        if error_json:
+            print(error_buffer.getvalue(), end="")
         raise typer.Exit(code=0)
 
     if counts[STATUS_FAILED]:
+        if error_json:
+            mutation = build_dedupe_apply_mutation_summary(outcomes)
+            emit_error_json(
+                "apply-dedupe-plan",
+                ErrorCategory.PARTIAL_MUTATION,
+                ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+                f"{counts[STATUS_APPLIED]}件成功、{counts[STATUS_FAILED]}件失敗しました。",
+                mutation=mutation,
+            )
         raise typer.Exit(code=1)
+
+    if error_json:
+        print(error_buffer.getvalue(), end="")
 
 
 @app.command(name="review-duplicate-conflicts")
@@ -1238,7 +1310,7 @@ def apply_price_link_dedupe_command(
 
     if counts[PRICE_STATUS_FAILED]:
         if error_json:
-            mutation = build_price_link_dedupe_mutation_summary(outcomes)
+            mutation = build_dedupe_apply_mutation_summary(outcomes)
             emit_error_json(
                 "apply-price-link-dedupe",
                 ErrorCategory.PARTIAL_MUTATION,
