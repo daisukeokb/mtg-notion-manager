@@ -8,6 +8,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from mtg_notion_manager.apply_price_link_dedupe_mutation_adapter import (
+    build_price_link_dedupe_mutation_summary,
+)
 from mtg_notion_manager.card_match_overrides import load_card_match_overrides
 from mtg_notion_manager.config import Config, ConfigError
 from mtg_notion_manager.error_contract import (
@@ -65,6 +68,7 @@ from mtg_notion_manager.services.apply_price_link_dedupe import (
     STATUS_SKIPPED_STALE as PRICE_STATUS_SKIPPED_STALE,
 )
 from mtg_notion_manager.services.apply_price_link_dedupe import (
+    PriceLinkDedupeReportLoadError,
     apply_price_link_targets,
     load_price_link_targets,
     select_canary_targets,
@@ -1041,6 +1045,30 @@ def apply_price_link_dedupe_command(
         False, "--apply", help="実際にNotionへ統合を書き込む(指定しない限り書き込まない)"
     ),
     output_dir: str = typer.Option("reports", "--output-dir", help="実行ログの出力先ディレクトリ"),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "実行結果が成功でない場合のみ、人間向け出力の代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message、書き込み結果を"
+            "伴う場合はmutationも含む)をstdoutへ出力する。--error-json は --apply を"
+            "意味しない(--dry-run・--apply省略時・--scope・カナリア3件上限・鮮度再チェックの"
+            "意味は変更しない)。不明な --scope・--scope manualでの代表ページID未指定のような"
+            "CLIの使い方の誤りは実行エラーではないため対象外(既存の人間向けメッセージ・"
+            "終了コード1を維持し、Error Contract JSONへは変換しない)。書き込み以前に終了する"
+            "実行エラー(設定読み込み失敗・レポート読み込み失敗など)はschema_version 1"
+            "(mutationなし)、書き込みを1件以上試みたうえでの失敗はschema_version 2"
+            "(mutation付き)。mutation.stateがMUTATION_STATE_UNKNOWNの場合は完了状態が不明な"
+            "書き込みが含まれるため、何もせず再実行しない(RECONCILE_BEFORE_RETRYはNotion側の"
+            "状態を手動確認してからの判断を促すものであり、自動リトライ可を意味しない)。"
+            "known failureのみの場合もRETRY_ALLOWEDは出力しない(dedupe書き込みはidempotentな"
+            "updateだが、鮮度状態やグループ構成が変化し得るため、計画全体を盲目的に再実行する"
+            "安全性は未証明であり、当面はMANUAL_REVIEW_REQUIREDに留める)。実行ログファイルの"
+            "生成は--error-jsonの有無に関わらず変更しない。成功時(--apply省略・--dry-run・"
+            "全件成功・鮮度不一致によるスキップのみ)の出力・終了コードは変更しない。messageは"
+            "診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
     """review-duplicate-conflicts の price_only / manual_representative グループを段階適用する。
 
@@ -1064,11 +1092,23 @@ def apply_price_link_dedupe_command(
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("apply-price-link-dedupe", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "apply-price-link-dedupe",
+                ErrorCategory.CONFIGURATION,
+                ErrorCode.CONFIG_LOAD_FAILED,
+                message,
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     try:
@@ -1084,7 +1124,13 @@ def apply_price_link_dedupe_command(
             report_path, manual_representative_overrides=overrides
         )
     except (OSError, ValueError) as exc:
-        console.print(f"[red]エラー:[/red] レポートを読み込めませんでした: {exc}")
+        wrapped = PriceLinkDedupeReportLoadError(f"レポートを読み込めませんでした: {exc}")
+        if error_json:
+            emit_error_json(
+                "apply-price-link-dedupe", *classify_exception(wrapped), str(wrapped)
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {wrapped}")
         raise typer.Exit(code=1) from exc
 
     price_only_targets = [t for t in all_targets if t.review_category == CATEGORY_PRICE_ONLY]
@@ -1099,7 +1145,15 @@ def apply_price_link_dedupe_command(
         remaining = [t for t in price_only_targets if t.card_name not in canary_names]
         targets = select_remaining_batch(remaining, limit=limit, offset=offset)
 
-    console.print(f"対象グループ数: {len(targets)}")
+    # --error-json モードでは、対象一覧表示が既に出力された後でapply_price_link_targets()が
+    # 部分失敗するケースがあり得る。そのケースでもstdoutを純粋なJSON1件だけにするため、
+    # 成功が確定するまでこれらの出力を一時バッファへ書き、エラーJSON確定時は破棄する
+    # (成功時はこのバッファの内容をそのまま実コンソールへ出力するため、成功時の出力内容
+    # 自体は変更しない)。
+    error_buffer = io.StringIO()
+    render_console = Console(file=error_buffer) if error_json else console
+
+    render_console.print(f"対象グループ数: {len(targets)}")
     table = Table(title=f"適用対象(scope={scope})")
     table.add_column("カード名")
     table.add_column("分類")
@@ -1112,10 +1166,12 @@ def apply_price_link_dedupe_command(
             str(len(group.page_ids)),
             group.representative_page_id or "",
         )
-    console.print(table)
+    render_console.print(table)
 
     if not targets:
-        console.print("対象がありません。")
+        render_console.print("対象がありません。")
+        if error_json:
+            print(error_buffer.getvalue(), end="")
         raise typer.Exit(code=0)
 
     exclusions = load_exclusions()
@@ -1128,10 +1184,13 @@ def apply_price_link_dedupe_command(
                 repo, targets, apply=do_apply, exclusions=exclusions
             )
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("apply-price-link-dedupe", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    console.print()
+    render_console.print()
     result_table = Table(title="適用結果")
     result_table.add_column("カード名")
     result_table.add_column("結果")
@@ -1144,7 +1203,7 @@ def apply_price_link_dedupe_command(
             outcome.representative_page_id or "",
             outcome.error or outcome.reason,
         )
-    console.print(result_table)
+    render_console.print(result_table)
 
     counts = {
         PRICE_STATUS_APPLIED: 0,
@@ -1156,27 +1215,41 @@ def apply_price_link_dedupe_command(
     for outcome in outcomes:
         counts[outcome.status] += 1
 
-    console.print()
-    console.print(f"適用: {counts[PRICE_STATUS_APPLIED]}件")
-    console.print(f"計画のみ(dry-run): {counts[PRICE_STATUS_PLANNED]}件")
-    console.print(f"スキップ(鮮度不一致): {counts[PRICE_STATUS_SKIPPED_STALE]}件")
-    console.print(f"スキップ(重複解消済み): {counts[PRICE_STATUS_SKIPPED_NOT_DUPLICATE]}件")
-    console.print(f"失敗: {counts[PRICE_STATUS_FAILED]}件")
+    render_console.print()
+    render_console.print(f"適用: {counts[PRICE_STATUS_APPLIED]}件")
+    render_console.print(f"計画のみ(dry-run): {counts[PRICE_STATUS_PLANNED]}件")
+    render_console.print(f"スキップ(鮮度不一致): {counts[PRICE_STATUS_SKIPPED_STALE]}件")
+    render_console.print(f"スキップ(重複解消済み): {counts[PRICE_STATUS_SKIPPED_NOT_DUPLICATE]}件")
+    render_console.print(f"失敗: {counts[PRICE_STATUS_FAILED]}件")
 
     log_paths = write_price_link_apply_log(
         outcomes, targets_report_path=targets_report, output_dir=Path(output_dir), applied=do_apply
     )
-    console.print()
-    console.print(f"実行ログ: {log_paths.json_path}")
+    render_console.print()
+    render_console.print(f"実行ログ: {log_paths.json_path}")
 
     if not do_apply:
-        console.print(
+        render_console.print(
             "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません。[/cyan]"
         )
+        if error_json:
+            print(error_buffer.getvalue(), end="")
         raise typer.Exit(code=0)
 
     if counts[PRICE_STATUS_FAILED]:
+        if error_json:
+            mutation = build_price_link_dedupe_mutation_summary(outcomes)
+            emit_error_json(
+                "apply-price-link-dedupe",
+                ErrorCategory.PARTIAL_MUTATION,
+                ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+                f"{counts[PRICE_STATUS_APPLIED]}件成功、{counts[PRICE_STATUS_FAILED]}件失敗しました。",
+                mutation=mutation,
+            )
         raise typer.Exit(code=1)
+
+    if error_json:
+        print(error_buffer.getvalue(), end="")
 
 
 @app.command(name="import-article")

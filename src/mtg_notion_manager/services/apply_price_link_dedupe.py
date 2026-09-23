@@ -20,6 +20,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from mtg_notion_manager.exceptions import MtgNotionManagerError
 from mtg_notion_manager.notion.dedupe_repository import (
     DECKS_RELATION_PROPERTY,
     ENGLISH_NAME_PROPERTY,
@@ -56,6 +57,16 @@ STATUS_SKIPPED_NOT_DUPLICATE = "skipped_no_longer_duplicate"
 STATUS_FAILED = "failed"
 
 TARGET_CATEGORIES = (CATEGORY_PRICE_ONLY, CATEGORY_MANUAL)
+
+
+class PriceLinkDedupeReportLoadError(MtgNotionManagerError):
+    """load_price_link_targets()が送出したOSError/ValueErrorを、CLI境界で
+    Error Contract分類可能なdomain exceptionへ狭くwrapするための専用型。
+
+    load_price_link_targets()自身は変更しない(引き続きOSError/ValueErrorを
+    直接送出する)。このexceptionはcli.py側でのみ構築・送出され、既存の
+    human向けメッセージ文言は完全に維持する。
+    """
 
 
 # --- バックアップ ------------------------------------------------------------
@@ -220,6 +231,13 @@ class GroupApplyOutcome:
     before_snapshot: list[dict] = field(default_factory=list)
     after_snapshot: dict | None = None
     history_note_appended: str | None = None
+    #: status==STATUS_FAILEDのうち、execute_dedupe_plan()が実際にNotionへの
+    #: 書き込みを試みて失敗した場合のみ設定される(dedupe_cards.FailedGroupOperationの
+    #: 値)。手動代表未指定・build_dedupe_plan()のgroup_errorsのような、Notion書き込みに
+    #: 到達する前の失敗ではNoneのまま(その場合Notion書き込みは1件も試みられていない)。
+    failed_operation: str | None = None
+    #: 同上の条件でのみ設定される(dedupe_cards.GroupWriteCompletionの値)。
+    failed_completion: str | None = None
 
 
 def apply_price_link_targets(
@@ -337,7 +355,10 @@ def _process_one_group(
             status=STATUS_FAILED,
             error=group_result.error,
             representative_page_id=group_result.representative_page_id,
+            merged_page_ids=group_result.duplicate_page_ids_marked,
             before_snapshot=before_snapshot,
+            failed_operation=group_result.failed_operation,
+            failed_completion=group_result.failed_completion,
         )
 
     return GroupApplyOutcome(

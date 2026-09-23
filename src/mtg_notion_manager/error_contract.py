@@ -30,6 +30,7 @@ from mtg_notion_manager.exceptions import (
     UnsupportedSourceError,
 )
 from mtg_notion_manager.mutation_contract import MutationSummary
+from mtg_notion_manager.services.apply_price_link_dedupe import PriceLinkDedupeReportLoadError
 from mtg_notion_manager.services.card_resolution import UnverifiedNewCardError
 from mtg_notion_manager.services.single_card_title_update import (
     SingleUpdateConfigError,
@@ -94,6 +95,15 @@ class ErrorCode:
     #: ErrorCategory.PARTIAL_MUTATION専用。execute_import_cards()の正常return後、
     #: 1件以上の書き込みがfailed/unknownだった場合(mutationフィールドで詳細を返す)。
     CARD_WRITE_PARTIAL_FAILURE = "CARD_WRITE_PARTIAL_FAILURE"
+    #: ErrorCategory.PARTIAL_MUTATION専用。dedupe共有write engine
+    #: (dedupe_cards.execute_dedupe_plan())が正常return後、1件以上の書き込みが
+    #: failed/unknownだった場合(mutationフィールドで詳細を返す)。dedupe-family
+    #: 共有のcode(apply-price-link-dedupe固有ではない――将来apply-dedupe-plan/
+    #: dedupe-cardsへ--error-jsonを展開する際も同じcodeを再利用する想定)。
+    DEDUPE_WRITE_PARTIAL_FAILURE = "DEDUPE_WRITE_PARTIAL_FAILURE"
+    #: apply-price-link-dedupeの--targets-reportが読み込めない/不正な場合
+    #: (元はOSError/ValueErrorとして送出される。CLI境界でのみ狭くwrapする)。
+    TARGETS_REPORT_LOAD_FAILED = "TARGETS_REPORT_LOAD_FAILED"
 
 
 # Exception type -> (error_category, error_code). Checked in order; a subtype
@@ -132,6 +142,11 @@ _EXCEPTION_CLASSIFICATION: tuple[tuple[type[Exception], str, str], ...] = (
     # isinstance判定によりここへ一致する。PARTIAL_MUTATION/CARD_WRITE_PARTIAL_FAILUREへは
     # 潰さず、identity/card-resolution系の実際の原因分類のまま返す。
     (UnverifiedNewCardError, ErrorCategory.IDENTITY_AMBIGUITY, ErrorCode.UNVERIFIED_NEW_CARD),
+    (
+        PriceLinkDedupeReportLoadError,
+        ErrorCategory.INPUT_VALIDATION,
+        ErrorCode.TARGETS_REPORT_LOAD_FAILED,
+    ),
     (NotionAPIError, ErrorCategory.PRODUCTION_API, ErrorCode.NOTION_API_ERROR),
     (MtgNotionManagerError, ErrorCategory.INTERNAL, ErrorCode.UNCLASSIFIED_DOMAIN_ERROR),
 )

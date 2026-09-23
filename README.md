@@ -48,9 +48,9 @@ mtg-notion-manager import <URL>
 - 発売セット名・色名はNotion側の選択肢と完全一致する必要がある。未知の値は `src/mtg_notion_manager/mapping.py` に追記してから再実行すること。マッピングされていない値でNotionに新しい選択肢を自動追加することはしない。
 - 外部ページの取得失敗、パース失敗、Notion API失敗時は、不完全なレコードを書き込まずエラー終了する。
 
-## `--error-json`(構造化エラー出力、対応: `import` / `import-article` / `apply-single-title-update` / `verify-import` / `doctor` / `audit-duplicates` / `review-duplicate-conflicts` / `plan-title-updates` / `import-cards`)
+## `--error-json`(構造化エラー出力、対応: `import` / `import-article` / `apply-single-title-update` / `verify-import` / `doctor` / `audit-duplicates` / `review-duplicate-conflicts` / `plan-title-updates` / `import-cards` / `apply-price-link-dedupe`)
 
-`import`・`import-article`・`apply-single-title-update`・`verify-import`・`doctor`・`audit-duplicates`・`review-duplicate-conflicts`・`plan-title-updates`・`import-cards` の9コマンドは `--error-json` フラグをサポートする(12コマンド中9)。
+`import`・`import-article`・`apply-single-title-update`・`verify-import`・`doctor`・`audit-duplicates`・`review-duplicate-conflicts`・`plan-title-updates`・`import-cards`・`apply-price-link-dedupe` の10コマンドは `--error-json` フラグをサポートする(12コマンド中10)。`apply-dedupe-plan`・`dedupe-cards` は未対応(将来のFOLLOW_UP)。
 
 - **成功時の出力・終了コードは一切変更しない**(`--error-json` を付けても付けなくても同じ)。
 - **失敗時のみ**、人間向けメッセージの代わりに、以下5フィールドだけを持つ1行の純粋なJSONオブジェクトをstdoutへ出力する(Rich装飾・ANSIエスケープ・前後の文言は一切含まない)。
@@ -81,7 +81,15 @@ mtg-notion-manager import <URL>
   - **`mutation.recovery_action` はNotion mutation stateの解消についてだけを表し、コマンド自体のtop-levelエラー(`error_category`/`error_code`)を解消・代替するものではない**。特に `recovery_action: NONE` は「mutation側の追加対応は不要」を意味するだけであり、「コマンド全体が成功した」ことも「他に何も確認しなくてよい」ことも意味しない。例えば `PartialImportAbortedError`(カードのidentity確認失敗によるbatch中断)で、中断より前の書き込みがすべて成功していた場合、`mutation` は `state: MUTATION_SUCCEEDED` / `recovery_action: NONE` になるが、`error_category: IDENTITY_AMBIGUITY` / `error_code: UNVERIFIED_NEW_CARD` は依然として実際に発生した中断原因を表しており、その解消は別途必要である。自動化スクリプトは常に **`error_category`/`error_code`(コマンドが正常に完了しなかった理由)と `mutation.recovery_action`(Notion書き込み結果について必要な対応)の両方を独立に確認**すること――片方だけを見て判断してはならない。
   - **`--error-json` は `--apply` を意味しない**。`--dry-run`・`--apply`省略時の意味は変更されておらず、正常終了(終了コード0)の出力・内容も変更しない。
   - `--error-json` モード時は、計画表示(サマリ・詳細テーブル)を含むすべての人間向け出力を一時バッファへ書き、成功が確定した場合のみそのままstdoutへ出力する。エラーJSONを出力する場合はバッファの内容を破棄するため、**`import`とは異なり、`import-cards`のエラー出力は常にstdout全体が純粋な1個のJSONオブジェクトになる**(末尾行のみの例外はない)。
-- Typer/Clickのusage error(必須引数欠落など)や、この9コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
+- **`apply-price-link-dedupe` は、dedupe-family共有write engine(`dedupe_cards.execute_dedupe_plan()`)の実行結果に接続する最初のdedupeコマンド**:
+  - **書き込み以前に終了する実行エラー**(設定読み込み失敗・`NOTION_CARD_DATA_SOURCE_ID`未設定・`--targets-report`の読み込み/パース失敗)は`schema_version: 1`(`mutation`フィールドなし)のまま。
+  - **不明な `--scope` の指定・`--scope manual` での代表ページID未指定のようなCLIの使い方の誤りはExecution Errorではないため対象外**(既存の人間向けメッセージ・終了コード1を維持し、Error Contract JSONへは変換しない――`review-duplicate-conflicts`の不明な`--category`指定と同じ境界)。
+  - **1件以上のNotion書き込みを試みたうえでの失敗**は`schema_version: 2`となり、`error_category: PARTIAL_MUTATION` / `error_code: DEDUPE_WRITE_PARTIAL_FAILURE`に加えて`mutation`フィールドを含む。`DEDUPE_WRITE_PARTIAL_FAILURE`はdedupe-family共有のcodeであり、`apply-price-link-dedupe`専用ではない(将来`apply-dedupe-plan`/`dedupe-cards`へ`--error-json`を展開する際も同じcodeを再利用する想定)。
+  - `mutation.state`が`MUTATION_STATE_UNKNOWN`の場合、`recovery_action`は必ず`RECONCILE_BEFORE_RETRY`(盲目的な自動リトライを許可する`RETRY_ALLOWED`にはならない)。既知の失敗のみの場合も`RETRY_ALLOWED`は出力せず`MANUAL_REVIEW_REQUIRED`に留める――dedupeの書き込みはidempotentな`update_page()`だが、鮮度状態やグループ構成が変化し得るため、計画全体を盲目的に再実行する安全性は未証明である。
+  - **カナリア3件のhard cap・鮮度再チェック(stale skip)・実行ログ生成(`write_price_link_apply_log()`)は`--error-json`の有無に関わらず一切変更しない**。特に鮮度不一致によるスキップのみの結果は正常outcomeであり、`--error-json`でもError Contract JSONを出力しない。
+  - `--error-json`は`--apply`を意味しない。`--dry-run`・`--apply`省略時の意味・正常終了時の出力・終了コードは変更しない。
+  - `--error-json`モード時は、対象一覧表示・適用結果テーブルを含むすべての人間向け出力を一時バッファへ書き、成功が確定した場合のみそのままstdoutへ出力する(`import-cards`と同じ方式――stdout全体が常に純粋な1個のJSONオブジェクトになる)。
+- Typer/Clickのusage error(必須引数欠落など)や、この10コマンド以外のコマンドは対象外(将来のFOLLOW_UP)。
 
 ## 開発
 

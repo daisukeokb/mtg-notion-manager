@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
+
+from mtg_notion_manager.exceptions import NotionAPIError
 from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
 from mtg_notion_manager.services import apply_price_link_dedupe as apply_mod
 from mtg_notion_manager.services.audit_duplicates import ExclusionList
+from mtg_notion_manager.services.dedupe_cards import FailedGroupOperation, GroupWriteCompletion
 from mtg_notion_manager.services.review_duplicate_conflicts import (
     CATEGORY_MANUAL,
     CATEGORY_PRICE_ONLY,
@@ -99,6 +103,43 @@ def _page(
 
 def _repo(pages: list[dict]) -> tuple[DedupeRepository, FakeNotionClient]:
     client = FakeNotionClient(pages)
+    return DedupeRepository(client, DATA_SOURCE_ID), client
+
+
+def _http_status_error(status_code: int = 400) -> httpx.HTTPStatusError:
+    request = httpx.Request("PATCH", "https://api.notion.com/v1/pages/x")
+    response = httpx.Response(status_code, request=request, text="notion error body")
+    return httpx.HTTPStatusError("HTTP error", request=request, response=response)
+
+
+def _timeout_exception() -> httpx.TimeoutException:
+    return httpx.TimeoutException("timed out")
+
+
+class FailingWithCauseNotionClient(FakeNotionClient):
+    """指定したpage_idへのupdate_page()呼び出し時に、指定したcauseを持つ
+    NotionAPIErrorを送出する(実際のNotionClient._request()の
+    `raise NotionAPIError(...) from exc` 連鎖をそのまま模したfake)。"""
+
+    def __init__(
+        self,
+        pages: list[dict] | None = None,
+        fail_on_page_ids: dict[str, BaseException] | None = None,
+    ) -> None:
+        super().__init__(pages)
+        self.fail_on_page_ids = fail_on_page_ids or {}
+
+    def update_page(self, page_id: str, properties: dict) -> dict:
+        cause = self.fail_on_page_ids.get(page_id)
+        if cause is not None:
+            raise NotionAPIError(f"Notion API呼び出しに失敗しました: {page_id}") from cause
+        return super().update_page(page_id, properties)
+
+
+def _cause_repo(
+    pages: list[dict], fail_on_page_ids: dict[str, BaseException]
+) -> tuple[DedupeRepository, FailingWithCauseNotionClient]:
+    client = FailingWithCauseNotionClient(pages, fail_on_page_ids=fail_on_page_ids)
     return DedupeRepository(client, DATA_SOURCE_ID), client
 
 
@@ -273,6 +314,73 @@ class TestApplyPriceLinkTargetsApply:
 
         assert outcomes[0].status == apply_mod.STATUS_FAILED
         assert client.update_calls == []
+
+    def test_manual_representative_missing_has_no_failure_metadata(self) -> None:
+        """代表未指定はNotion書き込みに到達する前の失敗であり、
+        failed_operation/failed_completionは両方Noneのまま(正当な0 mutation)。"""
+        tie_created = "2024-01-01T00:00:00.000Z"
+        tie_edited = "2024-06-01T00:00:00.000Z"
+        pages = [
+            _page("p1", "血染めのぬかるみ", created_time=tie_created, last_edited_time=tie_edited),
+            _page("p2", "血染めのぬかるみ", created_time=tie_created, last_edited_time=tie_edited),
+        ]
+        repo, client = _repo(pages)
+        targets = [
+            apply_mod.PriceLinkTargetGroup(
+                "血染めのぬかるみ", CATEGORY_MANUAL, ["p1", "p2"], [], [], 0
+            )
+        ]
+
+        outcomes = apply_mod.apply_price_link_targets(repo, targets, apply=True)
+
+        assert outcomes[0].failed_operation is None
+        assert outcomes[0].failed_completion is None
+
+    def test_representative_write_known_failure_is_propagated(self) -> None:
+        """execute_dedupe_plan()由来の実際のNotion書き込み失敗は、
+        failed_operation/failed_completionへ正確に反映される。"""
+        pages = [
+            _page("p1", "沼", english_name="Swamp", price=3500),
+            _page("p2", "沼", price=1800),
+        ]
+        repo, client = _cause_repo(pages, fail_on_page_ids={"p1": _http_status_error()})
+        targets = [
+            apply_mod.PriceLinkTargetGroup(
+                "沼", CATEGORY_PRICE_ONLY, ["p1", "p2"], [1800, 3500], [], 0
+            )
+        ]
+
+        outcomes = apply_mod.apply_price_link_targets(repo, targets, apply=True)
+
+        outcome = outcomes[0]
+        assert outcome.status == apply_mod.STATUS_FAILED
+        assert outcome.failed_operation == FailedGroupOperation.REPRESENTATIVE_UPDATE
+        assert outcome.failed_completion == GroupWriteCompletion.KNOWN_FAILED
+        assert outcome.merged_page_ids == []
+
+    def test_mark_write_unknown_completion_preserves_prefix(self) -> None:
+        """代表成功→A成功→Bでタイムアウト失敗した場合、成功済みprefix(A)が
+        merged_page_idsへ保持され、failed_operation/failed_completionが
+        構造的に判定される。"""
+        pages = [
+            _page("p1", "沼", english_name="Swamp", price=3500),
+            _page("p2", "沼", price=1800),
+            _page("p3", "沼", price=1900),
+        ]
+        repo, client = _cause_repo(pages, fail_on_page_ids={"p3": _timeout_exception()})
+        targets = [
+            apply_mod.PriceLinkTargetGroup(
+                "沼", CATEGORY_PRICE_ONLY, ["p1", "p2", "p3"], [1800, 1900, 3500], [], 0
+            )
+        ]
+
+        outcomes = apply_mod.apply_price_link_targets(repo, targets, apply=True)
+
+        outcome = outcomes[0]
+        assert outcome.status == apply_mod.STATUS_FAILED
+        assert outcome.merged_page_ids == ["p2"]
+        assert outcome.failed_operation == FailedGroupOperation.MARK_MERGED
+        assert outcome.failed_completion == GroupWriteCompletion.UNKNOWN
 
     def test_no_delete_method_exists_on_client(self) -> None:
         pages = [_page("p1", "沼", price=3500), _page("p2", "沼", price=1800)]
