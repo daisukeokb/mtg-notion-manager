@@ -13,6 +13,8 @@ from __future__ import annotations
 import datetime
 from dataclasses import dataclass, field
 
+import httpx
+
 from mtg_notion_manager.exceptions import (
     ConflictError,
     NotionAPIError,
@@ -475,6 +477,45 @@ def _today() -> str:
     return datetime.date.today().isoformat()
 
 
+class FailedGroupOperation:
+    """GroupApplyResult(error!=None)で、実際に失敗したNotion書き込み種別。
+
+    representative_updated(既にどこまで進んだかの事実)から決定論的に決まる
+    (_apply_one_group()の呼び出し側は、代表レコード更新が既に成功していたかを
+    既に知っているため、NotionAPIError自体から推測する必要はない)。
+
+    dedupe-family専用(import_cards.pyのFailedWriteOperationとは意図的に
+    別型にしている――dedupe_cards.pyがimport_cards.pyへ依存する逆向きの
+    domain couplingを新設しないため)。
+    """
+
+    REPRESENTATIVE_UPDATE = "representative_update"
+    MARK_MERGED = "mark_merged"
+
+
+class GroupWriteCompletion:
+    """GroupApplyResult(error!=None)で、失敗した書き込みの完了状態についてわかっている事実。
+
+    NotionAPIError.__cause__ の型だけから判定する(str(exc)のメッセージ文字列は
+    一切見ない)。サーバーが明示的なHTTPエラー応答を返した場合だけをKNOWN_FAILEDとし、
+    それ以外(タイムアウト・その他の接続エラー・原因不明)はすべて安全側の
+    UNKNOWNへ倒す。dedupe-familyの書き込みはすべてupdate_page()(idempotentな
+    リトライ対象)だが、「べき等なので再試行対象」であることと「完了状態が
+    確定している」ことは同義ではないため、リトライを使い切った後のタイムアウトも
+    UNKNOWNとする(import-cardsのimport_cards.WriteCompletionと同じ方針。
+    型は別だが意味は揃えている)。
+    """
+
+    KNOWN_FAILED = "known_failed"
+    UNKNOWN = "unknown"
+
+
+def _completion_from_notion_api_error(exc: NotionAPIError) -> str:
+    if isinstance(exc.__cause__, httpx.HTTPStatusError):
+        return GroupWriteCompletion.KNOWN_FAILED
+    return GroupWriteCompletion.UNKNOWN
+
+
 @dataclass(frozen=True)
 class GroupApplyResult:
     card_name: str
@@ -482,6 +523,27 @@ class GroupApplyResult:
     representative_updated: bool
     duplicate_page_ids_marked: list[str] = field(default_factory=list)
     error: str | None = None
+    #: error!=Noneのときのみ設定される(FailedGroupOperationの値)。
+    failed_operation: str | None = None
+    #: error!=Noneのときのみ設定される(GroupWriteCompletionの値)。
+    failed_completion: str | None = None
+
+    def __post_init__(self) -> None:
+        has_failed_operation = self.failed_operation is not None
+        has_failed_completion = self.failed_completion is not None
+        if has_failed_operation != has_failed_completion:
+            raise ValueError(
+                "GroupApplyResult.failed_operation と .failed_completion は両方"
+                "設定されるか、両方Noneでなければならない "
+                f"(failed_operation={self.failed_operation!r}, "
+                f"failed_completion={self.failed_completion!r})."
+            )
+        if (self.error is not None) != has_failed_operation:
+            raise ValueError(
+                "GroupApplyResult.error が設定されている場合、かつその場合のみ"
+                "failed_operation/failed_completionが設定されていなければならない "
+                f"(error={self.error!r}, failed_operation={self.failed_operation!r})."
+            )
 
 
 @dataclass(frozen=True)
@@ -517,6 +579,11 @@ def _apply_one_group(merge_plan: MergePlan, repo: DedupeRepository) -> GroupAppl
     (代表レコード更新・個々の重複ページの統合済み設定)はresultへ正確に反映する。
     後続の書き込みが失敗したことを理由に、既に成功した代表レコード更新を
     Falseへ戻したり、既に成功した重複ページのmark記録を失ったりしない。
+
+    失敗時は、representative_updatedが既にTrueかどうかから
+    failed_operation(REPRESENTATIVE_UPDATE/MARK_MERGED)を決定論的に判定し、
+    NotionAPIError.__cause__の型だけからfailed_completion
+    (KNOWN_FAILED/UNKNOWN)を判定する(str(exc)のメッセージ文字列は一切見ない)。
     """
     representative_updated = False
     marked: list[str] = []
@@ -537,10 +604,17 @@ def _apply_one_group(merge_plan: MergePlan, repo: DedupeRepository) -> GroupAppl
             duplicate_page_ids_marked=marked,
         )
     except NotionAPIError as exc:
+        failed_operation = (
+            FailedGroupOperation.MARK_MERGED
+            if representative_updated
+            else FailedGroupOperation.REPRESENTATIVE_UPDATE
+        )
         return GroupApplyResult(
             card_name=merge_plan.group.card_name,
             representative_page_id=merge_plan.representative_page_id,
             representative_updated=representative_updated,
             duplicate_page_ids_marked=marked,
             error=str(exc),
+            failed_operation=failed_operation,
+            failed_completion=_completion_from_notion_api_error(exc),
         )
