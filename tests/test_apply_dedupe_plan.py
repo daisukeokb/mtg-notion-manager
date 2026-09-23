@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import httpx
+
 from mtg_notion_manager.exceptions import NotionAPIError
 from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
 from mtg_notion_manager.services import apply_dedupe_plan as apply_mod
 from mtg_notion_manager.services.audit_duplicates import ExclusionList
+from mtg_notion_manager.services.dedupe_cards import FailedGroupOperation, GroupWriteCompletion
 
 DATA_SOURCE_ID = "81eec501-574b-4222-ad69-87a6f68fdf2b"
 
@@ -76,6 +79,16 @@ def _page(
 def _repo(pages: list[dict]) -> tuple[DedupeRepository, FakeNotionClient]:
     client = FakeNotionClient(pages)
     return DedupeRepository(client, DATA_SOURCE_ID), client
+
+
+def _http_status_error(status_code: int = 400) -> httpx.HTTPStatusError:
+    request = httpx.Request("PATCH", "https://api.notion.com/v1/pages/x")
+    response = httpx.Response(status_code, request=request, text="notion error body")
+    return httpx.HTTPStatusError("HTTP error", request=request, response=response)
+
+
+def _timeout_exception() -> httpx.TimeoutException:
+    return httpx.TimeoutException("timed out")
 
 
 def _write_report(tmp_path: Path, items: list[dict]) -> Path:
@@ -217,6 +230,64 @@ class TestApplyDedupeBatchApply:
         statuses = {o.card_name: o.status for o in outcomes}
         assert statuses["沼"] == apply_mod.STATUS_FAILED
         assert statuses["山"] == apply_mod.STATUS_APPLIED
+
+    def test_representative_write_known_failure_is_propagated(self) -> None:
+        """execute_dedupe_plan()由来の実際のNotion書き込み失敗は、
+        failed_operation/failed_completionへ正確に反映される。"""
+        pages = [
+            _page("p1", "沼", english_name="Swamp", deck_ids=["d1"]),
+            _page("p2", "沼", deck_ids=["d1", "d2"]),
+        ]
+        repo, client = _repo(pages)
+        original_update = client.update_page
+
+        def flaky_update(page_id: str, properties: dict) -> dict:
+            if page_id == "p1":
+                raise NotionAPIError(
+                    "Notion API呼び出しに失敗しました: p1"
+                ) from _http_status_error()
+            return original_update(page_id, properties)
+
+        client.update_page = flaky_update  # type: ignore[method-assign]
+        groups = [apply_mod.ReportGroup("沼", 2, 0, "p1", ["p1", "p2"])]
+
+        outcomes = apply_mod.apply_dedupe_batch(repo, groups, apply=True)
+
+        outcome = outcomes[0]
+        assert outcome.status == apply_mod.STATUS_FAILED
+        assert outcome.failed_operation == FailedGroupOperation.REPRESENTATIVE_UPDATE
+        assert outcome.failed_completion == GroupWriteCompletion.KNOWN_FAILED
+        assert outcome.merged_page_ids == []
+
+    def test_mark_write_unknown_completion_preserves_prefix(self) -> None:
+        """代表成功→A成功→Bでタイムアウト失敗した場合、成功済みprefix(A)が
+        merged_page_idsへ保持され、failed_operation/failed_completionが
+        構造的に判定される。"""
+        pages = [
+            _page("p1", "沼", english_name="Swamp", deck_ids=["d1"]),
+            _page("p2", "沼", deck_ids=["d1"]),
+            _page("p3", "沼", deck_ids=["d1"]),
+        ]
+        repo, client = _repo(pages)
+        original_update = client.update_page
+
+        def flaky_update(page_id: str, properties: dict) -> dict:
+            if page_id == "p3":
+                raise NotionAPIError(
+                    "Notion APIへの接続がタイムアウトしました: p3"
+                ) from _timeout_exception()
+            return original_update(page_id, properties)
+
+        client.update_page = flaky_update  # type: ignore[method-assign]
+        groups = [apply_mod.ReportGroup("沼", 3, 0, "p1", ["p1", "p2", "p3"])]
+
+        outcomes = apply_mod.apply_dedupe_batch(repo, groups, apply=True)
+
+        outcome = outcomes[0]
+        assert outcome.status == apply_mod.STATUS_FAILED
+        assert outcome.merged_page_ids == ["p2"]
+        assert outcome.failed_operation == FailedGroupOperation.MARK_MERGED
+        assert outcome.failed_completion == GroupWriteCompletion.UNKNOWN
 
 
 class TestStalenessDetection:

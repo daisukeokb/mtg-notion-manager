@@ -15,13 +15,13 @@ import pytest
 from typer.testing import CliRunner
 
 from mtg_notion_manager import cli
-from mtg_notion_manager.apply_price_link_dedupe_mutation_adapter import (
-    ResultFidelityViolationError as PriceLinkResultFidelityViolationError,
-)
-from mtg_notion_manager.apply_price_link_dedupe_mutation_adapter import (
-    build_price_link_dedupe_mutation_summary,
-)
 from mtg_notion_manager.config import Config, ConfigError
+from mtg_notion_manager.dedupe_apply_mutation_adapter import (
+    ResultFidelityViolationError as DedupeApplyResultFidelityViolationError,
+)
+from mtg_notion_manager.dedupe_apply_mutation_adapter import (
+    build_dedupe_apply_mutation_summary,
+)
 from mtg_notion_manager.error_contract import SCHEMA_VERSION, ErrorCategory, ErrorCode
 from mtg_notion_manager.exceptions import (
     AmbiguousCardMatchError,
@@ -42,6 +42,10 @@ from mtg_notion_manager.models import (
     ParsedDeckList,
 )
 from mtg_notion_manager.services import title_update_dry_run as planner
+from mtg_notion_manager.services.apply_dedupe_plan import ApplyLogPaths as DedupePlanApplyLogPaths
+from mtg_notion_manager.services.apply_dedupe_plan import (
+    GroupApplyOutcome as DedupePlanGroupApplyOutcome,
+)
 from mtg_notion_manager.services.apply_price_link_dedupe import ApplyLogPaths, GroupApplyOutcome
 from mtg_notion_manager.services.audit_duplicates import AuditReportPaths, GroupAudit
 from mtg_notion_manager.services.dedupe_cards import FailedGroupOperation, GroupWriteCompletion
@@ -3499,8 +3503,8 @@ def test_apply_price_link_dedupe_mutation_adapter_fail_closed_on_inconsistent_me
         failed_completion=None,
     )
 
-    with pytest.raises(PriceLinkResultFidelityViolationError):
-        build_price_link_dedupe_mutation_summary([broken_outcome])
+    with pytest.raises(DedupeApplyResultFidelityViolationError):
+        build_dedupe_apply_mutation_summary([broken_outcome])
 
 
 def test_apply_price_link_dedupe_canary_hard_cap_unchanged_with_error_json(
@@ -3582,3 +3586,696 @@ def test_apply_price_link_dedupe_stale_only_error_json_stays_normal(
     assert result.exit_code == 0
     with pytest.raises(json.JSONDecodeError):
         json.loads(result.stdout)
+
+
+# --- apply-dedupe-plan ----------------------------------------------------------
+
+
+def _dedupe_plan_report_item(card_name: str, page_ids: list[str], category: str = "auto") -> dict:
+    return {
+        "card_name": card_name,
+        "category": category,
+        "duplicate_count": len(page_ids),
+        "recommended_representative_id": page_ids[0],
+        "merged_deck_relation_count": 0,
+        "pages": [{"page_id": pid} for pid in page_ids],
+    }
+
+
+def _write_dedupe_plan_report(tmp_path: Path, items: list[dict]) -> Path:
+    path = tmp_path / "audit.json"
+    path.write_text(json.dumps(items), encoding="utf-8")
+    return path
+
+
+def _patch_dedupe_plan_notion(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_notion(monkeypatch)
+    monkeypatch.setattr(cli, "load_exclusions", lambda: object())
+
+
+def test_apply_dedupe_plan_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["apply-dedupe-plan", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+def test_apply_dedupe_plan_error_json_config_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _raise_config() -> Config:
+        raise ConfigError("APIキーが未設定です")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config))
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["apply-dedupe-plan", "--audit-report", str(report_path), "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_apply_dedupe_plan_error_json_missing_card_data_source_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def _config_without_card_db() -> Config:
+        return Config(
+            notion_api_key="secret_test",
+            commander_data_source_id="commander-ds-id",
+            card_data_source_id=None,
+        )
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_config_without_card_db))
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["apply-dedupe-plan", "--audit-report", str(report_path), "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_apply_dedupe_plan_error_json_report_load_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "apply-dedupe-plan",
+            "--audit-report",
+            str(tmp_path / "missing.json"),
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.INPUT_VALIDATION,
+        code=ErrorCode.AUDIT_REPORT_LOAD_FAILED,
+    )
+
+
+def test_apply_dedupe_plan_error_json_invalid_classification_stays_human(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """CLI usage error(不明な--classification)はError Contractの対象外(§11)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "apply-dedupe-plan",
+            "--audit-report",
+            str(report_path),
+            "--classification",
+            "needs_review",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 1
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+    assert "エラー" in result.stdout
+
+
+def test_apply_dedupe_plan_error_json_dry_run_matches_human_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+    outcome = DedupePlanGroupApplyOutcome(
+        card_name="沼", status="planned", representative_page_id="p1"
+    )
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--dry-run",
+    ]
+
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_apply_dedupe_plan_error_json_success_matches_human_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+    outcome = DedupePlanGroupApplyOutcome(
+        card_name="沼", status="applied", representative_page_id="p1", merged_page_ids=["p2"]
+    )
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    monkeypatch.setattr(
+        cli,
+        "write_apply_log",
+        lambda outcomes, audit_report_path, output_dir, applied, timestamp=None: (
+            DedupePlanApplyLogPaths(json_path=Path(output_dir) / "log.json")
+        ),
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+    ]
+
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_apply_dedupe_plan_error_json_stale_only_matches_human_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+    outcome = DedupePlanGroupApplyOutcome(
+        card_name="沼", status="skipped_stale", reason="現在の分類が変化しています"
+    )
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+    ]
+
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_apply_dedupe_plan_error_json_not_duplicate_only_matches_human_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+    outcome = DedupePlanGroupApplyOutcome(
+        card_name="沼", status="skipped_no_longer_duplicate", reason="既に統合済みです"
+    )
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+    ]
+
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def _dedupe_plan_known_failed_outcome(
+    card_name: str,
+    *,
+    operation: str = FailedGroupOperation.MARK_MERGED,
+    merged: list[str] | None = None,
+) -> DedupePlanGroupApplyOutcome:
+    return DedupePlanGroupApplyOutcome(
+        card_name=card_name,
+        status="failed",
+        representative_page_id="p1",
+        merged_page_ids=merged or [],
+        error=f"Notion API呼び出しに失敗しました: {card_name}",
+        failed_operation=operation,
+        failed_completion=GroupWriteCompletion.KNOWN_FAILED,
+    )
+
+
+def _dedupe_plan_unknown_completion_outcome(
+    card_name: str,
+    *,
+    operation: str = FailedGroupOperation.MARK_MERGED,
+    merged: list[str] | None = None,
+) -> DedupePlanGroupApplyOutcome:
+    return DedupePlanGroupApplyOutcome(
+        card_name=card_name,
+        status="failed",
+        representative_page_id="p1",
+        merged_page_ids=merged or [],
+        error=f"Notion APIへの接続がタイムアウトしました: {card_name}",
+        failed_operation=operation,
+        failed_completion=GroupWriteCompletion.UNKNOWN,
+    )
+
+
+def test_apply_dedupe_plan_error_json_known_partial_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T45: 代表成功+A成功後、Bのmarkが既知失敗。実行ログも引き続き書かれる。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2", "p3"])]
+    )
+    outcome = _dedupe_plan_known_failed_outcome("沼", merged=["A"])
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+        "--error-json",
+    ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "PARTIAL_MUTATION"
+    assert mutation["attempted"] == 3
+    assert mutation["succeeded"] == 2
+    assert mutation["failed"] == 1
+    assert mutation["unknown"] == 0
+    assert mutation["recovery_action"] == "MANUAL_REVIEW_REQUIRED"
+    assert mutation["operations"] == [{"key": "沼", "action": "mark_merged", "state": "failed"}]
+    # JSON purity要件はexecution log抑止を意味しない(§32)。
+    log_files = list(tmp_path.glob("dedupe-apply-*.json"))
+    assert len(log_files) == 1
+
+
+def test_apply_dedupe_plan_error_json_unknown_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T46: タイムアウトによる完了状態不明。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2", "p3"])]
+    )
+    outcome = _dedupe_plan_unknown_completion_outcome("沼", merged=["A"])
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+        "--error-json",
+    ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["attempted"] == 3
+    assert mutation["succeeded"] == 2
+    assert mutation["failed"] == 0
+    assert mutation["unknown"] == 1
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+    assert mutation["operations"] == [{"key": "沼", "action": "mark_merged", "state": "unknown"}]
+
+
+def test_apply_dedupe_plan_error_json_representative_known_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T47: 代表更新自体が既知失敗。mark writeは0件。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+    outcome = _dedupe_plan_known_failed_outcome(
+        "沼", operation=FailedGroupOperation.REPRESENTATIVE_UPDATE
+    )
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+        "--error-json",
+    ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_FAILED"
+    assert mutation["attempted"] == 1
+    assert mutation["succeeded"] == 0
+    assert mutation["failed"] == 1
+    assert mutation["recovery_action"] == "MANUAL_REVIEW_REQUIRED"
+    assert mutation["operations"] == [
+        {"key": "沼", "action": "representative_update", "state": "failed"}
+    ]
+
+
+def test_apply_dedupe_plan_error_json_representative_unknown(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T48: 代表更新自体がタイムアウトによる完了状態不明。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+    outcome = _dedupe_plan_unknown_completion_outcome(
+        "沼", operation=FailedGroupOperation.REPRESENTATIVE_UPDATE
+    )
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+        "--error-json",
+    ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["attempted"] == 1
+    assert mutation["unknown"] == 1
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+
+
+def test_apply_dedupe_plan_error_json_multiple_groups(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T49: A成功(2 writes) + B既知部分失敗(2成功+1失敗)。
+    + Cスキップ(stale) + Dスキップ(not-duplicate)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path,
+        [
+            _dedupe_plan_report_item("A", ["p1", "p2"]),
+            _dedupe_plan_report_item("B", ["p3", "p4", "p5"]),
+            _dedupe_plan_report_item("C", ["p6", "p7"]),
+            _dedupe_plan_report_item("D", ["p8", "p9"]),
+        ],
+    )
+    outcome_a = DedupePlanGroupApplyOutcome(
+        card_name="A", status="applied", representative_page_id="p1", merged_page_ids=["p2"]
+    )
+    outcome_b = _dedupe_plan_known_failed_outcome("B", merged=["p4"])
+    outcome_c = DedupePlanGroupApplyOutcome(
+        card_name="C", status="skipped_stale", reason="鮮度不一致"
+    )
+    outcome_d = DedupePlanGroupApplyOutcome(
+        card_name="D", status="skipped_no_longer_duplicate", reason="既に統合済み"
+    )
+    monkeypatch.setattr(
+        cli,
+        "apply_dedupe_batch",
+        lambda repo, targets, apply, exclusions=None: [outcome_a, outcome_b, outcome_c, outcome_d],
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+        "--error-json",
+    ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["attempted"] == 5
+    assert mutation["succeeded"] == 4
+    assert mutation["failed"] == 1
+    assert mutation["unknown"] == 0
+
+
+def test_apply_dedupe_plan_zero_write_failed_group_not_fabricated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """T50: status=="failed"だがfailed_operation/failed_completionが両方None
+    (Notion書き込みに到達する前の失敗)の場合、mutationへ捏造した書き込み件数を
+    含めない(attempted=0のまま)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path, [_dedupe_plan_report_item("沼", ["p1", "p2"])]
+    )
+    outcome = DedupePlanGroupApplyOutcome(
+        card_name="沼", status="failed", error="代表選択が一意に決定できません"
+    )
+    monkeypatch.setattr(
+        cli, "apply_dedupe_batch", lambda repo, targets, apply, exclusions=None: [outcome]
+    )
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+        "--error-json",
+    ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="apply-dedupe-plan",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["attempted"] == 0
+    assert mutation["succeeded"] == 0
+    assert mutation["failed"] == 0
+    assert mutation["unknown"] == 0
+    assert mutation["state"] == "NO_MUTATION"
+    assert "operations" not in mutation
+
+
+def test_apply_dedupe_plan_mutation_adapter_fail_closed_on_inconsistent_metadata() -> None:
+    """T51: failed_operationとfailed_completionが片方だけ設定された壊れたoutcomeは
+    誤ったmutation JSONへ変換せずfail closedする(§21)。message文字列からの推測は
+    行わない。"""
+    broken_outcome = DedupePlanGroupApplyOutcome(
+        card_name="沼",
+        status="failed",
+        error="何か失敗しました",
+        failed_operation=FailedGroupOperation.MARK_MERGED,
+        failed_completion=None,
+    )
+
+    with pytest.raises(DedupeApplyResultFidelityViolationError):
+        build_dedupe_apply_mutation_summary([broken_outcome])
+
+
+def test_apply_dedupe_plan_limit_unchanged_with_error_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§29/T52: --error-json追加後も--limitのtarget selectionは変わらない。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path,
+        [
+            _dedupe_plan_report_item("A", ["p1", "p2"]),
+            _dedupe_plan_report_item("B", ["p3", "p4"]),
+            _dedupe_plan_report_item("C", ["p5", "p6"]),
+            _dedupe_plan_report_item("D", ["p7", "p8"]),
+            _dedupe_plan_report_item("E", ["p9", "p10"]),
+        ],
+    )
+    captured: dict[str, list] = {}
+
+    def fake_apply(repo: object, targets: list, apply: bool, exclusions: object = None) -> list:
+        captured["targets"] = targets
+        return [
+            DedupePlanGroupApplyOutcome(
+                card_name=t.card_name, status="applied", representative_page_id="p1"
+            )
+            for t in targets
+        ]
+
+    monkeypatch.setattr(cli, "apply_dedupe_batch", fake_apply)
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--limit",
+        "2",
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+    ]
+
+    human = runner.invoke(cli.app, args)
+    human_targets = list(captured["targets"])
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+    structured_targets = list(captured["targets"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert len(human_targets) == 2
+    assert [t.card_name for t in human_targets] == [t.card_name for t in structured_targets]
+
+
+def test_apply_dedupe_plan_offset_unchanged_with_error_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """§30/T53: --error-json追加後も--offset/--limitのtarget slicingは変わらない。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_dedupe_plan_notion(monkeypatch)
+    report_path = _write_dedupe_plan_report(
+        tmp_path,
+        [
+            _dedupe_plan_report_item("A", ["p1", "p2"]),
+            _dedupe_plan_report_item("B", ["p3", "p4"]),
+            _dedupe_plan_report_item("C", ["p5", "p6"]),
+            _dedupe_plan_report_item("D", ["p7", "p8"]),
+            _dedupe_plan_report_item("E", ["p9", "p10"]),
+        ],
+    )
+    captured: dict[str, list] = {}
+
+    def fake_apply(repo: object, targets: list, apply: bool, exclusions: object = None) -> list:
+        captured["targets"] = targets
+        return [
+            DedupePlanGroupApplyOutcome(
+                card_name=t.card_name, status="applied", representative_page_id="p1"
+            )
+            for t in targets
+        ]
+
+    monkeypatch.setattr(cli, "apply_dedupe_batch", fake_apply)
+    args = [
+        "apply-dedupe-plan",
+        "--audit-report",
+        str(report_path),
+        "--offset",
+        "2",
+        "--limit",
+        "2",
+        "--apply",
+        "--output-dir",
+        str(tmp_path),
+        "--error-json",
+    ]
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 0
+    assert [t.card_name for t in captured["targets"]] == ["C", "D"]

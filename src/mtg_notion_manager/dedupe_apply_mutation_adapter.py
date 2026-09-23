@@ -1,28 +1,34 @@
-"""apply-price-link-dedupe の実行結果を Error Contract v2 の MutationSummary へ変換する adapter。
+"""dedupe-familyの各apply系commandの実行結果を Error Contract v2 の MutationSummary
+へ変換する共有adapter。
 
-このモジュールは apply-price-link-dedupe 専用であり、dedupe-family全体への
-汎用フレームワークではない(apply-dedupe-plan/dedupe-cardsへの--error-json展開は
-別Work Unitのscope――そちらでも同じ考え方のadapterを個別に用意する)。
+対象commandは、dedupe_cards.pyの共有write engine(execute_dedupe_plan()/
+_apply_one_group())をそのまま使い、その結果を自分自身のGroupApplyOutcome
+(command固有のdataclass)へ変換するという同じ構造を持つ:
 
-input は dedupe_cards.py の共有write engine(execute_dedupe_plan()/
-_apply_one_group())が返した GroupApplyResult を、apply_price_link_dedupe.py
-自身が GroupApplyOutcome へ変換した結果である。
+- apply-price-link-dedupe(services/apply_price_link_dedupe.py, Phase 2K)
+- apply-dedupe-plan(services/apply_dedupe_plan.py, 本Work Unitで追加)
+
+このモジュールは、その2つ(将来的にはdedupe-cards自身も)のGroupApplyOutcomeが
+共通して持つべき最小限のfieldだけへ依存する``DedupeGroupOutcome`` Protocolを
+使い、command固有dataclassをimportせず疑似的な汎用mutationフレームワークにも
+拡張しない――あくまで「同じ形のcommand固有dataclassをどのcommandからでも渡せる」
+という最小限の一般化だけを行う(count/state導出/recovery_action決定ロジックの
+複製は一切作らない)。
 
 重要な事実(このモジュールの実装が前提とする):
-GroupApplyOutcome(status==STATUS_FAILED) には、実際には3種類の起源がある。
+GroupApplyOutcome(status=="failed")には、実際には複数の起源がありうる。
 1. execute_dedupe_plan()が実際にNotionへの書き込みを試みて失敗した
    (failed_operation/failed_completionが両方設定される――
    dedupe_cards.GroupApplyResultの__post_init__不変条件により、
    error!=Noneならこの2つは必ず両方設定されている)。
-2. --scope manual で代表ページIDが指定されなかった防御的チェック
-   (Notion書き込みは一切試みられていない)。
-3. build_dedupe_plan()のgroup_errors(代表選択・属性競合などNotion書き込みに
-   到達する前の失敗、Notion書き込みは一切試みられていない)。
+2. command固有の事前チェック(例: apply-price-link-dedupeの
+   --scope manual代表未指定、build_dedupe_plan()のgroup_errors)による、
+   Notion書き込みに到達する前の失敗(Notion書き込みは一切試みられていない)。
 
-2.と3.はfailed_operation/failed_completionが両方Noneのまま到達する、
-正当な「0 mutation」ケースである(RESULT FIDELITY VIOLATIONではない)。
-一方だけが設定されている状態(片方だけNone)は、上記の不変条件から見て
-構造的に到達しないはずだが、そのような矛盾したデータが渡された場合は
+2.はfailed_operation/failed_completionが両方Noneのまま到達する、正当な
+「0 mutation」ケースである(RESULT FIDELITY VIOLATIONではない)。一方だけが
+設定されている状態(片方だけNone)は、上記の不変条件から見て構造的に到達
+しないはずだが、そのような矛盾したデータが渡された場合は
 ResultFidelityViolationErrorとしてfail closedし、誤ったmutation JSONを
 生成しない。
 """
@@ -30,14 +36,13 @@ ResultFidelityViolationErrorとしてfail closedし、誤ったmutation JSONを
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Protocol
 
 from mtg_notion_manager.mutation_contract import MutationOperation, MutationSummary, RecoveryAction
-from mtg_notion_manager.services.apply_price_link_dedupe import (
-    STATUS_APPLIED,
-    STATUS_FAILED,
-    GroupApplyOutcome,
-)
 from mtg_notion_manager.services.dedupe_cards import FailedGroupOperation, GroupWriteCompletion
+
+_STATUS_APPLIED = "applied"
+_STATUS_FAILED = "failed"
 
 _MUTATION_OPERATION_ACTION = {
     FailedGroupOperation.REPRESENTATIVE_UPDATE: "representative_update",
@@ -45,8 +50,37 @@ _MUTATION_OPERATION_ACTION = {
 }
 
 
+class DedupeGroupOutcome(Protocol):
+    """このadapterが読み取る最小限のfieldだけを表す構造的contract。
+
+    apply_price_link_dedupe.GroupApplyOutcome / apply_dedupe_plan.GroupApplyOutcome
+    はどちらも(構造的に)このProtocolを満たす――共有write engineのfidelity fix
+    (Phase 2I/2J)が両方のcommand固有dataclassへ伝播されているため。
+
+    読み取り専用property(``@property``)として宣言する――両方のcommand固有
+    dataclassが``frozen=True``であり、mypyはfrozen dataclassの属性を
+    read-onlyとみなすため、Protocol側も書き込み可能なplain属性ではなく
+    read-only属性として宣言しないと構造的に一致しない。
+    """
+
+    @property
+    def card_name(self) -> str: ...
+
+    @property
+    def status(self) -> str: ...
+
+    @property
+    def merged_page_ids(self) -> list[str]: ...
+
+    @property
+    def failed_operation(self) -> str | None: ...
+
+    @property
+    def failed_completion(self) -> str | None: ...
+
+
 class ResultFidelityViolationError(RuntimeError):
-    """GroupApplyOutcome(status==STATUS_FAILED)に、failed_operationと
+    """GroupApplyOutcome(status=="failed")に、failed_operationと
     failed_completionのうち片方だけが設定されていた(両方Noneまたは両方
     非Noneのはずが崩れている)。
 
@@ -57,16 +91,17 @@ class ResultFidelityViolationError(RuntimeError):
     """
 
 
-def build_price_link_dedupe_mutation_summary(
-    outcomes: Sequence[GroupApplyOutcome],
+def build_dedupe_apply_mutation_summary(
+    outcomes: Sequence[DedupeGroupOutcome],
 ) -> MutationSummary:
     """GroupApplyOutcomeの列から、実際にNotion書き込みを試みた件数だけを数えた
     MutationSummaryを構築する。
 
-    STATUS_PLANNED/STATUS_SKIPPED_STALE/STATUS_SKIPPED_NOT_DUPLICATEは
-    0 mutation(Notionへ一切書き込みを試みていない)として数えない。
-    STATUS_FAILEDのうち、failed_operation/failed_completionが両方Noneの
-    ものも同様(Notion書き込みに到達する前の失敗)。
+    STATUS_PLANNED/STATUS_SKIPPED_STALE/STATUS_SKIPPED_NOT_DUPLICATEに相当する
+    (status!="applied" and status!="failed"の)結果は0 mutation(Notionへ一切
+    書き込みを試みていない)として数えない。status=="failed"のうち、
+    failed_operation/failed_completionが両方Noneのものも同様(Notion書き込みに
+    到達する前の失敗)。
 
     recovery_actionはunknown/failedの件数だけから導出する(RETRY_ALLOWEDは
     rerun-safetyが別途証明されるまでemitしない)。この導出方法はmutation_contract.py
@@ -79,10 +114,10 @@ def build_price_link_dedupe_mutation_summary(
     operations: list[MutationOperation] = []
 
     for outcome in outcomes:
-        if outcome.status == STATUS_APPLIED:
+        if outcome.status == _STATUS_APPLIED:
             succeeded += 1 + len(outcome.merged_page_ids)
             continue
-        if outcome.status != STATUS_FAILED:
+        if outcome.status != _STATUS_FAILED:
             continue  # PLANNED/SKIPPED_* はNotionへ一切書き込みを試みていない
 
         has_failed_operation = outcome.failed_operation is not None
