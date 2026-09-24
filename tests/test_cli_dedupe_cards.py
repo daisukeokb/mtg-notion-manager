@@ -69,19 +69,26 @@ class FakeNotionClientCtx:
 class FakeDedupeRepo:
     def __init__(self, missing_schema: list[str] | None = None) -> None:
         self._missing_schema = missing_schema or []
+        #: apply_schema_migration()が実際に呼ばれた回数・引数を記録する
+        #: (Phase 2N: --dry-run が --apply-schema のNotion書き込みを確実に
+        #: 抑制することを、結果の観測ではなく呼び出し回数そのもので固定する)。
+        self.apply_schema_migration_calls: list[list[str]] = []
 
     def missing_schema_properties(self) -> list[str]:
         return self._missing_schema
 
     def apply_schema_migration(self, property_names: list[str]) -> dict:
+        self.apply_schema_migration_calls.append(list(property_names))
         return {}
 
 
-def _patch_repo(monkeypatch: pytest.MonkeyPatch, missing_schema: list[str] | None = None) -> None:
+def _patch_repo(
+    monkeypatch: pytest.MonkeyPatch, missing_schema: list[str] | None = None
+) -> FakeDedupeRepo:
     monkeypatch.setattr(cli, "NotionClient", lambda api_key: FakeNotionClientCtx())
-    monkeypatch.setattr(
-        cli, "DedupeRepository", lambda client, data_source_id: FakeDedupeRepo(missing_schema)
-    )
+    fake_repo = FakeDedupeRepo(missing_schema)
+    monkeypatch.setattr(cli, "DedupeRepository", lambda client, data_source_id: fake_repo)
+    return fake_repo
 
 
 def test_dry_run_shows_plan_and_does_not_apply(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -339,3 +346,261 @@ def test_partial_failure_shows_accurate_completed_mark_count(
     plain_stdout = result.stdout.replace("\n", "")
     assert "1" in plain_stdout
     assert "失敗: 1件" in result.stdout
+
+
+# --- Phase 2N: --dry-run / --apply-schema safety repair ------------------
+#
+# Phase 2Mのread-only auditで発見された既存の安全契約違反(--dry-run が
+# --apply-schema のNotion書き込みを抑制しない)を修正する回帰テスト群。
+# T1〜T9(Work Unit §22-30)に対応する。
+
+
+def test_t1_apply_schema_only_calls_migration_and_skips_dedupe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(cli.app, ["dedupe-cards", "--card-name", "沼", "--apply-schema"])
+
+    assert result.exit_code == 0
+    assert len(fake_repo.apply_schema_migration_calls) == 1
+    assert execute_calls["count"] == 0
+
+
+def test_t2_dry_run_apply_schema_suppresses_schema_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最重要regression: --dry-run --apply-schema はschema書き込みを一切行わない。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--dry-run", "--apply-schema"]
+    )
+
+    assert result.exit_code == 0
+    assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
+    assert "所持枚数" in result.stdout  # schema preview は維持される
+    assert "沼" in result.stdout  # dedupe preview も維持される
+
+
+def test_t3_dry_run_with_both_apply_flags_suppresses_all_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--dry-run", "--apply", "--apply-schema"],
+    )
+
+    assert result.exit_code == 0
+    assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
+
+
+def test_t4_apply_with_apply_schema_runs_schema_before_dedupe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+
+    call_order: list[str] = []
+    original_apply_schema_migration = fake_repo.apply_schema_migration
+
+    def _tracking_apply_schema_migration(property_names: list[str]) -> dict:
+        call_order.append("schema")
+        return original_apply_schema_migration(property_names)
+
+    fake_repo.apply_schema_migration = _tracking_apply_schema_migration  # type: ignore[method-assign]
+
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=["p2"],
+            )
+        ]
+    )
+
+    def _tracking_execute_dedupe_plan(plan: DedupePlan, repo: object) -> DedupeApplyResult:
+        call_order.append("dedupe")
+        return apply_result
+
+    monkeypatch.setattr(cli, "execute_dedupe_plan", _tracking_execute_dedupe_plan)
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema"]
+    )
+
+    assert result.exit_code == 0
+    assert len(fake_repo.apply_schema_migration_calls) == 1
+    assert call_order == ["schema", "dedupe"]
+
+
+def test_t5_apply_only_with_missing_schema_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(
+            missing_schema=["所持枚数", "統合済み"]
+        ),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(cli.app, ["dedupe-cards", "--card-name", "沼", "--apply"])
+
+    assert result.exit_code == 1
+    assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
+
+
+def test_t6_dry_run_apply_schema_with_no_missing_schema_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=[])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--dry-run", "--apply-schema"]
+    )
+
+    assert result.exit_code == 0
+    assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
+
+
+def test_t7_dry_run_message_does_not_claim_schema_applied(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: None)
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--dry-run", "--apply-schema"]
+    )
+
+    assert result.exit_code == 0
+    assert "スキーマに追加しました" not in result.stdout
+    assert "Notionへの書き込みは行いません" in result.stdout
+
+
+def test_t8_apply_schema_only_message_does_not_deny_schema_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: None)
+
+    result = runner.invoke(cli.app, ["dedupe-cards", "--card-name", "沼", "--apply-schema"])
+
+    assert result.exit_code == 0
+    assert "スキーマに追加しました" in result.stdout
+    assert "Notionへの書き込みは行いません。" not in result.stdout
+    assert "重複統合の書き込みは行いません" in result.stdout
+
+
+@pytest.mark.parametrize("apply_flag", [False, True])
+@pytest.mark.parametrize("apply_schema_flag", [False, True])
+def test_t9_dry_run_dominates_all_apply_flag_combinations(
+    monkeypatch: pytest.MonkeyPatch, apply_flag: bool, apply_schema_flag: bool
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    args = ["dedupe-cards", "--card-name", "沼", "--dry-run"]
+    if apply_flag:
+        args.append("--apply")
+    if apply_schema_flag:
+        args.append("--apply-schema")
+
+    result = runner.invoke(cli.app, args)
+
+    assert result.exit_code == 0
+    assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
