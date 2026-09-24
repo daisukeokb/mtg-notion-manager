@@ -15,6 +15,11 @@ from mtg_notion_manager.services.dedupe_cards import (
     MergePlan,
     RepresentativeChoice,
 )
+from mtg_notion_manager.services.dedupe_schema import (
+    SchemaMigrationExecutionError,
+    SchemaMigrationResult,
+    SchemaWriteCompletion,
+)
 
 runner = CliRunner()
 
@@ -604,3 +609,178 @@ def test_t9_dry_run_dominates_all_apply_flag_combinations(
     assert result.exit_code == 0
     assert fake_repo.apply_schema_migration_calls == []
     assert execute_calls["count"] == 0
+
+
+# --- Phase 2O: schema mutation result fidelity (CLI integration) --------
+#
+# services/dedupe_schema.pyの単体テスト(SUCCEEDED/KNOWN_FAILED/UNKNOWNの
+# 分類そのもの)はtests/test_dedupe_schema.pyにある。ここでは
+# cli.execute_schema_migration という統合ポイントを経由したCLI挙動
+# (fail-closedの維持・schema→dedupeの順序・dry-run regressionの再固定)
+# だけを検証する。
+
+
+def test_t7_schema_failure_prevents_dedupe_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+
+    def _raise_schema_failure(repo: object, property_names: list[str]) -> SchemaMigrationResult:
+        raise SchemaMigrationExecutionError(
+            SchemaMigrationResult(
+                completion=SchemaWriteCompletion.KNOWN_FAILED,
+                property_names=tuple(property_names),
+            ),
+            "Notion API呼び出しに失敗しました (400): bad request",
+        )
+
+    monkeypatch.setattr(cli, "execute_schema_migration", _raise_schema_failure)
+
+    build_calls = {"count": 0}
+
+    def _tracking_build_dedupe_plan(
+        repo: object, card_name: str | None = None, representative_page_id: str | None = None
+    ) -> DedupePlan:
+        build_calls["count"] += 1
+        return _sample_plan()
+
+    monkeypatch.setattr(cli, "build_dedupe_plan", _tracking_build_dedupe_plan)
+
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema"]
+    )
+
+    assert result.exit_code == 1
+    # schema失敗時、build_dedupe_plan()自体が呼ばれる前に例外が伝播する
+    # (schema phaseがbuild_dedupe_plan()より前に配置されているため)。
+    assert build_calls["count"] == 0
+    assert execute_calls["count"] == 0
+    assert "bad request" in result.stdout
+
+
+def test_t8_schema_success_then_dedupe_runs_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+
+    call_order: list[str] = []
+    schema_result = SchemaMigrationResult(
+        completion=SchemaWriteCompletion.SUCCEEDED,
+        property_names=("所持枚数", "統合済み"),
+    )
+
+    def _tracking_execute_schema_migration(
+        repo: object, property_names: list[str]
+    ) -> SchemaMigrationResult:
+        call_order.append("schema")
+        return schema_result
+
+    monkeypatch.setattr(cli, "execute_schema_migration", _tracking_execute_schema_migration)
+
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=["p2"],
+            )
+        ]
+    )
+
+    def _tracking_execute_dedupe_plan(plan: DedupePlan, repo: object) -> DedupeApplyResult:
+        call_order.append("dedupe")
+        return apply_result
+
+    monkeypatch.setattr(cli, "execute_dedupe_plan", _tracking_execute_dedupe_plan)
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema"]
+    )
+
+    assert result.exit_code == 0
+    assert call_order == ["schema", "dedupe"]
+
+
+def test_t9_apply_schema_only_generates_success_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+
+    schema_calls = {"count": 0}
+
+    def _tracking_execute_schema_migration(
+        repo: object, property_names: list[str]
+    ) -> SchemaMigrationResult:
+        schema_calls["count"] += 1
+        return SchemaMigrationResult(
+            completion=SchemaWriteCompletion.SUCCEEDED, property_names=tuple(property_names)
+        )
+
+    monkeypatch.setattr(cli, "execute_schema_migration", _tracking_execute_schema_migration)
+
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(cli.app, ["dedupe-cards", "--card-name", "沼", "--apply-schema"])
+
+    assert result.exit_code == 0
+    assert schema_calls["count"] == 1
+    assert execute_calls["count"] == 0
+
+
+def test_t10_dry_run_never_calls_execute_schema_migration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 2Nのdry-run safety regressionを、新しい統合ポイント
+    (cli.execute_schema_migration)側からも再固定する。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    schema_calls = {"count": 0}
+
+    def _tracking_execute_schema_migration(
+        repo: object, property_names: list[str]
+    ) -> SchemaMigrationResult:
+        schema_calls["count"] += 1
+        return SchemaMigrationResult(
+            completion=SchemaWriteCompletion.SUCCEEDED, property_names=tuple(property_names)
+        )
+
+    monkeypatch.setattr(cli, "execute_schema_migration", _tracking_execute_schema_migration)
+
+    result_a = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--dry-run", "--apply-schema"]
+    )
+    result_b = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--dry-run", "--apply", "--apply-schema"],
+    )
+
+    assert result_a.exit_code == 0
+    assert result_b.exit_code == 0
+    assert schema_calls["count"] == 0

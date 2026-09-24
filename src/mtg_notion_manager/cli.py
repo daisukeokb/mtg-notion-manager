@@ -92,6 +92,7 @@ from mtg_notion_manager.services.card_resolution import (
     write_pending_manifest,
 )
 from mtg_notion_manager.services.dedupe_cards import build_dedupe_plan, execute_dedupe_plan
+from mtg_notion_manager.services.dedupe_schema import execute_schema_migration
 from mtg_notion_manager.services.doctor import run_doctor
 from mtg_notion_manager.services.import_article import (
     STATUS_ERROR as ARTICLE_STATUS_ERROR,
@@ -584,7 +585,14 @@ def dedupe_cards_command(
 
             schema_applied = False
             if apply_schema and missing_schema and not dry_run:
-                repo.apply_schema_migration(missing_schema)
+                # schema write(1回のPATCH)の結果はexecute_schema_migration()が
+                # SchemaMigrationResultとして構造化して返す(成功時)、または
+                # SchemaMigrationExecutionError(KNOWN_FAILED/UNKNOWN)として
+                # 送出する(失敗時)。Error Contractへはまだ接続しないため、
+                # ここでは戻り値を保持するだけで表示・JSON化はしない
+                # (str(exc)のhuman messageは既存のまま――失敗時は下のexcept
+                # MtgNotionManagerErrorが従来通り処理する)。
+                _schema_migration_result = execute_schema_migration(repo, missing_schema)
                 console.print(f"[green]スキーマに追加しました: {', '.join(missing_schema)}[/green]")
                 missing_schema = []
                 schema_applied = True
