@@ -582,10 +582,12 @@ def dedupe_cards_command(
             print_dedupe_schema_plan(console, missing_schema)
             console.print()
 
-            if apply_schema and missing_schema:
+            schema_applied = False
+            if apply_schema and missing_schema and not dry_run:
                 repo.apply_schema_migration(missing_schema)
                 console.print(f"[green]スキーマに追加しました: {', '.join(missing_schema)}[/green]")
                 missing_schema = []
+                schema_applied = True
                 console.print()
 
             plan = build_dedupe_plan(
@@ -598,9 +600,16 @@ def dedupe_cards_command(
                 raise typer.Exit(code=0)
 
             if dry_run or not apply:
-                console.print(
-                    "[cyan]--apply が指定されていないため、Notionへの書き込みは行いません。[/cyan]"
-                )
+                if schema_applied:
+                    console.print(
+                        "[cyan]--apply が指定されていないため、重複統合の書き込みは行いません"
+                        "(スキーマへのプロパティ追加は上記の通り既に実行済みです)。[/cyan]"
+                    )
+                else:
+                    console.print(
+                        "[cyan]--apply が指定されていないため、"
+                        "Notionへの書き込みは行いません。[/cyan]"
+                    )
                 raise typer.Exit(code=0)
 
             if missing_schema:
