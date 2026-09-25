@@ -13,6 +13,12 @@ from mtg_notion_manager.config import Config, ConfigError
 from mtg_notion_manager.dedupe_apply_mutation_adapter import (
     build_dedupe_apply_mutation_summary,
 )
+from mtg_notion_manager.dedupe_cards_mutation_adapter import (
+    NO_SCHEMA_CONTRIBUTION,
+    build_dedupe_cards_mutation_summary,
+    schema_mutation_contribution_for_failure,
+    schema_mutation_contribution_for_success,
+)
 from mtg_notion_manager.error_contract import (
     ErrorCategory,
     ErrorCode,
@@ -92,7 +98,10 @@ from mtg_notion_manager.services.card_resolution import (
     write_pending_manifest,
 )
 from mtg_notion_manager.services.dedupe_cards import build_dedupe_plan, execute_dedupe_plan
-from mtg_notion_manager.services.dedupe_schema import execute_schema_migration
+from mtg_notion_manager.services.dedupe_schema import (
+    SchemaMigrationExecutionError,
+    execute_schema_migration,
+)
 from mtg_notion_manager.services.doctor import run_doctor
 from mtg_notion_manager.services.import_article import (
     STATUS_ERROR as ARTICLE_STATUS_ERROR,
@@ -550,16 +559,54 @@ def dedupe_cards_command(
         help="--card-name 省略時に全重複グループへ適用する(--yes との併用が必須)",
     ),
     yes: bool = typer.Option(False, "--yes", help="--apply-all の確認"),
+    error_json: bool = typer.Option(
+        False,
+        "--error-json",
+        help=(
+            "実行結果が成功でない場合のみ、人間向け出力の代わりに1行の構造化JSON"
+            "(schema_version/command/error_category/error_code/message、書き込み結果を"
+            "伴う場合はmutationも含む)をstdoutへ出力する。--error-json は --apply/"
+            "--apply-schema を意味しない(--dry-run・フラグ省略時の意味は変更しない)。"
+            "--representative-page-id に --card-name が伴わない場合、--card-name省略時の"
+            "全件適用に --apply-all/--yes が伴わない場合、および --apply指定時にスキーマが"
+            "不足しており --apply-schema も指定されていない場合は、いずれもCLIの使い方の"
+            "誤りであり実行エラーではないため対象外(既存の人間向けメッセージ・終了コード1を"
+            "維持し、Error Contract JSONへは変換しない)。書き込みを一切試みない実行エラー"
+            "(設定読み込み失敗など)はschema_version 1(mutationなし)。schema mutation"
+            "(--apply-schema、1回のPATCH)またはdedupe write(代表レコード更新・統合済み"
+            "設定)のいずれかを1件以上試みたうえでの失敗はschema_version 2(mutation付き)。"
+            "schema mutationとdedupe writeの両方を試みた場合は単一のaggregate mutationへ"
+            "合算する(dedupe-family共有mutation adapterを使用、apply-dedupe-plan/"
+            "apply-price-link-dedupeと同じ分類・recovery方針)。mutation.stateが"
+            "MUTATION_STATE_UNKNOWNの場合は完了状態が不明な書き込みが含まれるため、何もせず"
+            "再実行しない(RECONCILE_BEFORE_RETRYはNotion側の状態を手動確認してからの判断を"
+            "促すものであり、自動リトライ可を意味しない)。known failureのみの場合も"
+            "RETRY_ALLOWEDは出力しない(当面はMANUAL_REVIEW_REQUIREDに留める)。schema"
+            "mutationはdry-run中は一切実行しない(既存のdry-run安全契約を維持)。schema"
+            "失敗時はdedupe phaseへ進まない(既存のfail-closed契約を維持)。成功時"
+            "(--apply/--apply-schema省略・--dry-run・全件成功のみ)の出力・終了コードは"
+            "変更しない。messageは診断用でありスクリプトからパースしないこと。"
+        ),
+    ),
 ) -> None:
     """MTGカードDBの重複カード(同名複数ページ)を検出し、代表レコードへ安全に統合する。"""
     try:
         config = Config.load()
     except ConfigError as exc:
-        console.print(f"[red]設定エラー:[/red] {exc}")
+        if error_json:
+            emit_error_json("dedupe-cards", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]設定エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     if not config.card_data_source_id:
-        console.print("[red]設定エラー:[/red] NOTION_CARD_DATA_SOURCE_ID が設定されていません。")
+        message = "NOTION_CARD_DATA_SOURCE_ID が設定されていません。"
+        if error_json:
+            emit_error_json(
+                "dedupe-cards", ErrorCategory.CONFIGURATION, ErrorCode.CONFIG_LOAD_FAILED, message
+            )
+        else:
+            console.print(f"[red]設定エラー:[/red] {message}")
         raise typer.Exit(code=1)
 
     if representative_page_id is not None and card_name is None:
@@ -575,52 +622,69 @@ def dedupe_cards_command(
         )
         raise typer.Exit(code=1)
 
+    # --error-json モードでは、schema/dedupeのpreviewが既に出力された後で
+    # 部分失敗するケースがあり得る。そのケースでもstdoutを純粋なJSON1件だけに
+    # するため、成功が確定するまでこれらの出力を一時バッファへ書き、エラーJSON
+    # 確定時は破棄する(成功時はこのバッファの内容をそのまま実コンソールへ出力
+    # するため、成功時の出力内容自体は変更しない)。
+    error_buffer = io.StringIO()
+    render_console = Console(file=error_buffer) if error_json else console
+
     try:
         with NotionClient(config.notion_api_key) as client:
             repo = DedupeRepository(client, config.card_data_source_id)
 
             missing_schema = repo.missing_schema_properties()
-            print_dedupe_schema_plan(console, missing_schema)
-            console.print()
+            print_dedupe_schema_plan(render_console, missing_schema)
+            render_console.print()
 
             schema_applied = False
+            schema_contribution = NO_SCHEMA_CONTRIBUTION
             if apply_schema and missing_schema and not dry_run:
-                # schema write(1回のPATCH)の結果はexecute_schema_migration()が
-                # SchemaMigrationResultとして構造化して返す(成功時)、または
-                # SchemaMigrationExecutionError(KNOWN_FAILED/UNKNOWN)として
-                # 送出する(失敗時)。Error Contractへはまだ接続しないため、
-                # ここでは戻り値を保持するだけで表示・JSON化はしない
-                # (str(exc)のhuman messageは既存のまま――失敗時は下のexcept
-                # MtgNotionManagerErrorが従来通り処理する)。
-                _schema_migration_result = execute_schema_migration(repo, missing_schema)
-                console.print(f"[green]スキーマに追加しました: {', '.join(missing_schema)}[/green]")
+                schema_migration_result = execute_schema_migration(repo, missing_schema)
+                render_console.print(
+                    f"[green]スキーマに追加しました: {', '.join(missing_schema)}[/green]"
+                )
                 missing_schema = []
                 schema_applied = True
-                console.print()
+                schema_contribution = schema_mutation_contribution_for_success(
+                    schema_migration_result
+                )
+                render_console.print()
 
             plan = build_dedupe_plan(
                 repo, card_name=card_name, representative_page_id=representative_page_id
             )
-            print_dedupe_plan(console, plan)
+            print_dedupe_plan(render_console, plan)
 
             if not plan.merge_plans:
-                console.print("統合対象の重複はありませんでした。")
+                render_console.print("統合対象の重複はありませんでした。")
+                if error_json:
+                    print(error_buffer.getvalue(), end="")
                 raise typer.Exit(code=0)
 
             if dry_run or not apply:
                 if schema_applied:
-                    console.print(
+                    render_console.print(
                         "[cyan]--apply が指定されていないため、重複統合の書き込みは行いません"
                         "(スキーマへのプロパティ追加は上記の通り既に実行済みです)。[/cyan]"
                     )
                 else:
-                    console.print(
+                    render_console.print(
                         "[cyan]--apply が指定されていないため、"
                         "Notionへの書き込みは行いません。[/cyan]"
                     )
+                if error_json:
+                    print(error_buffer.getvalue(), end="")
                 raise typer.Exit(code=0)
 
             if missing_schema:
+                # CLIの使い方の誤り(--apply-schema未指定)であり実行エラーではないため
+                # Error Contract対象外(既存precedent: 不明な--classification等と同じ扱い)。
+                # 既にbufferへ書いたpreview出力は、error_json時も人間向け出力として
+                # そのまま可視化する(human modeと同じ内容を維持するため)。
+                if error_json:
+                    print(error_buffer.getvalue(), end="")
                 console.print(
                     "[red]エラー:[/red] 必要なスキーマ("
                     f"{', '.join(missing_schema)}) が存在しないため書き込みできません。"
@@ -629,15 +693,41 @@ def dedupe_cards_command(
                 raise typer.Exit(code=1)
 
             result = execute_dedupe_plan(plan, repo)
-            console.print()
-            print_dedupe_apply_result(console, result)
+            render_console.print()
+            print_dedupe_apply_result(render_console, result)
 
             if result.failed:
+                if error_json:
+                    mutation = build_dedupe_cards_mutation_summary(result, schema_contribution)
+                    emit_error_json(
+                        "dedupe-cards",
+                        ErrorCategory.PARTIAL_MUTATION,
+                        ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+                        f"{len(result.succeeded)}件成功、{len(result.failed)}件失敗しました。",
+                        mutation=mutation,
+                    )
                 raise typer.Exit(code=1)
 
     except MtgNotionManagerError as exc:
-        console.print(f"[red]エラー:[/red] {exc}")
+        if error_json:
+            if isinstance(exc, SchemaMigrationExecutionError):
+                contribution = schema_mutation_contribution_for_failure(exc)
+                mutation = build_dedupe_cards_mutation_summary(None, contribution)
+                emit_error_json(
+                    "dedupe-cards",
+                    ErrorCategory.PARTIAL_MUTATION,
+                    ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+                    str(exc),
+                    mutation=mutation,
+                )
+            else:
+                emit_error_json("dedupe-cards", *classify_exception(exc), str(exc))
+        else:
+            console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
+
+    if error_json:
+        print(error_buffer.getvalue(), end="")
 
 
 @app.command(name="audit-duplicates")
