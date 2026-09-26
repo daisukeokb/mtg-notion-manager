@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+import re
+
 import pytest
 from typer.testing import CliRunner
 
 from mtg_notion_manager import cli
 from mtg_notion_manager.config import Config
+from mtg_notion_manager.error_contract import SCHEMA_VERSION, ErrorCategory, ErrorCode
 from mtg_notion_manager.exceptions import NotionAPIError
 from mtg_notion_manager.services.dedupe_cards import (
     DedupeApplyResult,
@@ -20,6 +24,8 @@ from mtg_notion_manager.services.dedupe_schema import (
     SchemaMigrationResult,
     SchemaWriteCompletion,
 )
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 runner = CliRunner()
 
@@ -784,3 +790,645 @@ def test_t10_dry_run_never_calls_execute_schema_migration(
     assert result_a.exit_code == 0
     assert result_b.exit_code == 0
     assert schema_calls["count"] == 0
+
+
+# --- Phase 2P: --error-json + schema/dedupe aggregate MutationSummary ----
+#
+# repo.missing_schema_properties()等をdedupe-cards CLIが直接呼ぶ構造上、
+# test_cli_error_contract.pyの_patch_notion()(NotionClient/CardRepository/
+# NotionWriterのみpatch)とは噛み合わないため、既にこのファイルで確立
+# されている_patch_repo()/FakeDedupeRepoをそのまま再利用する
+# (この配置は意図的な判断であり、Final Reportで開示済み)。
+
+
+def _assert_pure_json_error(stdout: str, *, command: str, category: str, code: str) -> dict:
+    assert "\x1b" not in stdout, "stdoutにANSIエスケープが含まれてはならない"
+    payload = json.loads(stdout)
+    assert isinstance(payload, dict)
+    assert payload["schema_version"] == SCHEMA_VERSION
+    assert payload["command"] == command
+    assert payload["error_category"] == category
+    assert payload["error_code"] == code
+    assert isinstance(payload["message"], str) and payload["message"]
+    assert "mutation" not in payload
+    return payload
+
+
+def _assert_pure_json_v2_mutation_error(
+    stdout: str, *, command: str, category: str, code: str
+) -> dict:
+    assert "\x1b" not in stdout, "stdoutにANSIエスケープが含まれてはならない"
+    payload = json.loads(stdout)
+    assert isinstance(payload, dict)
+    assert payload["schema_version"] == 2
+    assert payload["command"] == command
+    assert payload["error_category"] == category
+    assert payload["error_code"] == code
+    assert isinstance(payload["message"], str) and payload["message"]
+    assert "mutation" in payload
+    return payload
+
+
+def _schema_failure(
+    completion: str, *, message: str = "Notion API呼び出しに失敗しました (400): bad request"
+) -> SchemaMigrationExecutionError:
+    return SchemaMigrationExecutionError(
+        SchemaMigrationResult(completion=completion, property_names=("所持枚数", "統合済み")),
+        message,
+    )
+
+
+# T1 -----------------------------------------------------------------------
+
+
+def test_p2p_t1_help_mentions_error_json() -> None:
+    result = runner.invoke(cli.app, ["dedupe-cards", "--help"])
+
+    assert result.exit_code == 0
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
+
+
+# T2/T7 ----------------------------------------------------------------------
+
+
+def test_p2p_t2_success_matches_human_output_no_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=["p2"],
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: apply_result)
+    args = ["dedupe-cards", "--card-name", "沼", "--apply"]
+
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 0
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+def test_p2p_t7_schema_success_then_dedupe_success_ordering_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    call_order: list[str] = []
+
+    def _tracking_execute_schema_migration(
+        repo: object, property_names: list[str]
+    ) -> SchemaMigrationResult:
+        call_order.append("schema")
+        return SchemaMigrationResult(
+            completion=SchemaWriteCompletion.SUCCEEDED, property_names=tuple(property_names)
+        )
+
+    monkeypatch.setattr(cli, "execute_schema_migration", _tracking_execute_schema_migration)
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=["p2"],
+            )
+        ]
+    )
+
+    def _tracking_execute_dedupe_plan(plan: DedupePlan, repo: object) -> DedupeApplyResult:
+        call_order.append("dedupe")
+        return apply_result
+
+    monkeypatch.setattr(cli, "execute_dedupe_plan", _tracking_execute_dedupe_plan)
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 0
+    assert call_order == ["schema", "dedupe"]
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+# T3 -------------------------------------------------------------------------
+
+
+def test_p2p_t3_config_error_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise_config() -> Config:
+        from mtg_notion_manager.config import ConfigError
+
+        raise ConfigError("APIキーが未設定です")
+
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_raise_config))
+
+    result = runner.invoke(cli.app, ["dedupe-cards", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_p2p_t3_missing_card_data_source_id_is_pure_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config_without_card_db))
+
+    result = runner.invoke(cli.app, ["dedupe-cards", "--error-json"])
+
+    assert result.exit_code == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.CONFIGURATION,
+        code=ErrorCode.CONFIG_LOAD_FAILED,
+    )
+
+
+def test_p2p_t3_cli_usage_errors_stay_human(monkeypatch: pytest.MonkeyPatch) -> None:
+    """representative_page_id/card_name・apply/apply_all/yesの誤りはCLIの使い方の
+    誤りでありError Contract対象外(既存precedent、§20/§21)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+
+    result_a = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--representative-page-id", "p1", "--dry-run", "--error-json"],
+    )
+    result_b = runner.invoke(cli.app, ["dedupe-cards", "--apply", "--error-json"])
+
+    for result in (result_a, result_b):
+        assert result.exit_code == 1
+        with pytest.raises(json.JSONDecodeError):
+            json.loads(result.stdout)
+        assert "エラー" in result.stdout
+
+
+def test_p2p_t3_missing_schema_blocks_apply_stays_human_but_preview_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--apply-schema省略時のschema不足はCLIの使い方の誤りとして対象外(§20/§21)。
+    ただしerror_jsonバッファに溜まっていたpreview出力は、human modeと同じ内容
+    としてそのまま可視化する(§13/§22)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(
+            missing_schema=["所持枚数", "統合済み"]
+        ),
+    )
+    args = ["dedupe-cards", "--card-name", "沼", "--apply"]
+
+    human = runner.invoke(cli.app, args)
+    structured = runner.invoke(cli.app, [*args, "--error-json"])
+
+    assert human.exit_code == structured.exit_code == 1
+    assert human.stdout == structured.stdout
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(structured.stdout)
+
+
+# T4/T5/T6/T17 ----------------------------------------------------------------
+
+
+def test_p2p_t4_schema_known_failure_error_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli, "execute_schema_migration", lambda repo, names: (_ for _ in ()).throw(
+            _schema_failure(SchemaWriteCompletion.KNOWN_FAILED)
+        )
+    )
+    build_calls = {"count": 0}
+
+    def _tracking_build_dedupe_plan(
+        repo: object, card_name: str | None = None, representative_page_id: str | None = None
+    ) -> DedupePlan:
+        build_calls["count"] += 1
+        return _sample_plan()
+
+    monkeypatch.setattr(cli, "build_dedupe_plan", _tracking_build_dedupe_plan)
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    assert build_calls["count"] == 0
+    assert execute_calls["count"] == 0
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_FAILED"
+    assert mutation["attempted"] == 1
+    assert mutation["succeeded"] == 0
+    assert mutation["failed"] == 1
+    assert mutation["unknown"] == 0
+    assert mutation["recovery_action"] == "MANUAL_REVIEW_REQUIRED"
+    assert mutation["operations"] == [
+        {"key": "所持枚数、統合済み", "action": "schema_update", "state": "failed"}
+    ]
+
+
+def test_p2p_t5_schema_unknown_error_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli, "execute_schema_migration", lambda repo, names: (_ for _ in ()).throw(
+            _schema_failure(SchemaWriteCompletion.UNKNOWN)
+        )
+    )
+    build_calls = {"count": 0}
+
+    def _tracking_build_dedupe_plan(
+        repo: object, card_name: str | None = None, representative_page_id: str | None = None
+    ) -> DedupePlan:
+        build_calls["count"] += 1
+        return _sample_plan()
+
+    monkeypatch.setattr(cli, "build_dedupe_plan", _tracking_build_dedupe_plan)
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    assert build_calls["count"] == 0
+    assert execute_calls["count"] == 0
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["attempted"] == 1
+    assert mutation["succeeded"] == 0
+    assert mutation["failed"] == 0
+    assert mutation["unknown"] == 1
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+
+
+def test_p2p_t6_schema_classification_is_message_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """messageが"timeout"を含んでいても、実際のcompletionがKNOWN_FAILEDなら
+    mutation.failed(unknownではなく)へ分類される(str(exc)を一切見ない)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "execute_schema_migration",
+        lambda repo, names: (_ for _ in ()).throw(
+            _schema_failure(
+                SchemaWriteCompletion.KNOWN_FAILED,
+                message="a timeout-looking message but completion is actually KNOWN_FAILED",
+            )
+        ),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    assert payload["mutation"]["failed"] == 1
+    assert payload["mutation"]["unknown"] == 0
+
+
+# T8/T9 ------------------------------------------------------------------------
+
+
+def test_p2p_t8_schema_success_then_dedupe_known_failure_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "execute_schema_migration",
+        lambda repo, names: SchemaMigrationResult(
+            completion=SchemaWriteCompletion.SUCCEEDED, property_names=tuple(names)
+        ),
+    )
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=[],
+                error="Notion API呼び出しに失敗しました: 沼",
+                failed_operation="mark_merged",
+                failed_completion="known_failed",
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: apply_result)
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    # schema: succeeded=1。dedupe: 代表更新は成功(succeeded+=1)、markが既知失敗(failed+=1)。
+    assert mutation["attempted"] == 3
+    assert mutation["succeeded"] == 2
+    assert mutation["failed"] == 1
+    assert mutation["unknown"] == 0
+    assert mutation["state"] == "PARTIAL_MUTATION"
+    assert mutation["recovery_action"] == "MANUAL_REVIEW_REQUIRED"
+
+
+def test_p2p_t9_schema_success_then_dedupe_unknown_aggregate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "execute_schema_migration",
+        lambda repo, names: SchemaMigrationResult(
+            completion=SchemaWriteCompletion.SUCCEEDED, property_names=tuple(names)
+        ),
+    )
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=[],
+                error="Notion APIへの接続がタイムアウトしました: 沼",
+                failed_operation="mark_merged",
+                failed_completion="unknown",
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: apply_result)
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["attempted"] == 3
+    assert mutation["succeeded"] == 2
+    assert mutation["failed"] == 0
+    assert mutation["unknown"] == 1
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+
+
+# T10 ---------------------------------------------------------------------
+
+
+def test_p2p_t10_dedupe_only_aggregate_no_schema_attempted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """schema mutationなし(--apply-schema省略)の場合、aggregateはdedupe-only
+    の結果と一致する(schema分のcountが混入しない)。"""
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch)  # missing_schema=[] (既にスキーマは揃っている)
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=[],
+                error="Notion API呼び出しに失敗しました: 沼",
+                failed_operation="mark_merged",
+                failed_completion="known_failed",
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: apply_result)
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--apply", "--error-json"]
+    )
+
+    assert result.exit_code == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PARTIAL_MUTATION,
+        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+    )
+    mutation = payload["mutation"]
+    assert mutation["attempted"] == 2
+    assert mutation["succeeded"] == 1
+    assert mutation["failed"] == 1
+    assert mutation["unknown"] == 0
+
+
+# T12 JSON purity ------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "args_suffix",
+    [
+        ["--apply", "--apply-schema"],  # schema failure path (T4寄り)
+    ],
+)
+def test_p2p_t12_json_purity_on_schema_failure(
+    monkeypatch: pytest.MonkeyPatch, args_suffix: list[str]
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "execute_schema_migration",
+        lambda repo, names: (_ for _ in ()).throw(
+            _schema_failure(SchemaWriteCompletion.KNOWN_FAILED)
+        ),
+    )
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", *args_suffix, "--error-json"]
+    )
+
+    # stdout全体が有効なJSON1個のみであることそのものがpurityの証明
+    # (人間向けpreview/進捗テキストが混入していればjson.loads自体が失敗する)。
+    payload = json.loads(result.stdout)
+    assert isinstance(payload, dict)
+
+
+def test_p2p_t12_json_purity_on_dedupe_partial_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    _patch_repo(monkeypatch)
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=[],
+                error="Notion API呼び出しに失敗しました: 沼",
+                failed_operation="mark_merged",
+                failed_completion="known_failed",
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: apply_result)
+
+    result = runner.invoke(
+        cli.app, ["dedupe-cards", "--card-name", "沼", "--apply", "--error-json"]
+    )
+
+    payload = json.loads(result.stdout)
+    assert isinstance(payload, dict)
+
+
+# T14/T15 dry-run regression under --error-json --------------------------------
+
+
+def test_p2p_t14_dry_run_schema_only_error_json_no_writes_no_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--dry-run", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 0
+    assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+def test_p2p_t15_dry_run_both_flags_error_json_no_writes_no_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_repo = _patch_repo(monkeypatch, missing_schema=["所持枚数", "統合済み"])
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "dedupe-cards",
+            "--card-name",
+            "沼",
+            "--dry-run",
+            "--apply",
+            "--apply-schema",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)

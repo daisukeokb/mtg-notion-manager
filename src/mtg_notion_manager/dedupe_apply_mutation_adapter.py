@@ -93,6 +93,11 @@ class ResultFidelityViolationError(RuntimeError):
 
 def build_dedupe_apply_mutation_summary(
     outcomes: Sequence[DedupeGroupOutcome],
+    *,
+    extra_succeeded: int = 0,
+    extra_failed: int = 0,
+    extra_unknown: int = 0,
+    extra_operations: Sequence[MutationOperation] = (),
 ) -> MutationSummary:
     """GroupApplyOutcomeの列から、実際にNotion書き込みを試みた件数だけを数えた
     MutationSummaryを構築する。
@@ -107,11 +112,19 @@ def build_dedupe_apply_mutation_summary(
     rerun-safetyが別途証明されるまでemitしない)。この導出方法はmutation_contract.py
     のstate導出(unknown優先)と同じ優先順位を使うため、生成するMutationSummaryが
     _ALLOWED_RECOVERY_BY_STATEの不変条件に違反することはない。
+
+    ``extra_*`` (keyword-only) は、dedupe group outcomesとは別起源のwrite attempt
+    (Phase 2P: dedupe-cardsのschema mutation、1回のPATCH)を同一のaggregate
+    MutationSummaryへ合算するための拡張。呼び出し元(dedupe-cards)が
+    schema_mutation_contributionを直接ここへ渡すだけで済むよう、count/state/
+    recovery_action導出ロジック自体は一切複製しない。デフォルトは全て0/空の
+    ままなので、これを渡さない既存呼び出し元(apply-dedupe-plan/
+    apply-price-link-dedupe)の挙動は完全に不変。
     """
-    succeeded = 0
-    failed = 0
-    unknown = 0
-    operations: list[MutationOperation] = []
+    succeeded = extra_succeeded
+    failed = extra_failed
+    unknown = extra_unknown
+    operations: list[MutationOperation] = list(extra_operations)
 
     for outcome in outcomes:
         if outcome.status == _STATUS_APPLIED:
