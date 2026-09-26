@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from typer.testing import CliRunner
@@ -23,6 +24,8 @@ from mtg_notion_manager.services.dedupe_schema import (
     SchemaMigrationResult,
     SchemaWriteCompletion,
 )
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 runner = CliRunner()
 
@@ -842,7 +845,8 @@ def test_p2p_t1_help_mentions_error_json() -> None:
     result = runner.invoke(cli.app, ["dedupe-cards", "--help"])
 
     assert result.exit_code == 0
-    assert "--error-json" in result.stdout
+    plain = _ANSI_ESCAPE_RE.sub("", result.stdout).replace("\n", "")
+    assert "--error-json" in plain
 
 
 # T2/T7 ----------------------------------------------------------------------
