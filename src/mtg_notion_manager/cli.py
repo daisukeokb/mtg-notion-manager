@@ -711,12 +711,17 @@ def dedupe_cards_command(
     except MtgNotionManagerError as exc:
         if error_json:
             if isinstance(exc, SchemaMigrationExecutionError):
+                # dedupe writeは一切試みられていない(schema失敗時はdedupe phase
+                # へ進まないfail-closed契約のため)ため、実際にdedupe writeが
+                # 失敗した場合専用のDEDUPE_WRITE_PARTIAL_FAILUREとは別code
+                # (SCHEMA_WRITE_FAILURE)を使う(Phase 2P-R1、Phase 2P-R0監査で
+                # 発覚したcontract gapの修正)。
                 contribution = schema_mutation_contribution_for_failure(exc)
                 mutation = build_dedupe_cards_mutation_summary(None, contribution)
                 emit_error_json(
                     "dedupe-cards",
                     ErrorCategory.PARTIAL_MUTATION,
-                    ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+                    ErrorCode.SCHEMA_WRITE_FAILURE,
                     str(exc),
                     mutation=mutation,
                 )

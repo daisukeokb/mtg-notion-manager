@@ -102,6 +102,17 @@ class ErrorCode:
     #: 共有のcode(apply-price-link-dedupe固有ではない――将来apply-dedupe-plan/
     #: dedupe-cardsへ--error-jsonを展開する際も同じcodeを再利用する想定)。
     DEDUPE_WRITE_PARTIAL_FAILURE = "DEDUPE_WRITE_PARTIAL_FAILURE"
+    #: ErrorCategory.PARTIAL_MUTATION専用。dedupe-cardsのschema mutation
+    #: (--apply-schema、DedupeRepository.apply_schema_migration()の1回のPATCH)が
+    #: KNOWN_FAILEDまたはUNKNOWNだった場合(mutationフィールドで詳細を返す)。
+    #: dedupe writeは一切試みられていない(schema失敗時はdedupe phaseへ進まない
+    #: fail-closed契約のため)ため、DEDUPE_WRITE_PARTIAL_FAILUREとは意図的に
+    #: 別code(Phase 2P-R0監査で、dedupe write失敗を前提とするDEDUPE_WRITE_
+    #: PARTIAL_FAILUREをschema-only failureへ流用していた既存precedent不在の
+    #: contract gapが発覚したため新設。Phase 2P-R1)。schema PATCHは常に0か1回
+    #: のみ試行されるため「PARTIAL」ではなく単一のFAILUREとして表現する
+    #: (KNOWN_FAILED/UNKNOWNの区別はmutation.state/recovery_actionが表す)。
+    SCHEMA_WRITE_FAILURE = "SCHEMA_WRITE_FAILURE"
     #: apply-price-link-dedupeの--targets-reportが読み込めない/不正な場合
     #: (元はOSError/ValueErrorとして送出される。CLI境界でのみ狭くwrapする)。
     TARGETS_REPORT_LOAD_FAILED = "TARGETS_REPORT_LOAD_FAILED"
