@@ -1050,8 +1050,11 @@ def test_p2p_t4_schema_known_failure_error_json(monkeypatch: pytest.MonkeyPatch)
         result.stdout,
         command="dedupe-cards",
         category=ErrorCategory.PARTIAL_MUTATION,
-        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+        code=ErrorCode.SCHEMA_WRITE_FAILURE,
     )
+    # dedupe writeは一切試みられていないため、dedupe write失敗専用のcodeでは
+    # ないことを明示する(Phase 2P-R0で発覚したcontract gapのregression lock)。
+    assert payload["error_code"] != ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE
     mutation = payload["mutation"]
     assert mutation["state"] == "MUTATION_FAILED"
     assert mutation["attempted"] == 1
@@ -1100,8 +1103,9 @@ def test_p2p_t5_schema_unknown_error_json(monkeypatch: pytest.MonkeyPatch) -> No
         result.stdout,
         command="dedupe-cards",
         category=ErrorCategory.PARTIAL_MUTATION,
-        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+        code=ErrorCode.SCHEMA_WRITE_FAILURE,
     )
+    assert payload["error_code"] != ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE
     mutation = payload["mutation"]
     assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
     assert mutation["attempted"] == 1
@@ -1138,7 +1142,7 @@ def test_p2p_t6_schema_classification_is_message_independent(
         result.stdout,
         command="dedupe-cards",
         category=ErrorCategory.PARTIAL_MUTATION,
-        code=ErrorCode.DEDUPE_WRITE_PARTIAL_FAILURE,
+        code=ErrorCode.SCHEMA_WRITE_FAILURE,
     )
     assert payload["mutation"]["failed"] == 1
     assert payload["mutation"]["unknown"] == 0
