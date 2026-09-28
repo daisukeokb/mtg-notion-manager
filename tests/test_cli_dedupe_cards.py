@@ -1562,7 +1562,10 @@ def test_b_t10_error_json_positive_verification_success_has_no_json(
     assert len(fake_client.update_data_source_schema_calls) == 1  # single-PATCH契約維持
     with pytest.raises(json.JSONDecodeError):
         json.loads(result.stdout)
-    assert "スキーマに追加しました" in result.stdout
+    # R1-T15: 今回のPATCH自体が成功したとは断定しない(direct successの
+    # 「スキーマに追加しました」とは異なるmessage)。
+    assert "スキーマに追加しました" not in result.stdout
+    assert "必要なスキーマ状態を確認しました" in result.stdout
     assert "成功: 1件" in result.stdout
 
 
@@ -1609,3 +1612,32 @@ def test_b_t11_dry_run_never_attempts_patch_or_verification_read(
     assert execute_calls["count"] == 0
     with pytest.raises(json.JSONDecodeError):
         json.loads(result.stdout)
+
+
+def test_r1_t18_malformed_read_back_error_json_stays_structured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R1-T18: verification read-backがmalformed shapeを返しても、raw
+    tracebackにならず、既存のSCHEMA_WRITE_FAILURE/UNKNOWN構造化JSONが
+    維持される(Phase 3B-R0で確認されたfail-closed gapのCLI統合テスト)。
+    """
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_client = _FakeVerificationNotionClient(
+        patch_error=_unknown_notion_error(), verification_schema={"properties": None}
+    )
+    monkeypatch.setattr(
+        cli, "NotionClient", lambda api_key: _FakeVerificationClientCtx(fake_client)
+    )
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    assert fake_client.get_data_source_calls == 2
+    payload = json.loads(result.stdout)  # raw tracebackならJSONDecodeErrorで失敗する
+    assert payload["schema_version"] == SCHEMA_VERSION + 1
+    assert payload["error_code"] == ErrorCode.SCHEMA_WRITE_FAILURE
+    assert payload["mutation"]["state"] == "MUTATION_STATE_UNKNOWN"
+    assert payload["mutation"]["recovery_action"] == "RECONCILE_BEFORE_RETRY"

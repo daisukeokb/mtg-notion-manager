@@ -8,8 +8,11 @@ from mtg_notion_manager.notion.dedupe_repository import DedupeRepository
 from mtg_notion_manager.services.dedupe_schema import (
     SchemaMigrationExecutionError,
     SchemaMigrationResult,
+    SchemaVerificationState,
     SchemaWriteCompletion,
     execute_schema_migration,
+    schema_prerequisite_satisfied,
+    verify_schema_properties_present,
 )
 
 DATA_SOURCE_ID = "81eec501-574b-4222-ad69-87a6f68fdf2b"
@@ -61,6 +64,29 @@ class _FakeSchemaClient:
         return self._verification_schema
 
 
+class _MalformedSchemaClient:
+    """update_data_source_schema()はUNKNOWN相当の例外を送出し、
+    get_data_source()は与えられた任意の(不正形状を含む)値をそのまま返す
+    fake低レベルNotionClient(R1-T9〜T13のmalformed read-back専用)。
+
+    _FakeSchemaClientの「Noneなら既定値{"properties": {}}を使う」という
+    利便性を持たない――malformed-shapeテストではresponse自体がNoneである
+    ケースも明示的に検証したいため、常に与えられた値をそのまま返す。
+    """
+
+    def __init__(self, *, patch_error: Exception, verification_response: object) -> None:
+        self._patch_error = patch_error
+        self._verification_response = verification_response
+        self.get_data_source_calls: list[str] = []
+
+    def update_data_source_schema(self, data_source_id: str, properties: dict) -> dict:
+        raise self._patch_error
+
+    def get_data_source(self, data_source_id: str) -> object:
+        self.get_data_source_calls.append(data_source_id)
+        return self._verification_response
+
+
 def _http_status_error() -> httpx.HTTPStatusError:
     request = httpx.Request("PATCH", f"https://api.notion.com/v1/data_sources/{DATA_SOURCE_ID}")
     response = httpx.Response(400, request=request)
@@ -75,6 +101,8 @@ def test_t1_schema_success_returns_structured_result() -> None:
 
     assert isinstance(result, SchemaMigrationResult)
     assert result.completion == SchemaWriteCompletion.SUCCEEDED
+    # R1-T1: direct successはverification=NOT_ATTEMPTED(検証を試みていない)。
+    assert result.verification == SchemaVerificationState.NOT_ATTEMPTED
     assert result.property_names == ("所持枚数", "統合済み")
     # single-PATCH契約: 複数プロパティでもNotion呼び出しは1回だけ。
     assert len(client.schema_update_calls) == 1
@@ -95,6 +123,8 @@ def test_t2_known_failure_from_http_status_error_cause() -> None:
 
     carrier = exc_info.value
     assert carrier.result.completion == SchemaWriteCompletion.KNOWN_FAILED
+    # R1-T2: KNOWN_FAILEDはverificationを一切試みない(NOT_ATTEMPTED)。
+    assert carrier.result.verification == SchemaVerificationState.NOT_ATTEMPTED
     assert carrier.result.property_names == ("所持枚数",)
     # human-visible messageは元のNotionAPIErrorのものをそのまま維持する。
     assert str(carrier) == str(notion_error)
@@ -212,6 +242,8 @@ def _unknown_error(
 
 
 def test_b_t3_unknown_with_full_positive_match_reconciles_to_success() -> None:
+    """Phase 3B-R1: completionはUNKNOWNのまま(SUCCEEDEDへ書き換えない)、
+    verification=DESIRED_STATE_VERIFIEDとして正常returnする(R1-T3)。"""
     client = _FakeSchemaClient(
         error=_unknown_error(), verification_schema=_positive_verification_schema()
     )
@@ -220,10 +252,14 @@ def test_b_t3_unknown_with_full_positive_match_reconciles_to_success() -> None:
     result = execute_schema_migration(repo, ["所持枚数", "統合済み"])
 
     assert isinstance(result, SchemaMigrationResult)
-    assert result.completion == SchemaWriteCompletion.SUCCEEDED
+    assert result.completion == SchemaWriteCompletion.UNKNOWN
+    assert result.completion != SchemaWriteCompletion.SUCCEEDED
+    assert result.verification == SchemaVerificationState.DESIRED_STATE_VERIFIED
     assert result.property_names == ("所持枚数", "統合済み")
     assert len(client.schema_update_calls) == 1  # single-PATCH契約は維持。
     assert len(client.get_data_source_calls) == 1
+    # write outcomeがUNKNOWNのままでも、dedupe phaseへ進んでよいと判定される。
+    assert schema_prerequisite_satisfied(result) is True
 
 
 def test_b_t4_unknown_with_no_properties_found_remains_unknown() -> None:
@@ -236,6 +272,7 @@ def test_b_t4_unknown_with_no_properties_found_remains_unknown() -> None:
         execute_schema_migration(repo, ["所持枚数", "統合済み"])
 
     assert exc_info.value.result.completion == SchemaWriteCompletion.UNKNOWN
+    assert exc_info.value.result.verification == SchemaVerificationState.INCONCLUSIVE
     assert len(client.get_data_source_calls) == 1
 
 
@@ -253,6 +290,7 @@ def test_b_t5_unknown_with_partial_properties_remains_unknown() -> None:
         execute_schema_migration(repo, ["所持枚数", "統合済み"])
 
     assert exc_info.value.result.completion == SchemaWriteCompletion.UNKNOWN
+    assert exc_info.value.result.verification == SchemaVerificationState.INCONCLUSIVE
     assert len(client.get_data_source_calls) == 1
 
 
@@ -271,6 +309,7 @@ def test_b_t6_unknown_with_type_mismatch_remains_unknown() -> None:
         execute_schema_migration(repo, ["所持枚数", "統合済み"])
 
     assert exc_info.value.result.completion == SchemaWriteCompletion.UNKNOWN
+    assert exc_info.value.result.verification == SchemaVerificationState.INCONCLUSIVE
 
 
 def test_b_t7_unknown_positive_match_ignores_unrelated_properties() -> None:
@@ -286,7 +325,8 @@ def test_b_t7_unknown_positive_match_ignores_unrelated_properties() -> None:
 
     result = execute_schema_migration(repo, ["所持枚数", "統合済み"])
 
-    assert result.completion == SchemaWriteCompletion.SUCCEEDED
+    assert result.completion == SchemaWriteCompletion.UNKNOWN
+    assert result.verification == SchemaVerificationState.DESIRED_STATE_VERIFIED
 
 
 def test_b_t8_verification_read_failure_preserves_unknown() -> None:
@@ -304,6 +344,7 @@ def test_b_t8_verification_read_failure_preserves_unknown() -> None:
 
     carrier = exc_info.value
     assert carrier.result.completion == SchemaWriteCompletion.UNKNOWN
+    assert carrier.result.verification == SchemaVerificationState.INCONCLUSIVE
     # original UNKNOWNの例外チェインはverification GETの失敗によって
     # 上書きされない(元のPATCH timeoutがそのまま__cause__)。
     original_patch_error = carrier.__cause__
@@ -324,7 +365,8 @@ def test_b_t13_verification_checks_requested_subset_only() -> None:
     # 所持枚数だけを要求 → 統合済みの状態は一切参照されないはず。
     result = execute_schema_migration(repo, ["所持枚数"])
 
-    assert result.completion == SchemaWriteCompletion.SUCCEEDED
+    assert result.completion == SchemaWriteCompletion.UNKNOWN
+    assert result.verification == SchemaVerificationState.DESIRED_STATE_VERIFIED
     assert result.property_names == ("所持枚数",)
 
 
@@ -342,4 +384,120 @@ def test_b_t14_positive_verification_is_message_independent() -> None:
 
     result = execute_schema_migration(repo, ["所持枚数", "統合済み"])
 
-    assert result.completion == SchemaWriteCompletion.SUCCEEDED
+    assert result.completion == SchemaWriteCompletion.UNKNOWN
+    assert result.verification == SchemaVerificationState.DESIRED_STATE_VERIFIED
+
+
+# --- Phase 3B-R1: malformed read-back must never mask original UNKNOWN ------
+#
+# Phase 3B-R0監査で、verify_schema_properties_present()がmalformed response
+# shapeに対して未捕捉のAttributeErrorを送出し、original UNKNOWNをmaskして
+# raw tracebackでcommandを終了させることが実証された(fail-closed gap)。
+# ここではその修正(shape validation + 最終安全境界)を固定する。
+
+
+@pytest.mark.parametrize(
+    "label,verification_response",
+    [
+        ("empty_dict", {}),
+        ("properties_null", {"properties": None}),
+        ("properties_list", {"properties": []}),
+        ("properties_string", {"properties": "not-a-dict"}),
+        ("response_is_none", None),
+        ("response_is_string", "unexpected scalar response"),
+        ("response_is_number", 42),
+        ("property_entry_null", {"properties": {"所持枚数": None, "統合済み": None}}),
+        ("property_entry_list", {"properties": {"所持枚数": [], "統合済み": []}}),
+        (
+            "property_entry_string",
+            {"properties": {"所持枚数": "invalid", "統合済み": "invalid"}},
+        ),
+        (
+            "property_entry_missing_type",
+            {"properties": {"所持枚数": {"id": "x"}, "統合済み": {"id": "y"}}},
+        ),
+        (
+            "type_is_null",
+            {
+                "properties": {
+                    "所持枚数": {"type": None, "number": {}},
+                    "統合済み": {"type": None, "checkbox": {}},
+                }
+            },
+        ),
+        (
+            "type_is_wrong_type",
+            {
+                "properties": {
+                    "所持枚数": {"type": 123, "number": {}},
+                    "統合済み": {"type": 123, "checkbox": {}},
+                }
+            },
+        ),
+    ],
+)
+def test_r1_t9_to_t13_malformed_read_back_preserves_original_unknown(
+    label: str, verification_response: object
+) -> None:
+    """R1-T9〜T13: いずれのmalformed/unexpected response shapeでも、raw
+    exceptionを送出せずinconclusiveとして扱い、original UNKNOWNを維持する。
+    """
+    client = _MalformedSchemaClient(
+        patch_error=_unknown_error(), verification_response=verification_response
+    )
+    repo = DedupeRepository(client, DATA_SOURCE_ID)
+
+    with pytest.raises(SchemaMigrationExecutionError) as exc_info:
+        execute_schema_migration(repo, ["所持枚数", "統合済み"])
+
+    carrier = exc_info.value
+    assert carrier.result.completion == SchemaWriteCompletion.UNKNOWN, label
+    assert carrier.result.verification == SchemaVerificationState.INCONCLUSIVE, label
+    assert len(client.get_data_source_calls) == 1, label
+
+
+def test_r1_t14_verification_helper_unexpected_exception_preserves_unknown() -> None:
+    """verify_schema_properties_present()の内部処理が想定外の例外
+    (AttributeError/TypeError/ValueError等)を送出しても、execute_schema_migration()
+    まで伝播させず、original UNKNOWNを維持する(最終安全境界の直接テスト)。
+    """
+
+    class _ExplodingDict(dict):
+        def get(self, *args: object, **kwargs: object) -> object:
+            raise TypeError("simulated unexpected parsing failure")
+
+    client = _MalformedSchemaClient(
+        patch_error=_unknown_error(), verification_response=_ExplodingDict({"properties": {}})
+    )
+    repo = DedupeRepository(client, DATA_SOURCE_ID)
+
+    # verify_schema_properties_present()を直接呼んでも例外を外へ漏らさない。
+    assert verify_schema_properties_present(repo, ("所持枚数",)) is False
+
+    # execute_schema_migration()経由でもoriginal UNKNOWNが維持される。
+    client2 = _MalformedSchemaClient(
+        patch_error=_unknown_error(), verification_response=_ExplodingDict({"properties": {}})
+    )
+    repo2 = DedupeRepository(client2, DATA_SOURCE_ID)
+    with pytest.raises(SchemaMigrationExecutionError) as exc_info:
+        execute_schema_migration(repo2, ["所持枚数"])
+
+    assert exc_info.value.result.completion == SchemaWriteCompletion.UNKNOWN
+    assert exc_info.value.result.verification == SchemaVerificationState.INCONCLUSIVE
+
+
+def test_r1_shape_validation_does_not_swallow_base_exceptions() -> None:
+    """KeyboardInterrupt/SystemExit等のBaseExceptionはverificationの安全境界
+    (except Exception)で捕捉されず、そのまま伝播する(§20の要求通り)。"""
+
+    class _InterruptingClient:
+        def update_data_source_schema(self, data_source_id: str, properties: dict) -> dict:
+            raise _unknown_error()
+
+        def get_data_source(self, data_source_id: str) -> dict:
+            raise KeyboardInterrupt()
+
+    repo = DedupeRepository(_InterruptingClient(), DATA_SOURCE_ID)
+
+    with pytest.raises(KeyboardInterrupt):
+        execute_schema_migration(repo, ["所持枚数"])
