@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -1433,6 +1434,178 @@ def test_p2p_t15_dry_run_both_flags_error_json_no_writes_no_json(
 
     assert result.exit_code == 0
     assert fake_repo.apply_schema_migration_calls == []
+    assert execute_calls["count"] == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+
+
+# --- Phase 3B: schema post-write verification pilot(CLI full-stack統合) -----
+#
+# ここではcli.execute_schema_migrationをmonkeypatchせず、real DedupeRepository
+# /execute_schema_migration()を実際に通す(NotionClientの低レベル送受信だけを
+# fakeにする)ことで、missing_schema_properties()→apply_schema_migration()→
+# (UNKNOWN時のみ)verification GETという実際の統合経路全体を検証する。
+
+
+class _FakeVerificationNotionClient:
+    """dedupe-cardsのCLI統合経路全体をreal DedupeRepository経由で検証するための
+    fake低レベルNotionClient。
+
+    1回目のget_data_source()呼び出しはmissing_schema_properties()用
+    (対象propertyがまだ無い状態を返す)、2回目以降はverification用
+    (呼び出し側が指定したschemaを返す)として振る舞う。
+    """
+
+    def __init__(self, *, patch_error: Exception, verification_schema: dict) -> None:
+        self._patch_error = patch_error
+        self._verification_schema = verification_schema
+        self.get_data_source_calls = 0
+        self.update_data_source_schema_calls: list[dict] = []
+
+    def get_data_source(self, data_source_id: str) -> dict:
+        self.get_data_source_calls += 1
+        if self.get_data_source_calls == 1:
+            return {"properties": {}}
+        return self._verification_schema
+
+    def update_data_source_schema(self, data_source_id: str, properties: dict) -> dict:
+        self.update_data_source_schema_calls.append(dict(properties))
+        raise self._patch_error
+
+
+class _FakeVerificationClientCtx:
+    def __init__(self, client: _FakeVerificationNotionClient) -> None:
+        self._client = client
+
+    def __enter__(self) -> _FakeVerificationNotionClient:
+        return self._client
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+
+def _unknown_notion_error() -> NotionAPIError:
+    error = NotionAPIError("Notion APIへの接続がタイムアウトしました: timed out")
+    error.__cause__ = httpx.TimeoutException("timed out")
+    return error
+
+
+def _positive_schema_properties() -> dict:
+    return {
+        "properties": {
+            "所持枚数": {"type": "number", "number": {"format": "number"}},
+            "統合済み": {"type": "checkbox", "checkbox": {}},
+        }
+    }
+
+
+def test_b_t9_error_json_verification_inconclusive_preserves_schema_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_client = _FakeVerificationNotionClient(
+        patch_error=_unknown_notion_error(), verification_schema={"properties": {}}
+    )
+    monkeypatch.setattr(
+        cli, "NotionClient", lambda api_key: _FakeVerificationClientCtx(fake_client)
+    )
+    # cli.DedupeRepositoryはmonkeypatchしない(real DedupeRepositoryをそのまま使う)。
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 1
+    assert fake_client.get_data_source_calls == 2  # missing_schema_properties + verification
+    payload = json.loads(result.stdout)
+    assert payload["schema_version"] == SCHEMA_VERSION + 1
+    assert payload["error_code"] == ErrorCode.SCHEMA_WRITE_FAILURE
+    assert payload["mutation"]["state"] == "MUTATION_STATE_UNKNOWN"
+    assert payload["mutation"]["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+
+
+def test_b_t10_error_json_positive_verification_success_has_no_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_client = _FakeVerificationNotionClient(
+        patch_error=_unknown_notion_error(), verification_schema=_positive_schema_properties()
+    )
+    monkeypatch.setattr(
+        cli, "NotionClient", lambda api_key: _FakeVerificationClientCtx(fake_client)
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    apply_result = DedupeApplyResult(
+        results=[
+            GroupApplyResult(
+                card_name="沼",
+                representative_page_id="p1",
+                representative_updated=True,
+                duplicate_page_ids_marked=["p2"],
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "execute_dedupe_plan", lambda plan, repo: apply_result)
+
+    result = runner.invoke(
+        cli.app,
+        ["dedupe-cards", "--card-name", "沼", "--apply", "--apply-schema", "--error-json"],
+    )
+
+    assert result.exit_code == 0
+    assert fake_client.get_data_source_calls == 2
+    assert len(fake_client.update_data_source_schema_calls) == 1  # single-PATCH契約維持
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(result.stdout)
+    assert "スキーマに追加しました" in result.stdout
+    assert "成功: 1件" in result.stdout
+
+
+def test_b_t11_dry_run_never_attempts_patch_or_verification_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    fake_client = _FakeVerificationNotionClient(
+        patch_error=_unknown_notion_error(), verification_schema=_positive_schema_properties()
+    )
+    monkeypatch.setattr(
+        cli, "NotionClient", lambda api_key: _FakeVerificationClientCtx(fake_client)
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_dedupe_plan",
+        lambda repo, card_name=None, representative_page_id=None: _sample_plan(),
+    )
+    execute_calls = {"count": 0}
+    monkeypatch.setattr(
+        cli,
+        "execute_dedupe_plan",
+        lambda plan, repo: execute_calls.__setitem__("count", execute_calls["count"] + 1),
+    )
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "dedupe-cards",
+            "--card-name",
+            "沼",
+            "--dry-run",
+            "--apply",
+            "--apply-schema",
+            "--error-json",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert fake_client.update_data_source_schema_calls == []
+    # missing_schema_properties()自体は1回のみ(dry-runでもpreview表示のため
+    # 読み取りは行う)。verification GETは、PATCHを一切試みていないため発生しない。
+    assert fake_client.get_data_source_calls == 1
     assert execute_calls["count"] == 0
     with pytest.raises(json.JSONDecodeError):
         json.loads(result.stdout)
