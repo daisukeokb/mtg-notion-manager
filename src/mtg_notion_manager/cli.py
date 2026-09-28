@@ -100,6 +100,7 @@ from mtg_notion_manager.services.card_resolution import (
 from mtg_notion_manager.services.dedupe_cards import build_dedupe_plan, execute_dedupe_plan
 from mtg_notion_manager.services.dedupe_schema import (
     SchemaMigrationExecutionError,
+    SchemaWriteCompletion,
     execute_schema_migration,
 )
 from mtg_notion_manager.services.doctor import run_doctor
@@ -642,9 +643,19 @@ def dedupe_cards_command(
             schema_contribution = NO_SCHEMA_CONTRIBUTION
             if apply_schema and missing_schema and not dry_run:
                 schema_migration_result = execute_schema_migration(repo, missing_schema)
-                render_console.print(
-                    f"[green]スキーマに追加しました: {', '.join(missing_schema)}[/green]"
-                )
+                if schema_migration_result.completion == SchemaWriteCompletion.SUCCEEDED:
+                    render_console.print(
+                        f"[green]スキーマに追加しました: {', '.join(missing_schema)}[/green]"
+                    )
+                else:
+                    # completion==UNKNOWNのままread-backでdesired stateを
+                    # 確認できたケース(Phase 3B-R1)。今回のPATCH自体が
+                    # 成功したとは断定しない。
+                    render_console.print(
+                        "[yellow]必要なスキーマ状態を確認しました"
+                        "(今回の書き込み自体が成功したかは未確定です): "
+                        f"{', '.join(missing_schema)}[/yellow]"
+                    )
                 missing_schema = []
                 schema_applied = True
                 schema_contribution = schema_mutation_contribution_for_success(

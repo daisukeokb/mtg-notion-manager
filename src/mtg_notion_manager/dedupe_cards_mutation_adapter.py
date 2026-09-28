@@ -31,6 +31,7 @@ from mtg_notion_manager.services.dedupe_cards import DedupeApplyResult
 from mtg_notion_manager.services.dedupe_schema import (
     SchemaMigrationExecutionError,
     SchemaMigrationResult,
+    SchemaVerificationState,
     SchemaWriteCompletion,
 )
 
@@ -91,11 +92,39 @@ NO_SCHEMA_CONTRIBUTION = SchemaMutationContribution()
 def schema_mutation_contribution_for_success(
     result: SchemaMigrationResult,
 ) -> SchemaMutationContribution:
-    """成功operationはoperations[]へ含めない(既存dedupe adapterと同じ方針、
-    §26/§27: property単位のwrite accountingを新設しない)。
+    """schema prerequisiteが満たされ(schema_prerequisite_satisfied()==True)、
+    dedupe phaseへ進めた場合のcontributionを構築する。
+
+    completion==SUCCEEDED(PATCH自体が例外なく成功)の場合のみsucceeded=1と
+    する(成功operationはoperations[]へ含めない、既存dedupe adapterと同じ
+    方針。§26/§27: property単位のwrite accountingを新設しない)。
+
+    completion==UNKNOWNのままverification==DESIRED_STATE_VERIFIEDで
+    dedupeへ進めた場合は、schema PATCH自体のwrite outcomeは引き続き
+    unknownであるため、succeededへ書き換えずunknown=1として正確に計上する
+    (Phase 3B-R0で確認されたresult fidelity gapの修正――post-write
+    verificationで確認できたのはdesired stateの成立であり、PATCH自体が
+    成功した証拠ではないため、MutationSummary上もそのまま「unknown」の
+    write attemptとして扱う)。
     """
-    del result
-    return SchemaMutationContribution(succeeded=1)
+    if result.completion == SchemaWriteCompletion.SUCCEEDED:
+        return SchemaMutationContribution(succeeded=1)
+    if (
+        result.completion == SchemaWriteCompletion.UNKNOWN
+        and result.verification == SchemaVerificationState.DESIRED_STATE_VERIFIED
+    ):
+        key = "、".join(result.property_names)
+        return SchemaMutationContribution(
+            unknown=1,
+            operations=(
+                MutationOperation(key=key, action=_SCHEMA_UPDATE_ACTION, state="unknown"),
+            ),
+        )
+    raise ValueError(
+        "Unexpected SchemaMigrationResult on a schema-prerequisite-satisfied path: "
+        f"completion={result.completion!r}, verification={result.verification!r} "
+        f"(card DB schema properties: {result.property_names!r})."
+    )
 
 
 def schema_mutation_contribution_for_failure(

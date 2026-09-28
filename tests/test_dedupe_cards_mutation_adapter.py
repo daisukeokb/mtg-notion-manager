@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from mtg_notion_manager.dedupe_apply_mutation_adapter import build_dedupe_apply_mutation_summary
 from mtg_notion_manager.dedupe_cards_mutation_adapter import (
     NO_SCHEMA_CONTRIBUTION,
@@ -19,6 +21,7 @@ from mtg_notion_manager.services.dedupe_cards import (
 from mtg_notion_manager.services.dedupe_schema import (
     SchemaMigrationExecutionError,
     SchemaMigrationResult,
+    SchemaVerificationState,
     SchemaWriteCompletion,
 )
 
@@ -79,6 +82,43 @@ def test_schema_contribution_for_success_has_no_operations() -> None:
     assert contribution == SchemaMutationContribution(
         succeeded=1, failed=0, unknown=0, operations=()
     )
+
+
+def test_r1_t6_schema_contribution_for_verified_unknown_stays_unknown() -> None:
+    """R1-T6: completion==UNKNOWN + verification==DESIRED_STATE_VERIFIEDでも、
+    succeededへ書き換えずunknown=1として計上する(Phase 3B-R0で確認された
+    result fidelity gapの修正)。"""
+    result = SchemaMigrationResult(
+        completion=SchemaWriteCompletion.UNKNOWN,
+        property_names=("所持枚数", "統合済み"),
+        verification=SchemaVerificationState.DESIRED_STATE_VERIFIED,
+    )
+
+    contribution = schema_mutation_contribution_for_success(result)
+
+    assert contribution.succeeded == 0
+    assert contribution.failed == 0
+    assert contribution.unknown == 1
+    assert len(contribution.operations) == 1
+    op = contribution.operations[0]
+    assert op.action == "schema_update"
+    assert op.state == "unknown"
+    assert op.key == "所持枚数、統合済み"
+
+
+def test_r1_schema_contribution_for_success_rejects_unexpected_combination() -> None:
+    """schema_prerequisite_satisfied()がFalseになるはずの組み合わせ
+    (completion==UNKNOWN かつ verification!=DESIRED_STATE_VERIFIED)が
+    誤って渡された場合、fail closedでValueErrorを送出する
+    (架空のschema successを静かに作らない)。"""
+    result = SchemaMigrationResult(
+        completion=SchemaWriteCompletion.UNKNOWN,
+        property_names=("所持枚数",),
+        verification=SchemaVerificationState.INCONCLUSIVE,
+    )
+
+    with pytest.raises(ValueError, match="Unexpected SchemaMigrationResult"):
+        schema_mutation_contribution_for_success(result)
 
 
 def test_schema_contribution_for_known_failure() -> None:
@@ -227,3 +267,59 @@ def test_aggregate_attempted_invariant_holds_across_combinations() -> None:
     for dedupe_result, contribution in cases:
         summary = build_dedupe_cards_mutation_summary(dedupe_result, contribution)
         assert summary.attempted == summary.succeeded + summary.failed + summary.unknown
+
+
+def test_r1_t7_verified_unknown_schema_plus_dedupe_success_aggregate() -> None:
+    """R1-T7: schema=UNKNOWN(verified)、dedupeが成功しても、aggregateの
+    schema分はunknownのまま正確に残る(succeededへ捏造しない)。"""
+    dedupe_result = DedupeApplyResult(results=[_dedupe_success("沼", marked=["p2"])])
+    verified_result = SchemaMigrationResult(
+        completion=SchemaWriteCompletion.UNKNOWN,
+        property_names=("所持枚数", "統合済み"),
+        verification=SchemaVerificationState.DESIRED_STATE_VERIFIED,
+    )
+    schema_contribution = schema_mutation_contribution_for_success(verified_result)
+
+    summary = build_dedupe_cards_mutation_summary(dedupe_result, schema_contribution)
+
+    # schema: unknown=1。dedupe: 沼(代表1+mark1=2 succeeded)。
+    assert summary.attempted == 3
+    assert summary.succeeded == 2
+    assert summary.failed == 0
+    assert summary.unknown == 1
+    assert summary.state == "MUTATION_STATE_UNKNOWN"
+    assert summary.recovery_action == "RECONCILE_BEFORE_RETRY"
+    assert summary.operations == (
+        MutationOperation(key="所持枚数、統合済み", action="schema_update", state="unknown"),
+    )
+
+
+def test_r1_t8_verified_unknown_schema_plus_dedupe_failure_aggregate() -> None:
+    """R1-T8: schema=UNKNOWN(verified) + dedupe known failureの両方が
+    aggregateへ正確に残る(schemaをsucceededへ捏造しない)。"""
+    dedupe_result = DedupeApplyResult(results=[_dedupe_known_failed("島", marked=[])])
+    verified_result = SchemaMigrationResult(
+        completion=SchemaWriteCompletion.UNKNOWN,
+        property_names=("所持枚数", "統合済み"),
+        verification=SchemaVerificationState.DESIRED_STATE_VERIFIED,
+    )
+    schema_contribution = schema_mutation_contribution_for_success(verified_result)
+
+    summary = build_dedupe_cards_mutation_summary(dedupe_result, schema_contribution)
+
+    # schema: unknown=1。dedupe: 島(代表成功=1 succeeded、markがKNOWN_FAILED=1 failed)。
+    assert summary.attempted == 3
+    assert summary.succeeded == 1
+    assert summary.failed == 1
+    assert summary.unknown == 1
+    # unknown>0が優先されるため、全体stateはMUTATION_STATE_UNKNOWN。
+    assert summary.state == "MUTATION_STATE_UNKNOWN"
+    assert summary.recovery_action == "RECONCILE_BEFORE_RETRY"
+    assert len(summary.operations) == 2
+    assert (
+        MutationOperation(key="所持枚数、統合済み", action="schema_update", state="unknown")
+        in summary.operations
+    )
+    assert (
+        MutationOperation(key="島", action="mark_merged", state="failed") in summary.operations
+    )
