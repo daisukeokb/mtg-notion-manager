@@ -631,6 +631,12 @@ def dedupe_cards_command(
     error_buffer = io.StringIO()
     render_console = Console(file=error_buffer) if error_json else console
 
+    # schema mutationのwrite historyは、try外で初期化しておくことで、schema
+    # mutation後のdownstream failure(build_dedupe_plan()のNotion読み取り失敗等)
+    # を捕捉するexcept節からも参照できるようにする(Phase 3C-R1)。schema
+    # mutationより前の失敗ではNO_SCHEMA_CONTRIBUTIONのまま(架空のmutationを作らない)。
+    schema_contribution = NO_SCHEMA_CONTRIBUTION
+
     try:
         with NotionClient(config.notion_api_key) as client:
             repo = DedupeRepository(client, config.card_data_source_id)
@@ -640,7 +646,6 @@ def dedupe_cards_command(
             render_console.print()
 
             schema_applied = False
-            schema_contribution = NO_SCHEMA_CONTRIBUTION
             if apply_schema and missing_schema and not dry_run:
                 schema_migration_result = execute_schema_migration(repo, missing_schema)
                 if schema_migration_result.completion == SchemaWriteCompletion.SUCCEEDED:
@@ -737,7 +742,17 @@ def dedupe_cards_command(
                     mutation=mutation,
                 )
             else:
-                emit_error_json("dedupe-cards", *classify_exception(exc), str(exc))
+                # schema mutation後のdownstream failure(Phase 3C-R1)。
+                # error_category/error_codeは実際の中断原因(downstream failure)の
+                # classificationを維持し、mutationにはそれ以前に既に試みた
+                # schema mutationのhistoryだけを載せる(両者は独立したlayer)。
+                # schema mutationを一切試みていなければ従来通りv1(mutationなし)。
+                mutation = None
+                if schema_contribution != NO_SCHEMA_CONTRIBUTION:
+                    mutation = build_dedupe_cards_mutation_summary(None, schema_contribution)
+                emit_error_json(
+                    "dedupe-cards", *classify_exception(exc), str(exc), mutation=mutation
+                )
         else:
             console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
