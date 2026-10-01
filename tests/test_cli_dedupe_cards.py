@@ -1641,3 +1641,320 @@ def test_r1_t18_malformed_read_back_error_json_stays_structured(
     assert payload["error_code"] == ErrorCode.SCHEMA_WRITE_FAILURE
     assert payload["mutation"]["state"] == "MUTATION_STATE_UNKNOWN"
     assert payload["mutation"]["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+
+
+# --- Phase 3C-R1: post-schema downstream error mutation fidelity ----------
+# schema mutationを実際に試みた後、build_dedupe_plan()等のdownstream処理が
+# MtgNotionManagerErrorで失敗した場合でも、error_category/error_codeは実際の
+# 中断原因(downstream failure)のclassificationを維持したまま、既に試みた
+# schema mutationのhistoryをError Contract v2のmutationとして保持することを
+# 固定する回帰テスト群。real DedupeRepository/build_dedupe_plan()/
+# execute_schema_migration()を通し、低レベルNotionClientだけをfakeにする。
+
+
+def _http_500_notion_error(
+    message: str = "Notion API呼び出しに失敗しました (500)",
+) -> NotionAPIError:
+    request = httpx.Request("POST", "https://api.notion.com/v1/data_sources/card-ds-id/query")
+    response = httpx.Response(500, request=request)
+    error = NotionAPIError(message)
+    error.__cause__ = httpx.HTTPStatusError("500", request=request, response=response)
+    return error
+
+
+class _PostSchemaDownstreamNotionClient:
+    """schema preview/PATCH/verification/planning readを個別に制御できるfake
+    低レベルNotionClient。
+
+    get_data_source()の1回目はpreview用(missing_schema_properties())で、
+    schema_present=Falseならschema propertyが無い状態を返す。2回目以降は
+    verification/planning用としてverification_schemaを返す。
+    """
+
+    def __init__(
+        self,
+        *,
+        schema_present: bool = False,
+        preview_error: NotionAPIError | None = None,
+        patch_error: NotionAPIError | None = None,
+        verification_schema: dict | None = None,
+        query_error: NotionAPIError | None = None,
+        pages: list[dict] | None = None,
+        property_item_error: NotionAPIError | None = None,
+    ) -> None:
+        self._schema_present = schema_present
+        self._preview_error = preview_error
+        self._patch_error = patch_error
+        self._verification_schema = (
+            verification_schema
+            if verification_schema is not None
+            else _positive_schema_properties()
+        )
+        self._query_error = query_error
+        self._pages = pages or []
+        self._property_item_error = property_item_error
+        self.get_data_source_calls = 0
+        self.update_data_source_schema_calls: list[dict] = []
+        self.query_calls = 0
+        self.property_item_calls = 0
+        self.update_page_calls: list[str] = []
+
+    def get_data_source(self, data_source_id: str) -> dict:
+        self.get_data_source_calls += 1
+        if self.get_data_source_calls == 1:
+            if self._preview_error is not None:
+                raise self._preview_error
+            return _positive_schema_properties() if self._schema_present else {"properties": {}}
+        return self._verification_schema
+
+    def update_data_source_schema(self, data_source_id: str, properties: dict) -> dict:
+        self.update_data_source_schema_calls.append(dict(properties))
+        if self._patch_error is not None:
+            raise self._patch_error
+        return {}
+
+    def query_data_source_all(self, data_source_id: str, page_size: int = 100) -> list[dict]:
+        self.query_calls += 1
+        if self._query_error is not None:
+            raise self._query_error
+        return self._pages
+
+    def get_page_property_item(
+        self, page_id: str, property_id: str, page_size: int = 100
+    ) -> list[dict]:
+        self.property_item_calls += 1
+        if self._property_item_error is not None:
+            raise self._property_item_error
+        return []
+
+    def update_page(self, page_id: str, properties: dict) -> dict:
+        self.update_page_calls.append(page_id)
+        return {"id": page_id, "url": f"https://notion.so/{page_id}"}
+
+
+def _invoke_post_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_client: _PostSchemaDownstreamNotionClient,
+    args: list[str],
+):
+    monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
+    monkeypatch.setattr(
+        cli, "NotionClient", lambda api_key: _FakeVerificationClientCtx(fake_client)
+    )
+    return runner.invoke(cli.app, ["dedupe-cards", "--card-name", "沼", *args])
+
+
+def _assert_schema_succeeded_mutation(mutation: dict) -> None:
+    assert mutation["attempted"] == 1
+    assert mutation["succeeded"] == 1
+    assert mutation["failed"] == 0
+    assert mutation["unknown"] == 0
+    assert mutation["state"] == "MUTATION_SUCCEEDED"
+    assert mutation["recovery_action"] == "NONE"
+    # 成功operationはoperations[]へ含めない既存Mutation Contract(空ならキー省略)。
+    assert "operations" not in mutation
+
+
+def test_r1_3c_t1_no_schema_mutation_then_planning_failure_stays_v1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T1: schema mutationを一切試みていないplanning失敗は従来通りv1(mutationなし)。"""
+    fake_client = _PostSchemaDownstreamNotionClient(
+        schema_present=True, query_error=_unknown_notion_error()
+    )
+
+    result = _invoke_post_schema(
+        monkeypatch, fake_client, ["--apply", "--apply-schema", "--error-json"]
+    )
+
+    assert result.exit_code == 1
+    assert fake_client.update_data_source_schema_calls == []
+    assert fake_client.query_calls == 1
+    _assert_pure_json_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+
+
+def test_r1_3c_t2_schema_succeeded_then_planning_timeout_keeps_schema_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T2: schema PATCH成功後のplanning timeoutでも、category/codeは
+    NOTION_API_ERRORのまま、schema mutation historyをv2で保持する。"""
+    fake_client = _PostSchemaDownstreamNotionClient(query_error=_unknown_notion_error())
+
+    result = _invoke_post_schema(
+        monkeypatch, fake_client, ["--apply", "--apply-schema", "--error-json"]
+    )
+
+    assert result.exit_code == 1
+    assert len(fake_client.update_data_source_schema_calls) == 1  # single-PATCH契約維持
+    assert fake_client.get_data_source_calls == 1  # SUCCEEDEDではverification readなし
+    assert fake_client.query_calls == 1
+    assert fake_client.update_page_calls == []
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+    _assert_schema_succeeded_mutation(payload["mutation"])
+
+
+def test_r1_3c_t3_schema_succeeded_then_planning_http_500_keeps_schema_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T3: planning失敗がHTTPStatusError由来でもclassification・mutationはT2と同じ。"""
+    fake_client = _PostSchemaDownstreamNotionClient(query_error=_http_500_notion_error())
+
+    result = _invoke_post_schema(
+        monkeypatch, fake_client, ["--apply", "--apply-schema", "--error-json"]
+    )
+
+    assert result.exit_code == 1
+    assert len(fake_client.update_data_source_schema_calls) == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+    _assert_schema_succeeded_mutation(payload["mutation"])
+
+
+def test_r1_3c_t4_apply_schema_only_then_planning_failure_keeps_schema_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T4: --apply無しの--apply-schemaのみでもplanningは実行されるため、
+    その失敗でもschema mutation historyを保持する。"""
+    fake_client = _PostSchemaDownstreamNotionClient(query_error=_unknown_notion_error())
+
+    result = _invoke_post_schema(monkeypatch, fake_client, ["--apply-schema", "--error-json"])
+
+    assert result.exit_code == 1
+    assert len(fake_client.update_data_source_schema_calls) == 1
+    assert fake_client.query_calls == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+    _assert_schema_succeeded_mutation(payload["mutation"])
+
+
+def test_r1_3c_t5_verified_unknown_then_planning_failure_keeps_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T5: UNKNOWN+DESIRED_STATE_VERIFIEDでplanningへ進んだ後の失敗でも、
+    schema writeはunknown=1のまま保持する(succeededへ書き換えない)。"""
+    fake_client = _PostSchemaDownstreamNotionClient(
+        patch_error=_unknown_notion_error(), query_error=_unknown_notion_error()
+    )
+
+    result = _invoke_post_schema(
+        monkeypatch, fake_client, ["--apply", "--apply-schema", "--error-json"]
+    )
+
+    assert result.exit_code == 1
+    assert len(fake_client.update_data_source_schema_calls) == 1
+    assert fake_client.get_data_source_calls == 2  # preview + verification(1回のみ)
+    assert fake_client.query_calls == 1
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+    mutation = payload["mutation"]
+    assert mutation["attempted"] == 1
+    assert mutation["succeeded"] == 0
+    assert mutation["failed"] == 0
+    assert mutation["unknown"] == 1
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
+    assert mutation["operations"] == [
+        {"key": "所持枚数、統合済み", "action": "schema_update", "state": "unknown"}
+    ]
+
+
+def test_r1_3c_t6_deep_planning_relation_read_failure_keeps_schema_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T6: planning内部のより深いread(_build_merge_plan → get_full_relation_ids
+    → get_page_property_item)の失敗でもschema mutation historyを保持する。"""
+    pages = [_regression_page("p1", "沼"), _regression_page("p2", "沼")]
+    for page in pages:
+        page["properties"]["採用デッキ"]["has_more"] = True
+    fake_client = _PostSchemaDownstreamNotionClient(
+        pages=pages, property_item_error=_unknown_notion_error()
+    )
+
+    result = _invoke_post_schema(
+        monkeypatch, fake_client, ["--apply", "--apply-schema", "--error-json"]
+    )
+
+    assert result.exit_code == 1
+    assert len(fake_client.update_data_source_schema_calls) == 1
+    assert fake_client.query_calls == 1
+    assert fake_client.property_item_calls == 1
+    assert fake_client.update_page_calls == []
+    payload = _assert_pure_json_v2_mutation_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+    _assert_schema_succeeded_mutation(payload["mutation"])
+
+
+def test_r1_3c_t7_pre_schema_preview_failure_has_no_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """T7: schema mutationより前(preview用schema GET)の失敗では、try外へ移した
+    初期化によって架空のmutationが生じず、v1(mutationなし)のまま。"""
+    fake_client = _PostSchemaDownstreamNotionClient(preview_error=_unknown_notion_error())
+
+    result = _invoke_post_schema(
+        monkeypatch, fake_client, ["--apply", "--apply-schema", "--error-json"]
+    )
+
+    assert result.exit_code == 1
+    assert fake_client.update_data_source_schema_calls == []
+    assert fake_client.query_calls == 0
+    _assert_pure_json_error(
+        result.stdout,
+        command="dedupe-cards",
+        category=ErrorCategory.PRODUCTION_API,
+        code=ErrorCode.NOTION_API_ERROR,
+    )
+
+
+@pytest.mark.parametrize(
+    ("patch_error", "schema_message"),
+    [
+        (None, "スキーマに追加しました"),
+        (_unknown_notion_error(), "必要なスキーマ状態を確認しました"),
+    ],
+)
+def test_r1_3c_t8_human_mode_output_unchanged(
+    monkeypatch: pytest.MonkeyPatch, patch_error: NotionAPIError | None, schema_message: str
+) -> None:
+    """T8: human mode(--error-json無し)は従来通り、schema結果の表示に続けて
+    エラーを表示するだけで、JSONやmutation summaryを新たに出さない。"""
+    fake_client = _PostSchemaDownstreamNotionClient(
+        patch_error=patch_error,
+        query_error=NotionAPIError("Notion APIへの接続がタイムアウトしました: timed out"),
+    )
+
+    result = _invoke_post_schema(monkeypatch, fake_client, ["--apply", "--apply-schema"])
+
+    assert result.exit_code == 1
+    plain_stdout = _ANSI_ESCAPE_RE.sub("", result.stdout)
+    assert schema_message in plain_stdout
+    assert "エラー: Notion APIへの接続がタイムアウトしました: timed out" in plain_stdout
+    assert plain_stdout.index(schema_message) < plain_stdout.index("エラー:")
+    assert "mutation" not in plain_stdout
+    assert "schema_version" not in plain_stdout
