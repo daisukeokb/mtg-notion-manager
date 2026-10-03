@@ -54,10 +54,14 @@ from mtg_notion_manager.services.apply_dedupe_plan import (
     STATUS_SKIPPED_NOT_DUPLICATE,
     STATUS_SKIPPED_STALE,
     DedupeAuditReportLoadError,
+    PartialDedupeApplyAbortedError,
     apply_dedupe_batch,
     load_audit_report,
     select_target_groups,
     write_apply_log,
+)
+from mtg_notion_manager.services.apply_dedupe_plan import (
+    GroupApplyOutcome as ApplyDedupePlanGroupOutcome,
 )
 from mtg_notion_manager.services.apply_price_link_dedupe import (
     STATUS_APPLIED as PRICE_STATUS_APPLIED,
@@ -75,6 +79,10 @@ from mtg_notion_manager.services.apply_price_link_dedupe import (
     STATUS_SKIPPED_STALE as PRICE_STATUS_SKIPPED_STALE,
 )
 from mtg_notion_manager.services.apply_price_link_dedupe import (
+    GroupApplyOutcome as PriceLinkGroupApplyOutcome,
+)
+from mtg_notion_manager.services.apply_price_link_dedupe import (
+    PartialPriceLinkApplyAbortedError,
     PriceLinkDedupeReportLoadError,
     apply_price_link_targets,
     load_price_link_targets,
@@ -878,6 +886,62 @@ def audit_duplicates_command(
     console.print(f"  - {paths.markdown_path}")
 
 
+def _render_apply_dedupe_plan_results(
+    render_console: Console,
+    outcomes: list[ApplyDedupePlanGroupOutcome],
+    *,
+    audit_report: str,
+    output_dir: str,
+    applied: bool,
+) -> dict[str, int]:
+    """apply-dedupe-planの適用結果表・件数集計を表示し、実行ログを書き出す。
+
+    正常終了時と、完了済みグループの後に中断した場合(PartialDedupeApplyAbortedError、
+    Phase 3D-R1)の両方で同じ表示・同じ既存ログ形式を使うための共通処理
+    (表示内容・ログ形式自体は変更しない)。グループ別status件数を返す。
+    """
+    render_console.print()
+    result_table = Table(title="適用結果")
+    result_table.add_column("カード名")
+    result_table.add_column("結果")
+    result_table.add_column("代表ページID")
+    result_table.add_column("詳細/エラー")
+    for outcome in outcomes:
+        result_table.add_row(
+            outcome.card_name,
+            outcome.status,
+            outcome.representative_page_id or "",
+            outcome.error or outcome.reason,
+        )
+    render_console.print(result_table)
+
+    counts = {
+        STATUS_APPLIED: 0,
+        STATUS_PLANNED: 0,
+        STATUS_SKIPPED_STALE: 0,
+        STATUS_SKIPPED_NOT_DUPLICATE: 0,
+        STATUS_FAILED: 0,
+    }
+    for outcome in outcomes:
+        counts[outcome.status] += 1
+
+    render_console.print()
+    render_console.print(f"適用: {counts[STATUS_APPLIED]}件")
+    render_console.print(f"計画のみ(dry-run): {counts[STATUS_PLANNED]}件")
+    render_console.print(
+        f"スキップ(鮮度不一致): {counts[STATUS_SKIPPED_STALE]}件"
+    )
+    render_console.print(f"スキップ(重複解消済み): {counts[STATUS_SKIPPED_NOT_DUPLICATE]}件")
+    render_console.print(f"失敗: {counts[STATUS_FAILED]}件")
+
+    log_paths = write_apply_log(
+        outcomes, audit_report_path=audit_report, output_dir=Path(output_dir), applied=applied
+    )
+    render_console.print()
+    render_console.print(f"実行ログ: {log_paths.json_path}")
+    return counts
+
+
 @app.command(name="apply-dedupe-plan")
 def apply_dedupe_plan_command(
     audit_report: str = typer.Option(..., "--audit-report", help="監査レポートJSONのパス"),
@@ -1007,6 +1071,32 @@ def apply_dedupe_plan_command(
         with NotionClient(config.notion_api_key) as client:
             repo = DedupeRepository(client, config.card_data_source_id)
             outcomes = apply_dedupe_batch(repo, targets, apply=do_apply, exclusions=exclusions)
+    except PartialDedupeApplyAbortedError as exc:
+        # 完了済みグループの後、後続グループの処理中にMtgNotionManagerErrorで中断した
+        # (Phase 3D-R1)。error_category/error_codeは実際の中断原因(exc.cause)から
+        # 分類し、carrier自体では分類しない。mutationには中断前に完了したグループの
+        # write historyだけを載せる。完了済みグループが書き込みを1件も試みていなければ
+        # 従来通りv1(mutationなし)のまま、結果表示・実行ログも追加しない。
+        completed = list(exc.completed_outcomes)
+        mutation = build_dedupe_apply_mutation_summary(completed)
+        if mutation.attempted > 0:
+            _render_apply_dedupe_plan_results(
+                render_console,
+                completed,
+                audit_report=audit_report,
+                output_dir=output_dir,
+                applied=do_apply,
+            )
+        if error_json:
+            emit_error_json(
+                "apply-dedupe-plan",
+                *classify_exception(exc.cause),
+                str(exc.cause),
+                mutation=mutation if mutation.attempted > 0 else None,
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {exc.cause}")
+        raise typer.Exit(code=1) from exc
     except MtgNotionManagerError as exc:
         if error_json:
             emit_error_json("apply-dedupe-plan", *classify_exception(exc), str(exc))
@@ -1014,45 +1104,13 @@ def apply_dedupe_plan_command(
             console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    render_console.print()
-    result_table = Table(title="適用結果")
-    result_table.add_column("カード名")
-    result_table.add_column("結果")
-    result_table.add_column("代表ページID")
-    result_table.add_column("詳細/エラー")
-    for outcome in outcomes:
-        result_table.add_row(
-            outcome.card_name,
-            outcome.status,
-            outcome.representative_page_id or "",
-            outcome.error or outcome.reason,
-        )
-    render_console.print(result_table)
-
-    counts = {
-        STATUS_APPLIED: 0,
-        STATUS_PLANNED: 0,
-        STATUS_SKIPPED_STALE: 0,
-        STATUS_SKIPPED_NOT_DUPLICATE: 0,
-        STATUS_FAILED: 0,
-    }
-    for outcome in outcomes:
-        counts[outcome.status] += 1
-
-    render_console.print()
-    render_console.print(f"適用: {counts[STATUS_APPLIED]}件")
-    render_console.print(f"計画のみ(dry-run): {counts[STATUS_PLANNED]}件")
-    render_console.print(
-        f"スキップ(鮮度不一致): {counts[STATUS_SKIPPED_STALE]}件"
+    counts = _render_apply_dedupe_plan_results(
+        render_console,
+        outcomes,
+        audit_report=audit_report,
+        output_dir=output_dir,
+        applied=do_apply,
     )
-    render_console.print(f"スキップ(重複解消済み): {counts[STATUS_SKIPPED_NOT_DUPLICATE]}件")
-    render_console.print(f"失敗: {counts[STATUS_FAILED]}件")
-
-    log_paths = write_apply_log(
-        outcomes, audit_report_path=audit_report, output_dir=Path(output_dir), applied=do_apply
-    )
-    render_console.print()
-    render_console.print(f"実行ログ: {log_paths.json_path}")
 
     if not do_apply:
         render_console.print(
@@ -1226,6 +1284,60 @@ def review_duplicate_conflicts_command(
     console.print(f"  - {paths.markdown_path}")
 
 
+def _render_apply_price_link_dedupe_results(
+    render_console: Console,
+    outcomes: list[PriceLinkGroupApplyOutcome],
+    *,
+    targets_report: str,
+    output_dir: str,
+    applied: bool,
+) -> dict[str, int]:
+    """apply-price-link-dedupeの適用結果表・件数集計を表示し、実行ログを書き出す。
+
+    正常終了時と、完了済みグループの後に中断した場合(PartialPriceLinkApplyAbortedError、
+    Phase 3D-R1)の両方で同じ表示・同じ既存ログ形式を使うための共通処理
+    (表示内容・ログ形式自体は変更しない)。グループ別status件数を返す。
+    """
+    render_console.print()
+    result_table = Table(title="適用結果")
+    result_table.add_column("カード名")
+    result_table.add_column("結果")
+    result_table.add_column("代表ページID")
+    result_table.add_column("詳細/エラー")
+    for outcome in outcomes:
+        result_table.add_row(
+            outcome.card_name,
+            outcome.status,
+            outcome.representative_page_id or "",
+            outcome.error or outcome.reason,
+        )
+    render_console.print(result_table)
+
+    counts = {
+        PRICE_STATUS_APPLIED: 0,
+        PRICE_STATUS_PLANNED: 0,
+        PRICE_STATUS_SKIPPED_STALE: 0,
+        PRICE_STATUS_SKIPPED_NOT_DUPLICATE: 0,
+        PRICE_STATUS_FAILED: 0,
+    }
+    for outcome in outcomes:
+        counts[outcome.status] += 1
+
+    render_console.print()
+    render_console.print(f"適用: {counts[PRICE_STATUS_APPLIED]}件")
+    render_console.print(f"計画のみ(dry-run): {counts[PRICE_STATUS_PLANNED]}件")
+    render_console.print(f"スキップ(鮮度不一致): {counts[PRICE_STATUS_SKIPPED_STALE]}件")
+    render_console.print(f"スキップ(重複解消済み): {counts[PRICE_STATUS_SKIPPED_NOT_DUPLICATE]}件")
+    render_console.print(f"失敗: {counts[PRICE_STATUS_FAILED]}件")
+
+    log_paths = write_price_link_apply_log(
+        outcomes, targets_report_path=targets_report, output_dir=Path(output_dir), applied=applied
+    )
+    render_console.print()
+    render_console.print(f"実行ログ: {log_paths.json_path}")
+    return counts
+
+
 @app.command(name="apply-price-link-dedupe")
 def apply_price_link_dedupe_command(
     targets_report: str = typer.Option(
@@ -1393,6 +1505,32 @@ def apply_price_link_dedupe_command(
             outcomes = apply_price_link_targets(
                 repo, targets, apply=do_apply, exclusions=exclusions
             )
+    except PartialPriceLinkApplyAbortedError as exc:
+        # 完了済みグループの後、後続グループの処理中にMtgNotionManagerErrorで中断した
+        # (Phase 3D-R1)。error_category/error_codeは実際の中断原因(exc.cause)から
+        # 分類し、carrier自体では分類しない。mutationには中断前に完了したグループの
+        # write historyだけを載せる。完了済みグループが書き込みを1件も試みていなければ
+        # 従来通りv1(mutationなし)のまま、結果表示・実行ログも追加しない。
+        completed = list(exc.completed_outcomes)
+        mutation = build_dedupe_apply_mutation_summary(completed)
+        if mutation.attempted > 0:
+            _render_apply_price_link_dedupe_results(
+                render_console,
+                completed,
+                targets_report=targets_report,
+                output_dir=output_dir,
+                applied=do_apply,
+            )
+        if error_json:
+            emit_error_json(
+                "apply-price-link-dedupe",
+                *classify_exception(exc.cause),
+                str(exc.cause),
+                mutation=mutation if mutation.attempted > 0 else None,
+            )
+        else:
+            console.print(f"[red]エラー:[/red] {exc.cause}")
+        raise typer.Exit(code=1) from exc
     except MtgNotionManagerError as exc:
         if error_json:
             emit_error_json("apply-price-link-dedupe", *classify_exception(exc), str(exc))
@@ -1400,43 +1538,13 @@ def apply_price_link_dedupe_command(
             console.print(f"[red]エラー:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    render_console.print()
-    result_table = Table(title="適用結果")
-    result_table.add_column("カード名")
-    result_table.add_column("結果")
-    result_table.add_column("代表ページID")
-    result_table.add_column("詳細/エラー")
-    for outcome in outcomes:
-        result_table.add_row(
-            outcome.card_name,
-            outcome.status,
-            outcome.representative_page_id or "",
-            outcome.error or outcome.reason,
-        )
-    render_console.print(result_table)
-
-    counts = {
-        PRICE_STATUS_APPLIED: 0,
-        PRICE_STATUS_PLANNED: 0,
-        PRICE_STATUS_SKIPPED_STALE: 0,
-        PRICE_STATUS_SKIPPED_NOT_DUPLICATE: 0,
-        PRICE_STATUS_FAILED: 0,
-    }
-    for outcome in outcomes:
-        counts[outcome.status] += 1
-
-    render_console.print()
-    render_console.print(f"適用: {counts[PRICE_STATUS_APPLIED]}件")
-    render_console.print(f"計画のみ(dry-run): {counts[PRICE_STATUS_PLANNED]}件")
-    render_console.print(f"スキップ(鮮度不一致): {counts[PRICE_STATUS_SKIPPED_STALE]}件")
-    render_console.print(f"スキップ(重複解消済み): {counts[PRICE_STATUS_SKIPPED_NOT_DUPLICATE]}件")
-    render_console.print(f"失敗: {counts[PRICE_STATUS_FAILED]}件")
-
-    log_paths = write_price_link_apply_log(
-        outcomes, targets_report_path=targets_report, output_dir=Path(output_dir), applied=do_apply
+    counts = _render_apply_price_link_dedupe_results(
+        render_console,
+        outcomes,
+        targets_report=targets_report,
+        output_dir=output_dir,
+        applied=do_apply,
     )
-    render_console.print()
-    render_console.print(f"実行ログ: {log_paths.json_path}")
 
     if not do_apply:
         render_console.print(
