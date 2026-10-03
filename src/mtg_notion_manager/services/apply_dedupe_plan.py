@@ -105,6 +105,32 @@ class GroupApplyOutcome:
     failed_completion: str | None = None
 
 
+class PartialDedupeApplyAbortedError(MtgNotionManagerError):
+    """apply_dedupe_batch()が後続グループの処理中(鮮度再監査・統合計画作成の
+    Notion読み取り等)にMtgNotionManagerErrorで中断した際、それより前に完了して
+    いたグループのGroupApplyOutcomeを保持して運ぶcarrier。
+
+    import_cards.PartialImportAbortedErrorと同じ「中断前の完了済み結果を外部から
+    回収可能にする」目的だが、元の例外の型が一定ではない(NotionAPIError等)ため
+    subclass化はせず、元の例外を ``cause`` に保持する。呼び出し側は分類
+    (error_category/error_code)を必ず ``cause`` から行い、このcarrier自体を
+    分類に使ってはならない。str(self)は元の例外メッセージと同一。
+
+    completed_outcomesは処理順のimmutable snapshotで、常に1件以上を含む
+    (完了済みグループが無ければcarrierを使わず元の例外をそのまま伝播する)。
+    """
+
+    def __init__(
+        self,
+        cause: MtgNotionManagerError,
+        *,
+        completed_outcomes: tuple[GroupApplyOutcome, ...],
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.completed_outcomes = completed_outcomes
+
+
 def apply_dedupe_batch(
     repo: DedupeRepository,
     target_groups: list[ReportGroup],
@@ -117,7 +143,17 @@ def apply_dedupe_batch(
     outcomes: list[GroupApplyOutcome] = []
 
     for group in target_groups:
-        outcomes.append(_process_one_group(repo, group, apply=apply, exclusions=exclusions))
+        try:
+            outcome = _process_one_group(repo, group, apply=apply, exclusions=exclusions)
+        except MtgNotionManagerError as exc:
+            # 中断semantics自体は変更しない(このグループ・以降のグループは処理しない)。
+            # 完了済みグループが1件もなければ元の例外をそのまま伝播する。
+            if not outcomes:
+                raise
+            raise PartialDedupeApplyAbortedError(
+                exc, completed_outcomes=tuple(outcomes)
+            ) from exc
+        outcomes.append(outcome)
 
     return outcomes
 

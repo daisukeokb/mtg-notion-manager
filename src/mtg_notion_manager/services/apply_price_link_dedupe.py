@@ -240,6 +240,29 @@ class GroupApplyOutcome:
     failed_completion: str | None = None
 
 
+class PartialPriceLinkApplyAbortedError(MtgNotionManagerError):
+    """apply_price_link_targets()が後続グループの処理中(鮮度再監査・統合計画作成の
+    Notion読み取り等)にMtgNotionManagerErrorで中断した際、それより前に完了して
+    いたグループのGroupApplyOutcomeを保持して運ぶcarrier
+    (apply_dedupe_plan.PartialDedupeApplyAbortedErrorと同じsemantics)。
+
+    元の例外を ``cause`` に保持する。呼び出し側は分類(error_category/error_code)を
+    必ず ``cause`` から行い、このcarrier自体を分類に使ってはならない。
+    str(self)は元の例外メッセージと同一。completed_outcomesは処理順のimmutable
+    snapshotで、常に1件以上を含む。
+    """
+
+    def __init__(
+        self,
+        cause: MtgNotionManagerError,
+        *,
+        completed_outcomes: tuple[GroupApplyOutcome, ...],
+    ) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.completed_outcomes = completed_outcomes
+
+
 def apply_price_link_targets(
     repo: DedupeRepository,
     targets: list[PriceLinkTargetGroup],
@@ -248,9 +271,22 @@ def apply_price_link_targets(
 ) -> list[GroupApplyOutcome]:
     """対象グループを1件ずつ鮮度チェックしてから適用(またはdry-run計画表示)する。"""
     exclusions = exclusions or ExclusionList()
-    return [
-        _process_one_group(repo, target, apply=apply, exclusions=exclusions) for target in targets
-    ]
+    outcomes: list[GroupApplyOutcome] = []
+
+    for target in targets:
+        try:
+            outcome = _process_one_group(repo, target, apply=apply, exclusions=exclusions)
+        except MtgNotionManagerError as exc:
+            # 中断semantics自体は変更しない(このグループ・以降のグループは処理しない)。
+            # 完了済みグループが1件もなければ元の例外をそのまま伝播する。
+            if not outcomes:
+                raise
+            raise PartialPriceLinkApplyAbortedError(
+                exc, completed_outcomes=tuple(outcomes)
+            ) from exc
+        outcomes.append(outcome)
+
+    return outcomes
 
 
 def _process_one_group(
