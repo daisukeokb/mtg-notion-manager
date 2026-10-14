@@ -423,6 +423,82 @@ class TestFailedWriteMetadata:
         assert r.failed_operation == import_cards.FailedWriteOperation.RELATION_UPDATE
         assert r.failed_completion == import_cards.WriteCompletion.UNKNOWN
 
+    @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
+    def test_create_ambiguous_5xx_is_unknown(self, status_code: int) -> None:
+        """Phase 3F-R1: べき等でない新規作成に対する500/502/503/504は、サーバー側で
+        実際には作成済みである可能性を排除できないためUNKNOWNとする。"""
+        card = _card("カードA")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="create")],
+        )
+        repo = FailingCreateWithCauseCardRepository(
+            fail_on_name_ja={"カードA": _http_status_error(status_code)}
+        )
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.failed_operation == import_cards.FailedWriteOperation.CREATE
+        assert r.failed_completion == import_cards.WriteCompletion.UNKNOWN
+        assert repo.create_attempts == ["カードA"]
+
+    @pytest.mark.parametrize("status_code", [400, 429])
+    def test_create_non_ambiguous_http_error_stays_known_failed(self, status_code: int) -> None:
+        """400・リトライを使い切った429は従来通りKNOWN_FAILED。"""
+        card = _card("カードA")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="create")],
+        )
+        repo = FailingCreateWithCauseCardRepository(
+            fail_on_name_ja={"カードA": _http_status_error(status_code)}
+        )
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        assert result.results[0].failed_completion == import_cards.WriteCompletion.KNOWN_FAILED
+
+    @pytest.mark.parametrize(
+        "cause",
+        [httpx.RemoteProtocolError("disconnected"), httpx.ReadError("connection reset")],
+        ids=["remote_protocol_error", "read_error"],
+    )
+    def test_create_transport_error_is_unknown(self, cause: BaseException) -> None:
+        card = _card("カードA")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="create")],
+        )
+        repo = FailingCreateWithCauseCardRepository(fail_on_name_ja={"カードA": cause})
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        assert result.results[0].failed_completion == import_cards.WriteCompletion.UNKNOWN
+
+    def test_relation_update_5xx_classification_unchanged(self) -> None:
+        """Phase 3F-R1の分類変更はべき等でない新規作成だけが対象で、relation_update
+        (絶対値を設定するPATCH)の既存分類(HTTPエラー応答 → KNOWN_FAILED)は変えない。"""
+        card = _card("既存カード")
+        existing = _existing("p1")
+        plan = import_cards.ImportCardsPlan(
+            parsed=_parsed([card]),
+            deck_page_id=DECK_PAGE_ID,
+            decisions=[CardDecision(card=card, action="relation_update", existing=existing)],
+        )
+        repo = FailingRelationUpdateWithCauseCardRepository(
+            fail_on_page_id={"p1": _http_status_error(503)}
+        )
+
+        result = import_cards.execute_import_cards(plan, repo)
+
+        r = result.results[0]
+        assert r.failed_operation == import_cards.FailedWriteOperation.RELATION_UPDATE
+        assert r.failed_completion == import_cards.WriteCompletion.KNOWN_FAILED
+
     def test_successful_create_has_no_failure_metadata(self) -> None:
         card = _card("新カード")
         plan = import_cards.ImportCardsPlan(
