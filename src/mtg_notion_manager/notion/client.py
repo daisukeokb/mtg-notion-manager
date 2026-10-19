@@ -12,25 +12,34 @@ NOTION_VERSION = "2025-09-03"
 
 MAX_RETRIES = 5
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+#: 書き込みリクエストに対してこれらのサーバーエラーが返っても、サーバー側で実際には
+#: 書き込みが完了していた可能性を排除できない(Notion公式ドキュメントは「writeは変更を
+#: 保存したうえで503を返しうる」と明記し、500/502/503/504のリトライはべき等な
+#: リクエストに限るよう求めている)。べき等でない操作ではこれらを自動リトライせず、
+#: 呼び出し側は完了状態を不明(UNKNOWN)として扱う。
+AMBIGUOUS_WRITE_STATUS_CODES = frozenset({500, 502, 503, 504})
 
 
 class NotionClient:
     """Notion REST API(data source対応)の薄いラッパー。
 
-    429/5xxは指数バックオフ(Retry-Afterがあれば優先)で最大 MAX_RETRIES 回まで
-    自動リトライする(サーバーが応答を返しており、実際に処理が失敗したことが
-    ほぼ確実なため)。
+    429(rate_limited)は、べき等かどうかに関わらず指数バックオフ(Retry-Afterが
+    あれば優先)で最大 MAX_RETRIES 回まで自動リトライする(Notion公式SDKも429を
+    全メソッドでリトライしている)。
 
-    タイムアウト(応答が一切得られない状態)は、べき等なリクエストに限り同様に
-    リトライする。POST /pages によるページ作成はべき等ではない
-    (サーバー側で実際には作成が成功していたが応答がクライアントに届かない
-    だけ、という可能性を排除できない)ため、タイムアウト時に自動リトライすると
-    同一ページを二重作成しうる。そのため create_page() は
-    _request(..., idempotent=False) を指定し、タイムアウト時は自動リトライせず
-    即座にエラーを送出する(実際に2026-09-08、この二重作成が発生したことを
-    確認済み)。呼び出し側(import_cards等)は既存カードの検索を経てから
-    create_page() を呼ぶ設計のため、エラー後に呼び出し側から再実行すれば
-    安全に収束する。
+    5xx(500/502/503/504)とタイムアウト(応答が一切得られない状態)は、べき等な
+    リクエスト(GET・読み取り専用のPOST .../query・絶対値を設定するPATCH)に限り
+    同様にリトライする。5xxはサーバーが応答を返していても、書き込みが実際には
+    保存されていた可能性を排除できない(AMBIGUOUS_WRITE_STATUS_CODES参照)。
+
+    POST /pages によるページ作成はべき等ではない(サーバー側で実際には作成が
+    成功していたが、クライアントにはタイムアウトや5xxしか届かない、という
+    可能性を排除できない)ため、自動リトライすると同一ページを二重作成しうる。
+    そのため create_page() は _request(..., idempotent=False) を指定し、
+    タイムアウト時・5xx時は自動リトライせず即座にエラーを送出する(実際に
+    2026-09-08、タイムアウト時の自動リトライによる二重作成が発生したことを
+    確認済み)。この場合の完了状態は不明であり、呼び出し側から再実行する前に
+    Notion側の状態(既存ページの有無)を確認する必要がある。
     """
 
     def __init__(self, api_key: str, timeout: float = 15.0) -> None:
@@ -163,10 +172,22 @@ class NotionClient:
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code
-                if status in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                ambiguous_write = not idempotent and status in AMBIGUOUS_WRITE_STATUS_CODES
+                if (
+                    status in RETRYABLE_STATUS_CODES
+                    and not ambiguous_write
+                    and attempt < MAX_RETRIES
+                ):
                     time.sleep(_retry_wait_seconds(exc.response, attempt))
                     attempt += 1
                     continue
+                if ambiguous_write:
+                    raise NotionAPIError(
+                        f"Notion API呼び出しに失敗しました ({status}): {exc.response.text}"
+                        f"(この操作({method} {path})はべき等ではなく、サーバー側で実際には"
+                        "処理が完了していた可能性を排除できないため自動リトライしません。"
+                        "手動で状態を確認してから再実行してください)"
+                    ) from exc
                 raise NotionAPIError(
                     f"Notion API呼び出しに失敗しました ({status}): {exc.response.text}"
                 ) from exc

@@ -24,6 +24,7 @@ from mtg_notion_manager.models import (
     ParsedDeckList,
 )
 from mtg_notion_manager.notion.card_repository import CardRepository
+from mtg_notion_manager.notion.client import AMBIGUOUS_WRITE_STATUS_CODES
 from mtg_notion_manager.parsers.decklist import parse_decklist, validate_deck_count
 from mtg_notion_manager.services.card_resolution import (
     ConfirmedCardMapping,
@@ -56,6 +57,11 @@ class WriteCompletion:
     UNKNOWNへ倒す。update_page()はタイムアウト時に自動リトライされるが、
     「べき等なので再試行対象」であることと「完了状態が確定している」ことは
     同義ではないため、リトライを使い切った後のタイムアウトも同様にUNKNOWNとする。
+
+    例外: 新規カード作成(POST /pages、べき等でない)では、HTTPエラー応答のうち
+    500/502/503/504(notion.client.AMBIGUOUS_WRITE_STATUS_CODES)はサーバー側で
+    実際には作成が完了していた可能性を排除できないため、KNOWN_FAILEDではなく
+    UNKNOWNとする(_create_completion_from_notion_api_error参照)。
     """
 
     KNOWN_FAILED = "known_failed"
@@ -64,6 +70,25 @@ class WriteCompletion:
 
 def _completion_from_notion_api_error(exc: NotionAPIError) -> str:
     if isinstance(exc.__cause__, httpx.HTTPStatusError):
+        return WriteCompletion.KNOWN_FAILED
+    return WriteCompletion.UNKNOWN
+
+
+def _create_completion_from_notion_api_error(exc: NotionAPIError) -> str:
+    """新規カード作成(create_card())失敗時の完了状態。
+
+    HTTPエラー応答のstatus code(構造化データ)だけから判定する(メッセージ文字列は
+    見ない)。500/502/503/504は作成が実際には完了していた可能性があるためUNKNOWN、
+    それ以外のHTTPエラー応答(400・リトライを使い切った429等)はKNOWN_FAILED、
+    HTTPエラー応答以外(タイムアウト・接続エラー等)は従来通りUNKNOWN。
+    relation_update(べき等なPATCH)は対象外で、_completion_from_notion_api_error()
+    の既存分類のまま。
+    """
+    cause = exc.__cause__
+    if (
+        isinstance(cause, httpx.HTTPStatusError)
+        and cause.response.status_code not in AMBIGUOUS_WRITE_STATUS_CODES
+    ):
         return WriteCompletion.KNOWN_FAILED
     return WriteCompletion.UNKNOWN
 
@@ -314,10 +339,18 @@ def _apply_one(
             if decision.action == "create"
             else FailedWriteOperation.RELATION_UPDATE
         )
+        # create分岐でNotionへ送るのはcreate_card()のPOST /pages 1回だけのため、
+        # ここに来たCREATEの失敗は必ずそのPOSTの失敗である。べき等でないcreateに限り、
+        # 曖昧な5xxをUNKNOWNとして扱う専用の分類を使う(relation_updateは従来のまま)。
+        completion = (
+            _create_completion_from_notion_api_error(exc)
+            if failed_operation == FailedWriteOperation.CREATE
+            else _completion_from_notion_api_error(exc)
+        )
         return CardApplyResult(
             card=decision.card,
             action="failed",
             error=str(exc),
             failed_operation=failed_operation,
-            failed_completion=_completion_from_notion_api_error(exc),
+            failed_completion=completion,
         )
