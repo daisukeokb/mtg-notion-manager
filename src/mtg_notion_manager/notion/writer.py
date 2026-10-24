@@ -2,10 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import httpx
+
+from mtg_notion_manager.exceptions import NotionAPIError
 from mtg_notion_manager.models import DeckRecord, ExistingDeck
 from mtg_notion_manager.notion.client import NotionClient
 
 TITLE_PROPERTY = "名前"
+
+#: 作成リクエスト送信後に結果を確認できなかった場合に、エラーメッセージへ付ける案内。
+_DECK_CREATE_UNKNOWN_GUIDANCE = (
+    "(デッキの作成結果は不明です。サーバー側で実際には作成が完了していた可能性を"
+    "排除できないため自動リトライしません。再実行する前に、Notion側に同名デッキが"
+    "既に作成されていないか確認してください)"
+)
 
 
 @dataclass(frozen=True)
@@ -62,7 +72,34 @@ class NotionWriter:
         return diffs
 
     def create_deck(self, record: DeckRecord) -> dict:
-        return self._client.create_page(self._data_source_id, record.to_notion_properties())
+        """デッキページを作成する(POST /pages 1回、べき等でない)。
+
+        Phase 3E-R1-R1: 作成リクエストを送った後に結果を確認できない失敗は、元の例外を
+        __cause__ に保持したまま、作成結果が不明であることを明示したNotionAPIErrorへ
+        揃える(HTTP clientとcard作成の挙動は変更しない)。
+        - 2xx応答の本文をJSONとして解釈できない(ValueError/json.JSONDecodeError):
+          サーバーは成功応答を返しているため、作成が完了している可能性がある。
+        - タイムアウト・HTTPエラー応答以外の接続エラー(ReadError・RemoteProtocolError・
+          ConnectError等): 応答を受け取れていない。
+        タイムアウトと5xxはNotionClient側のメッセージが既に同じ注意を含むため、
+        そのまま再送出する。分類(classify_deck_create_failure)は__cause__の型だけを
+        見るため、いずれもUNKNOWNになる。
+        """
+        properties = record.to_notion_properties()
+        try:
+            return self._client.create_page(self._data_source_id, properties)
+        except NotionAPIError as exc:
+            cause = exc.__cause__
+            if isinstance(cause, httpx.HTTPError) and not isinstance(
+                cause, (httpx.HTTPStatusError, httpx.TimeoutException)
+            ):
+                raise NotionAPIError(f"{exc}{_DECK_CREATE_UNKNOWN_GUIDANCE}") from cause
+            raise
+        except ValueError as exc:
+            raise NotionAPIError(
+                f"Notion APIの成功応答(2xx)をJSONとして解釈できませんでした: {exc}"
+                f"{_DECK_CREATE_UNKNOWN_GUIDANCE}"
+            ) from exc
 
 
 def _extract_comparable_values(properties: dict) -> dict[str, object]:

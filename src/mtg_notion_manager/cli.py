@@ -25,9 +25,12 @@ from mtg_notion_manager.error_contract import (
     classify_exception,
     emit_error_json,
 )
-from mtg_notion_manager.exceptions import MtgNotionManagerError
+from mtg_notion_manager.exceptions import MtgNotionManagerError, NotionAPIError
 from mtg_notion_manager.import_cards_mutation_adapter import (
     build_import_cards_mutation_summary,
+)
+from mtg_notion_manager.import_deck_mutation_adapter import (
+    build_deck_create_mutation_summary,
 )
 from mtg_notion_manager.intentional_duplicates import load_intentional_duplicates
 from mtg_notion_manager.notion.card_repository import CardRepository
@@ -125,7 +128,11 @@ from mtg_notion_manager.services.import_cards import (
     build_import_cards_plan,
     execute_import_cards,
 )
-from mtg_notion_manager.services.import_deck import build_import_plan, execute_import
+from mtg_notion_manager.services.import_deck import (
+    build_import_plan,
+    classify_deck_create_failure,
+    execute_import,
+)
 from mtg_notion_manager.services.review_duplicate_conflicts import (
     CATEGORY_INTENTIONAL,
     CATEGORY_MANUAL,
@@ -272,11 +279,17 @@ def import_command(
             "--error-json は対話確認(この内容でNotionに登録しますか?)をbypassしない"
             "(--yes・--applyに相当する動作はない)。確認を拒否した場合・--dry-run・"
             "重複デッキのためスキップした場合は実行エラーではないため対象外"
-            "(既存の出力・終了コード0を変更しない)。確認後の書き込み(create_page)は"
-            "非べき等でありタイムアウト時は自動リトライしない設計のため、書き込み試行後に"
-            "発生したエラーでは、JSONの有無にかかわらずNotion側の書き込みが完了していない"
-            "ことの証明にはならない(自動リトライしないこと。再実行前に既存デッキ・重複状態を"
-            "手動で確認すること)。messageは診断用でありスクリプトからパースしないこと。"
+            "(既存の出力・終了コード0を変更しない)。書き込み以前に終了する実行エラー"
+            "(設定読み込み失敗・デッキ情報取得失敗・重複確認のNotion読み取り失敗など)は"
+            "schema_version 1(mutationなし)。確認後の書き込み(create_page、1回のみ)を"
+            "試みたうえでの失敗はschema_version 2となり、error_category/error_codeは実際の"
+            "原因の分類のまま、mutation(attempted=1)を付与する。サーバーが明示的に拒否した"
+            "HTTPエラー(400等)はMUTATION_FAILED/MANUAL_REVIEW_REQUIRED、500/502/503/504・"
+            "タイムアウト・接続エラーは作成が実際には完了していた可能性を排除できないため"
+            "MUTATION_STATE_UNKNOWN/RECONCILE_BEFORE_RETRY(非べき等のため自動リトライしない)。"
+            "いずれの場合もRETRY_ALLOWEDは出力しない:JSONの有無・内容にかかわらず自動リトライ"
+            "しないこと。再実行前に既存デッキ・重複状態を手動で確認すること。"
+            "messageは診断用でありスクリプトからパースしないこと。"
         ),
     ),
 ) -> None:
@@ -284,9 +297,10 @@ def import_command(
 
     --error-json は実行エラー(設定読み込み失敗・デッキ情報取得失敗・Notion書き込み失敗)
     だけを対象にする。対話確認・--dry-run・重複スキップは対象外で、既存の出力・終了コード0を
-    変更しない。確認後の唯一の書き込み(create_page)は非べき等でありタイムアウト時に
-    自動リトライしないため、書き込み試行後のエラーはNotion側の状態が不明である可能性がある
-    (詳細はREADMEの安全上の注意を参照)。
+    変更しない。書き込み以前のエラーはschema_version 1、確認後の唯一の書き込み
+    (create_page、非べき等でありタイムアウト・5xx時に自動リトライしない)を試みた後の
+    エラーはschema_version 2(mutation付き、完了状態はMUTATION_FAILEDまたは
+    MUTATION_STATE_UNKNOWN)になる(詳細はREADMEの安全上の注意を参照)。
     """
     try:
         config = Config.load()
@@ -334,7 +348,27 @@ def import_command(
                 console.print("キャンセルしました。")
                 raise typer.Exit(code=0)
 
-            execute_import(plan, writer)
+            try:
+                execute_import(plan, writer)
+            except NotionAPIError as exc:
+                # execute_import()がNotionへ送るのは確認後のcreate_page()(POST /pages)
+                # 1回だけのため、ここで捕捉するNotionAPIErrorは書き込みを試みた後の失敗
+                # である(Phase 3E-R1)。error_category/error_codeは実際の原因の分類の
+                # まま、完了状態(KNOWN_FAILED/UNKNOWN)をError Contract v2のmutationとして
+                # 付与する。human modeの表示・終了コードは変更しない。
+                if error_json:
+                    completion = classify_deck_create_failure(exc)
+                    emit_error_json(
+                        "import",
+                        *classify_exception(exc),
+                        str(exc),
+                        mutation=build_deck_create_mutation_summary(
+                            plan.record.name, completion
+                        ),
+                    )
+                else:
+                    console.print(f"[red]エラー:[/red] {exc}")
+                raise typer.Exit(code=1) from exc
             console.print("[green]Notionに登録しました。[/green]")
 
     except MtgNotionManagerError as exc:

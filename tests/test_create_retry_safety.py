@@ -73,7 +73,7 @@ def _patch_deck_plan(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
-def test_deck_import_503_sends_one_post_and_keeps_v1_error(
+def test_deck_import_503_sends_one_post_and_reports_unknown(
     monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
 ) -> None:
     _patch_deck_plan(monkeypatch)
@@ -86,12 +86,16 @@ def test_deck_import_503_sends_one_post_and_keeps_v1_error(
     assert _post_count(httpx_mock) == 1  # 二重作成につながる自動リトライをしない
     assert "Notionに登録しました" not in result.stdout  # 曖昧な5xxを成功扱いしない
     payload = json.loads(result.stdout.strip().splitlines()[-1])
-    # deck importは従来通りv1のみ(Phase 3E-R1の対象外)。
-    assert payload["schema_version"] == 1
+    # Phase 3E-R1: 書き込み試行後の失敗はv2。分類は実際の原因のまま、503は完了状態不明。
+    assert payload["schema_version"] == 2
     assert payload["command"] == "import"
     assert payload["error_category"] == ErrorCategory.PRODUCTION_API
     assert payload["error_code"] == ErrorCode.NOTION_API_ERROR
-    assert "mutation" not in payload
+    mutation = payload["mutation"]
+    assert mutation["attempted"] == 1
+    assert mutation["unknown"] == 1
+    assert mutation["state"] == "MUTATION_STATE_UNKNOWN"
+    assert mutation["recovery_action"] == "RECONCILE_BEFORE_RETRY"
 
 
 # --- card import(import-cards、v2) ----------------------------------------------
