@@ -12,7 +12,11 @@ from mtg_notion_manager.services.import_article import (
     STATUS_READY,
     ArticleImportPlan,
 )
-from mtg_notion_manager.services.import_cards import ImportCardsPlan, ImportCardsResult
+from mtg_notion_manager.services.import_cards import (
+    ImportCardsPlan,
+    ImportCardsResult,
+    WriteCompletion,
+)
 from mtg_notion_manager.services.verify_import import ArticleVerifyReport
 
 
@@ -82,7 +86,19 @@ def print_apply_result(console: Console, result: ImportCardsResult) -> None:
     succeeded = len(result.succeeded)
     failed = len(result.failed)
     console.print(f"成功: {succeeded}件 / 失敗: {failed}件")
-    if failed:
+    unknown = sum(
+        1 for r in result.failed if r.failed_completion == WriteCompletion.UNKNOWN
+    )
+    if unknown:
+        # Phase 3G: 完了状態が不明な書き込み(5xx・タイムアウト・接続エラー・2xx非JSON)が
+        # ある場合は、Error JSONのRECONCILE_BEFORE_RETRYと同じ意味の案内にする
+        # (Notion側の状態を確認する前の再実行を促さない)。
+        console.print(
+            f"[red]完了状態が不明な書き込みが{unknown}件あります(Notion側で実際には"
+            "作成・更新が完了していた可能性があります)。再実行する前に、Notion側で"
+            "該当カードの有無・採用デッキのリレーションを確認してください。[/red]"
+        )
+    elif failed:
         console.print(
             "[red]失敗したカードがあります。同じコマンドを再実行してください"
             "(成功済みのカードは重複作成・重複リレーションされません)。[/red]"
