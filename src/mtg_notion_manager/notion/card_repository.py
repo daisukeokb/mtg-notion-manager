@@ -7,10 +7,11 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from mtg_notion_manager.card_match_overrides import CardMatchOverrides
-from mtg_notion_manager.exceptions import CardMatchOverrideError
+from mtg_notion_manager.exceptions import CardMatchOverrideError, NotionAPIError
 from mtg_notion_manager.models import DeckCard, ExistingCard, VerifiedNewCard
 from mtg_notion_manager.notion.client import NotionClient
 from mtg_notion_manager.parsers.card_names import normalize_card_name
@@ -192,7 +193,22 @@ class CardRepository:
         if note:
             properties[NOTE_PROPERTY] = {"rich_text": [{"text": {"content": note}}]}
 
-        return self._client.create_page(self._data_source_id, properties)
+        # Phase 3G: 2xx応答の本文をJSONとして解釈できない場合(json.JSONDecodeError、
+        # 不正なバイト列ではUnicodeDecodeError)は、サーバーが成功応答を返しているため
+        # 作成が完了している可能性がある。未捕捉の例外にせず、元の例外をcauseに保持した
+        # NotionAPIErrorへ変換する(import_cards側はHTTPエラー応答以外のcauseを
+        # 完了状態不明(UNKNOWN)として扱う)。捕捉範囲はcreate_page()の呼び出しだけに
+        # 限定し、payload構築など他のValueErrorとは混同しない。NotionClient自体
+        # (read系・deck作成を含む)の挙動は変更しない。
+        try:
+            return self._client.create_page(self._data_source_id, properties)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise NotionAPIError(
+                f"Notion APIの成功応答(2xx)をJSONとして解釈できませんでした: {exc}"
+                "(カードの作成結果は不明です。サーバー側で実際には作成が完了していた"
+                "可能性を排除できないため自動リトライしません。再実行する前に、Notion側に"
+                "同名カードが既に作成されていないか確認してください)"
+            ) from exc
 
 
 def _is_merged(page: dict) -> bool:
