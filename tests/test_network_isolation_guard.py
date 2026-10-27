@@ -268,21 +268,26 @@ def test_dotenv_values_auto_discovery_is_disabled(network_guard: Any) -> None:
 
 def _path_variants(path: Path) -> list[str]:
     """同じファイルを指す、文字列としては異なるパスの表記(Unicode正規化・`..`・
-    大文字小文字)。大文字小文字違いは、そのファイルシステムで同一ファイルになる場合のみ。"""
+    大文字小文字)。ファイルシステムによって同一ファイルになるかが異なる(例: APFSでは
+    NFC/NFDや大文字小文字の違いが同じファイルを指すが、ext4では別のファイル名になる)
+    ため、そのファイルシステム上で実際に同じファイルを指す表記だけを返す。"""
     text = str(path)
-    variants = {
+    candidates = {
         text,
         unicodedata.normalize("NFC", text),
         unicodedata.normalize("NFD", text),
         str(path.parent / "." / ".." / path.parent.name / path.name),
+        str(path.with_name(path.name.upper())),
     }
-    upper = path.with_name(path.name.upper())
-    try:
-        if os.path.samefile(path, upper):
-            variants.add(str(upper))
-    except OSError:
-        pass
-    return sorted(variants)
+    variants = []
+    for candidate in sorted(candidates):
+        try:
+            if os.path.samefile(candidate, path):
+                variants.append(candidate)
+        except OSError:  # 別のファイル名として扱われ、存在しない
+            continue
+    assert text in variants
+    return variants
 
 
 def test_repo_dotenv_is_recognized_in_every_path_form(network_guard: Any) -> None:
