@@ -1,0 +1,16 @@
+# Layer B (Phase 3H-R1): never send local secrets or caches to a Docker build.
+# scripts/run_isolated_tests.sh builds from a fresh checkout of HEAD, so these
+# files are not present there anyway; this file is defense in depth for any
+# other build that uses the repository root as its context.
+.env
+.env.*
+!.env.example
+**/.env
+.venv/
+venv/
+reports/
+config/local/
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/

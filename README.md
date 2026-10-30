@@ -115,3 +115,17 @@ pytest
 - **認証情報の隔離**: `NOTION_*` 環境変数をテスト用のダミー値で上書きし、python-dotenvの `.env` 自動探索(引数なしの `load_dotenv()` / `dotenv_values()`)を無効化する。リポジトリ直下の `.env` は、パスを明示してもpython-dotenvの `load_dotenv` / `dotenv_values` / `get_key` / `DotEnv` から読めず、`set_key` / `unset_key` から書き換えられない(`CredentialAccessBlockedError`)。判定はパス文字列ではなくファイルの同一性(`os.path.samefile`)で行うため、Unicode正規化・大文字小文字・`..`・リンクの違いでは回避できない。テスト用に明示した別ファイルは読める。
 - 各テストの前後でガードが外れていないかを確認し、外れていれば再インストールしたうえでそのテストをエラーにする。
 - **限界**: このガードはpytestのプロセス内で、かつこの `conftest.py` が読み込まれる場合にだけ働く。`--noconftest`・リポジトリ直下より下位を指す `--confcutdir`・リポジトリ外のテストファイルでは無効。subprocess・multiprocessing(spawn)の子プロセス、ネイティブ拡張・ctypes、`_socket` を直接使う呼び出しには効かない(子プロセスにはダミーの環境変数だけが引き継がれる)。python-dotenv以外の手段(`open()` 等)による `.env` の読み取り(`open()` したstreamを `dotenv_values(stream=...)` 等へ渡すことを含む)は防がない。実行環境レベルでのネットワーク制限は行っていない。Windowsは未検証。
+
+### 隔離されたテスト実行環境(Layer B、CIの必須チェック)
+
+CIの必須チェック `test` は、リポジトリのコードを実行するすべてのテスト(`pytest`、`pytest tools/generation_workspace/tests`、Generation WorkspaceのCLI smoke)を、ネットワークの無いコンテナの中で実行する。上記のpytestガード(Layer A)はそのまま有効で、Layer Bはその外側で子プロセス・ネイティブコードを含めて通信を止める。
+
+```bash
+bash scripts/run_isolated_tests.sh      # 要Docker。Dockerが無ければ失敗する(隔離なしの実行へは切り替えない)
+bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外すと失敗することの確認
+```
+
+- **準備(ネットワークあり)**: commit済みのHEADだけを空のディレクトリへ取り出し(未追跡の `.env` は含まれない)、そこからimage(`ci/isolated-tests/Dockerfile`、ベースimageはdigest固定)をbuildして依存関係をinstallする。build contextは `.dockerignore` でも `.env` を除外する。CIのcheckoutは `persist-credentials: false`。
+- **実行(ネットワークなし)**: `docker run --network none`(loopbackのみ)、`--read-only`(書き込みは `/tmp` のtmpfsのみ)、`--cap-drop ALL`、`no-new-privileges`、非rootユーザー(uid 10001)、volume mountなし、Docker socketなし。環境変数はホストから引き継がず、`-e` で明示したダミーの `NOTION_*` だけを渡す。
+- **自己検査(fail-closed)**: テストの前に `ci/isolated-tests/verify_isolation.py` が、loopback以外のinterface・routeが無いこと(無ければプローブを送る前に停止)、Layer Aを通らない `_socket`・子プロセス・ネイティブ(git/libcurl)の接続が即座に「到達不能」で失敗すること、名前解決が失敗すること、ダミー以外の認証情報・秘密らしい環境変数・`.env`・Docker socketが無いこと、非rootでアプリケーションディレクトリが読み取り専用であることを確認し、1つでも満たさなければテストを実行しない。
+- **限界**: commit済みの変更だけが対象(未commitの変更はLayer Bでは検証されない)。`--network none` はloopbackを残すため、コンテナ内のlocalhost通信まではOSレベルで遮断しない(Layer Aがpytestプロセス内で遮断する)。依存関係のバージョンは `pyproject.toml` の範囲指定のままで、lockはしていない。ローカルのmacOSでDockerが無い場合はLayer Bを実行できない(正式な検証はCI)。`lint`・`type-check` と Generation Workspaceのruff/mypyは、コードを実行しない静的検査のため隔離外で実行する。
