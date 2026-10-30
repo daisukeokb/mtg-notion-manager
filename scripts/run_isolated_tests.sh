@@ -54,6 +54,7 @@ docker run --rm \
   --network none \
   --read-only \
   --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+  --tmpfs /work:rw,nosuid,nodev,size=1g,uid=10001,gid=10001,mode=0700 \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --user 10001:10001 \

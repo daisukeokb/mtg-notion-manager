@@ -10,6 +10,11 @@ cd /app
 
 python ci/isolated-tests/verify_isolation.py /app
 
+# Tests run in a writable copy on the /work tmpfs (see the Dockerfile); /app
+# stays read-only.
+cp -R /app/. /work/
+cd /work
+
 if [ "$#" -gt 0 ]; then
   exec "$@"
 fi

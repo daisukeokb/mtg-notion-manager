@@ -16,22 +16,28 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # git: one existing test runs `git ls-files`; the isolation self-check also uses
 # git (libcurl) as a native, non-Python network probe.
-# The repository is owned by root but read by the unprivileged test user, so
-# mark it as a safe directory system-wide.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/* \
-    && git config --system --add safe.directory /app \
     && useradd --uid 10001 --create-home --shell /usr/sbin/nologin tester
 
-WORKDIR /app
-COPY . /app
+# Layout:
+#   /work  build-time checkout the editable installs point to. At run time a
+#          tmpfs owned by the test user is mounted over it and the entrypoint
+#          fills it with a copy of /app after the isolation self-check: some
+#          tests write into the working tree (e.g. reports/), and this is the
+#          only writable place besides /tmp.
+#   /app   pristine, read-only copy of the same source (owned by root).
+WORKDIR /work
+COPY . /work
 
 # Defense in depth: the build context must never contain a .env file.
-RUN if find /app -name .env -not -path '/app/.git/*' | grep -q .; then \
+RUN if find /work -name .env -not -path '/work/.git/*' | grep -q .; then \
         echo "ERROR: .env found in the build context" >&2; exit 1; \
     fi \
-    && pip install -e ".[dev]" -e tools/generation_workspace
+    && pip install -e ".[dev]" -e tools/generation_workspace \
+    && cp -R /work /app
 
+WORKDIR /app
 USER 10001:10001
 CMD ["sh", "ci/isolated-tests/run_in_container.sh"]

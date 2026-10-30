@@ -126,6 +126,6 @@ bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外す�
 ```
 
 - **準備(ネットワークあり)**: commit済みのHEADだけを空のディレクトリへ取り出し(未追跡の `.env` は含まれない)、そこからimage(`ci/isolated-tests/Dockerfile`、ベースimageはdigest固定)をbuildして依存関係をinstallする。build contextは `.dockerignore` でも `.env` を除外する。CIのcheckoutは `persist-credentials: false`。
-- **実行(ネットワークなし)**: `docker run --network none`(loopbackのみ)、`--read-only`(書き込みは `/tmp` のtmpfsのみ)、`--cap-drop ALL`、`no-new-privileges`、非rootユーザー(uid 10001)、volume mountなし、Docker socketなし。環境変数はホストから引き継がず、`-e` で明示したダミーの `NOTION_*` だけを渡す。
+- **実行(ネットワークなし)**: `docker run --network none`(loopbackのみ)、`--read-only`(書き込みは `/tmp` と `/work` のtmpfsのみ。`/app` は読み取り専用の元ソースで、自己検査の後に `/work` へコピーしてそこでテストを実行する。テストの一部が作業ツリー内の `reports/` 等へ書き込むため)、`--cap-drop ALL`、`no-new-privileges`、非rootユーザー(uid 10001)、volume mountなし、Docker socketなし。環境変数はホストから引き継がず、`-e` で明示したダミーの `NOTION_*` だけを渡す。
 - **自己検査(fail-closed)**: テストの前に `ci/isolated-tests/verify_isolation.py` が、loopback以外のinterface・routeが無いこと(無ければプローブを送る前に停止)、Layer Aを通らない `_socket`・子プロセス・ネイティブ(git/libcurl)の接続が即座に「到達不能」で失敗すること、名前解決が失敗すること、ダミー以外の認証情報・秘密らしい環境変数・`.env`・Docker socketが無いこと、非rootでアプリケーションディレクトリが読み取り専用であることを確認し、1つでも満たさなければテストを実行しない。
 - **限界**: commit済みの変更だけが対象(未commitの変更はLayer Bでは検証されない)。`--network none` はloopbackを残すため、コンテナ内のlocalhost通信まではOSレベルで遮断しない(Layer Aがpytestプロセス内で遮断する)。依存関係のバージョンは `pyproject.toml` の範囲指定のままで、lockはしていない。ローカルのmacOSでDockerが無い場合はLayer Bを実行できない(正式な検証はCI)。`lint`・`type-check` と Generation Workspaceのruff/mypyは、コードを実行しない静的検査のため隔離外で実行する。

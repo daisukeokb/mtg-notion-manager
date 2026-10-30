@@ -60,6 +60,7 @@ def _docker_run_block(script: str) -> str:
         "--user 10001:10001",
         "--pids-limit",
         "--tmpfs /tmp:",
+        "--tmpfs /work:",
         '"PYTEST_ADDOPTS=-p no:cacheprovider"',
     ],
 )
@@ -113,8 +114,11 @@ def test_container_entrypoint_runs_self_check_first() -> None:
     assert "set -eu" in lines
     commands = [line for line in lines if not line.startswith(("set ", "cd ", "echo "))]
     assert commands[0] == "python ci/isolated-tests/verify_isolation.py /app"
-    # A caller-supplied command only runs after the self-check.
-    assert commands[1].startswith('if [ "$#" -gt 0 ]')
+    # Tests run in the writable /work copy; a caller-supplied command also only
+    # runs after the self-check.
+    assert commands[1] == "cp -R /app/. /work/"
+    assert "cd /work" in lines
+    assert commands[2].startswith('if [ "$#" -gt 0 ]')
     assert "pytest" in commands
     assert "pytest tools/generation_workspace/tests" in commands
 
@@ -123,7 +127,8 @@ def test_dockerfile_is_pinned_unprivileged_and_rejects_dotenv() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
     assert re.search(r"^FROM python:3\.9-slim-bookworm@sha256:[0-9a-f]{64}$", dockerfile, re.M)
     assert "USER 10001:10001" in dockerfile
-    assert "find /app -name .env" in dockerfile
+    assert "find /work -name .env" in dockerfile
+    assert "cp -R /work /app" in dockerfile
 
 
 def test_dockerignore_excludes_dotenv() -> None:
