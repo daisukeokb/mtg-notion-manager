@@ -106,3 +106,12 @@ mtg-notion-manager import <URL>
 ```bash
 pytest
 ```
+
+### テスト実行時の安全ガード(ネットワーク隔離・認証情報隔離)
+
+リポジトリ直下の `conftest.py` が、リポジトリ内のテストを実行する通常のpytest(`pytest`、`pytest tools/generation_workspace/tests` 等)で、テストのcollectionより前に次のガードを有効にする。ガードを無効にするためのオプション・設定は用意していない。
+
+- **外部ネットワーク通信の遮断**: AF_INET / AF_INET6 のsocketに対する `connect` / `connect_ex` / `sendto` / `sendmsg` / `bind`、`socket.create_connection`、名前解決(`getaddrinfo` 等)を、接続先に関わらず(`localhost`・`::1` を含めて)`NetworkAccessBlockedError` で拒否する。httpx(同期・非同期)・urllib・ssl・asyncioはいずれもこれらを経由する。AF_UNIX(ファイルsocket)は許可する。HTTPを使うテストは `pytest-httpx`(`httpx_mock` fixture)やfakeで差し替えること。
+- **認証情報の隔離**: `NOTION_*` 環境変数をテスト用のダミー値で上書きし、python-dotenvの `.env` 自動探索(引数なしの `load_dotenv()` / `dotenv_values()`)を無効化する。リポジトリ直下の `.env` は、パスを明示してもpython-dotenvの `load_dotenv` / `dotenv_values` / `get_key` / `DotEnv` から読めず、`set_key` / `unset_key` から書き換えられない(`CredentialAccessBlockedError`)。判定はパス文字列ではなくファイルの同一性(`os.path.samefile`)で行うため、Unicode正規化・大文字小文字・`..`・リンクの違いでは回避できない。テスト用に明示した別ファイルは読める。
+- 各テストの前後でガードが外れていないかを確認し、外れていれば再インストールしたうえでそのテストをエラーにする。
+- **限界**: このガードはpytestのプロセス内で、かつこの `conftest.py` が読み込まれる場合にだけ働く。`--noconftest`・リポジトリ直下より下位を指す `--confcutdir`・リポジトリ外のテストファイルでは無効。subprocess・multiprocessing(spawn)の子プロセス、ネイティブ拡張・ctypes、`_socket` を直接使う呼び出しには効かない(子プロセスにはダミーの環境変数だけが引き継がれる)。python-dotenv以外の手段(`open()` 等)による `.env` の読み取り(`open()` したstreamを `dotenv_values(stream=...)` 等へ渡すことを含む)は防がない。実行環境レベルでのネットワーク制限は行っていない。Windowsは未検証。
