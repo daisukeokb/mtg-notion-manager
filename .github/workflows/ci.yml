@@ -18,8 +18,10 @@ concurrency:
 
 # Supply chain (Phase 3H-R2): every external action is pinned to a full commit
 # SHA (the release tag in the trailing comment); every checkout drops the token
-# (persist-credentials disabled); Python packages come only from the
-# hash-verified requirements/ci-lock.txt. See README for the update procedure.
+# (persist-credentials disabled) and is verified right after; every package we
+# install comes from the hash-verified requirements/ci-lock.txt (wheels only).
+# Known gap: setup-python's own installer upgrades pip on the runner outside
+# the lock. See README for the update procedure.
 jobs:
   # Required check. Layer B (Phase 3H-R1): every test suite that executes
   # repository code runs inside a container with no network (only loopback),
@@ -56,7 +58,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip --version
-          python -m pip install --require-hashes --no-deps -r requirements/ci-lock.txt
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt
           python -m pip install --no-deps --no-build-isolation --no-index -e .
           python -m pip check
       - name: Run ruff
@@ -79,7 +81,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip --version
-          python -m pip install --require-hashes --no-deps -r requirements/ci-lock.txt
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt
           python -m pip install --no-deps --no-build-isolation --no-index -e .
           python -m pip check
       - name: Run mypy
@@ -102,7 +104,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip --version
-          python -m pip install --require-hashes --no-deps -r requirements/ci-lock.txt
+          python -m pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt
           python -m pip install --no-deps --no-build-isolation --no-index -e .
           python -m pip install -e tools/generation_workspace --no-deps --no-build-isolation --no-index
           python -m pip check

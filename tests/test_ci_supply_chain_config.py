@@ -46,6 +46,8 @@ def _uses_references() -> list[str]:
             match = re.match(r"^\s*(?:-\s+)?uses:\s*(.+?)\s*$", line)
             if match:
                 refs.append(match.group(1))
+            elif re.search(r"\buses\s*:", line):
+                refs.append(line.strip())  # e.g. flow style {uses: ...}: never accepted
     return refs
 
 
@@ -115,6 +117,9 @@ def test_credential_check_prints_key_names_only() -> None:
     assert "--name-only" in script
     for pattern in ("extraheader", "^credential\\.", "^includeif\\."):
         assert pattern in script
+    for scope in ("--local", "--global", "--system"):
+        assert scope in script
+    assert "credentials in URL" in script
 
 
 def test_workflow_permissions_are_read_only() -> None:
@@ -146,15 +151,17 @@ def test_runner_python_matches_the_image_python() -> None:
 
 # --- R2-04: Python dependencies -----------------------------------------------------
 
-_LOCKED_INSTALL = "pip install --require-hashes --no-deps -r requirements/ci-lock.txt"
+_LOCKED_INSTALL = (
+    "pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt"
+)
 
 
 def _pip_install_commands(text: str) -> list[str]:
     joined = text.replace("\\\n", " ")
     commands = []
     for line in joined.splitlines():
-        for part in re.split(r"&&", line):
-            if "pip install" in part:
+        for part in re.split(r"&&|;|\|\|", line):
+            if re.search(r"\bpip3?(\.\d+)?\s+install\b", part):
                 commands.append(" ".join(part.split()))
     return commands
 

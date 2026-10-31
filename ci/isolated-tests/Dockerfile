@@ -47,7 +47,7 @@ COPY . /work
 RUN if find /work -name .env -not -path '/work/.git/*' | grep -q .; then \
         echo "ERROR: .env found in the build context" >&2; exit 1; \
     fi \
-    && pip install --require-hashes --no-deps -r requirements/ci-lock.txt \
+    && pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt \
     && pip install --no-deps --no-build-isolation --no-index \
         -e . -e tools/generation_workspace \
     && pip check \
