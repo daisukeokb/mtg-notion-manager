@@ -45,7 +45,7 @@ if find "$SRC" -name .env -not -path "$SRC/.git/*" | grep -q .; then
 fi
 echo "Isolated test source: $HEAD_SHA (committed HEAD only)"
 
-docker build --quiet -f "$SRC/ci/isolated-tests/Dockerfile" -t "$IMAGE" "$SRC"
+docker build --quiet --platform linux/amd64 -f "$SRC/ci/isolated-tests/Dockerfile" -t "$IMAGE" "$SRC"
 
 # --- Execution: no network, no secrets ---------------------------------------
 # docker run does not inherit the host environment; only the -e values below

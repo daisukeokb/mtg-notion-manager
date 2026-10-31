@@ -89,7 +89,10 @@ def test_runner_builds_from_committed_head_only() -> None:
     script = RUNNER.read_text(encoding="utf-8")
     assert 'git init -q "$SRC"' in script
     assert 'fetch -q --depth=1 "file://$REPO_ROOT" "$HEAD_SHA"' in script
-    build = 'docker build --quiet -f "$SRC/ci/isolated-tests/Dockerfile" -t "$IMAGE" "$SRC"'
+    build = (
+        'docker build --quiet --platform linux/amd64 -f "$SRC/ci/isolated-tests/Dockerfile"'
+        ' -t "$IMAGE" "$SRC"'
+    )
     assert build in script
 
 
@@ -144,9 +147,10 @@ def test_workflow_test_job_is_isolated_and_has_no_plain_pytest() -> None:
     assert "run: bash scripts/run_isolated_tests.sh\n" in test_job
     assert "run: bash scripts/check_isolation_red.sh" in test_job
     assert "secrets." not in workflow
+    # Phase 3H-R2: every checkout drops the token, including lint / type-check.
     assert workflow.count("persist-credentials: false") == workflow.count(
         "uses: actions/checkout@"
-    ) - _jobs_without_code_execution(workflow)
+    )
     # Every step that executes repository code goes through the isolated runner.
     for line in workflow.splitlines():
         command = line.strip()
@@ -239,8 +243,3 @@ def test_structure_check_refuses_non_linux_before_any_probe(
     monkeypatch.setattr(sys, "platform", "darwin")
     with pytest.raises(verify.IsolationCheckFailed, match="not Linux"):
         verify.check_structure()
-
-
-def _jobs_without_code_execution(workflow: str) -> int:
-    """lint / type-check jobs only run static analysis and keep the default checkout."""
-    return sum(1 for job in ("\n  lint:\n", "\n  type-check:\n") if job in workflow)
