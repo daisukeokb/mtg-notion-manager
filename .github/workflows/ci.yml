@@ -32,6 +32,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - name: Verify no persisted Git credentials
+        run: bash scripts/check_no_persisted_credentials.sh
       - name: Run test suites in the network-isolated container
         run: bash scripts/run_isolated_tests.sh
       - name: Red checks (isolation must fail closed)
@@ -44,6 +46,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - name: Verify no persisted Git credentials
+        run: bash scripts/check_no_persisted_credentials.sh
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.9.25"
@@ -65,6 +69,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - name: Verify no persisted Git credentials
+        run: bash scripts/check_no_persisted_credentials.sh
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.9.25"
@@ -86,6 +92,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - name: Verify no persisted Git credentials
+        run: bash scripts/check_no_persisted_credentials.sh
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.9.25"

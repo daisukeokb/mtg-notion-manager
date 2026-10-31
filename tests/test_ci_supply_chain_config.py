@@ -98,8 +98,23 @@ def test_every_checkout_drops_the_token() -> None:
     checkouts = [i for i, line in enumerate(lines) if "uses: actions/checkout@" in line]
     assert checkouts
     for index in checkouts:
-        following = [line.strip() for line in lines[index + 1 : index + 3]]
-        assert following == ["with:", "persist-credentials: false"], lines[index]
+        following = [line.strip() for line in lines[index + 1 : index + 5]]
+        assert following == [
+            "with:",
+            "persist-credentials: false",
+            "- name: Verify no persisted Git credentials",
+            "run: bash scripts/check_no_persisted_credentials.sh",
+        ], lines[index]
+
+
+def test_credential_check_prints_key_names_only() -> None:
+    script = (REPO_ROOT / "scripts" / "check_no_persisted_credentials.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "set -euo pipefail" in script
+    assert "--name-only" in script
+    for pattern in ("extraheader", "^credential\\.", "^includeif\\."):
+        assert pattern in script
 
 
 def test_workflow_permissions_are_read_only() -> None:

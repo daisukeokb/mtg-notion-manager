@@ -133,7 +133,7 @@ bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外す�
 ### CIの供給網・認証情報の固定(Phase 3H-R2)
 
 - **GitHub Actions**: `uses:` はすべて完全な40文字のcommit SHAで固定し、行末にreleaseタグをコメントで残す(`actions/checkout` v4.4.0、`actions/setup-python` v5.6.0)。許可するActionは `tests/test_ci_supply_chain_config.py` の `ALLOWED_ACTIONS` に限る。
-- **認証情報**: すべての `actions/checkout` で `persist-credentials: false`(`.git/config` にtokenを残さない)。workflowの権限は `contents: read` のみで、`secrets.` は使わない。
+- **認証情報**: すべての `actions/checkout` で `persist-credentials: false`(`.git/config` にtokenを残さない)。各jobはcheckout直後に `scripts/check_no_persisted_credentials.sh` で、`.git/config` に `extraheader`・`credential.*`・`includeIf.*` が残っていないことを確認する(キー名だけを表示し、値は表示しない)。workflowの権限は `contents: read` のみで、`secrets.` は使わない。
 - **ベースimage**: `python:3.9-slim-bookworm` のlinux/amd64 image manifest digestで固定し、`docker build --platform linux/amd64` でbuildする。Dockerがpull時にdigestで内容を検証するため、tagの付け替えでは差し替わらない。CIのrunner側のPython(`setup-python`)もimageと同じ3.9.25に固定する。
 - **Python依存関係**: `requirements/ci-lock.txt` に、両プロジェクトの実行時依存・`dev` 依存・buildバックエンド(hatchling、editables)を推移的依存まで `==` で固定し、各versionの公開ファイルすべてのsha256を記録する。CIとimageは `pip install --require-hashes --no-deps -r requirements/ci-lock.txt` で入れ、ローカルの2プロジェクトは `--no-deps --no-build-isolation --no-index` で(取得なしで)入れた後、`pip check` で整合性を確認する。`pyproject.toml` との整合(全宣言が含まれ、範囲指定を満たすこと)はテストで検査する。開発用の `pip install -e ".[dev]"` はこれまでどおり使える(lockはCIとLayer B imageの再現性のため)。
 
