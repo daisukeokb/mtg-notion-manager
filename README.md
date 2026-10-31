@@ -128,4 +128,18 @@ bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外す�
 - **準備(ネットワークあり)**: commit済みのHEADだけを空のディレクトリへ取り出し(未追跡の `.env` は含まれない)、そこからimage(`ci/isolated-tests/Dockerfile`、ベースimageはdigest固定)をbuildして依存関係をinstallする。build contextは `.dockerignore` でも `.env` を除外する。CIのcheckoutは `persist-credentials: false`。
 - **実行(ネットワークなし)**: `docker run --network none`(loopbackのみ)、`--read-only`(書き込みは `/tmp` と `/work` のtmpfsのみ。`/app` は読み取り専用の元ソースで、自己検査の後に `/work` へコピーしてそこでテストを実行する。テストの一部が作業ツリー内の `reports/` 等へ書き込むため)、`--cap-drop ALL`、`no-new-privileges`、非rootユーザー(uid 10001)、volume mountなし、Docker socketなし。環境変数はホストから引き継がず、`-e` で明示したダミーの `NOTION_*` だけを渡す。
 - **自己検査(fail-closed)**: テストの前に `ci/isolated-tests/verify_isolation.py` が、loopback以外のinterface・routeが無いこと(無ければプローブを送る前に停止)、Layer Aを通らない `_socket`・子プロセス・ネイティブ(git/libcurl)の接続が即座に「到達不能」で失敗すること、名前解決が失敗すること、ダミー以外の認証情報・秘密らしい環境変数・`.env`・Docker socketが無いこと、非rootでアプリケーションディレクトリが読み取り専用であることを確認し、1つでも満たさなければテストを実行しない。
-- **限界**: commit済みの変更だけが対象(未commitの変更はLayer Bでは検証されない)。`--network none` はloopbackを残すため、コンテナ内のlocalhost通信まではOSレベルで遮断しない(Layer Aがpytestプロセス内で遮断する)。依存関係のバージョンは `pyproject.toml` の範囲指定のままで、lockはしていない。ローカルのmacOSでDockerが無い場合はLayer Bを実行できない(正式な検証はCI)。`lint`・`type-check` と Generation Workspaceのruff/mypyは、コードを実行しない静的検査のため隔離外で実行する。
+- **限界**: commit済みの変更だけが対象(未commitの変更はLayer Bでは検証されない)。`--network none` はloopbackを残すため、コンテナ内のlocalhost通信まではOSレベルで遮断しない(Layer Aがpytestプロセス内で遮断する)。Python依存関係は `requirements/ci-lock.txt`(hash付き)に固定済み(下記)。ローカルのmacOSでDockerが無い場合はLayer Bを実行できない(正式な検証はCI)。`lint`・`type-check` と Generation Workspaceのruff/mypyは、コードを実行しない静的検査のため隔離外で実行する。
+
+### CIの供給網・認証情報の固定(Phase 3H-R2)
+
+- **GitHub Actions**: `uses:` はすべて完全な40文字のcommit SHAで固定し、行末にreleaseタグをコメントで残す(`actions/checkout` v4.4.0、`actions/setup-python` v5.6.0)。許可するActionは `tests/test_ci_supply_chain_config.py` の `ALLOWED_ACTIONS` に限る。
+- **認証情報**: すべての `actions/checkout` で `persist-credentials: false`(`.git/config` にtokenを残さない)。各jobはcheckout直後に `scripts/check_no_persisted_credentials.sh` で、local/global/systemのgit configに `extraheader`・`credential.*`・`includeIf.*` が無く、remote URLに認証情報が含まれないことを確認する(キー名だけを表示し、値は表示しない。設定を読めない場合は失敗扱い)。workflowの権限は `contents: read` のみで、`secrets.` は使わない。
+- **ベースimage**: `python:3.9-slim-bookworm` のlinux/amd64 image manifest digestで固定し、`docker build --platform linux/amd64` でbuildする。Dockerがpull時にdigestで内容を検証するため、tagの付け替えでは差し替わらない。CIのrunner側のPython(`setup-python`)もimageと同じ3.9.25に固定する。
+- **Python依存関係**: `requirements/ci-lock.txt` に、両プロジェクトの実行時依存・`dev` 依存・buildバックエンド(hatchling、editables)を推移的依存まで `==` で固定し、各versionの公開ファイルすべてのsha256を記録する。CIとimageは `pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt` で入れ、ローカルの2プロジェクトは `--no-deps --no-build-isolation --no-index` で(取得なしで)入れた後、`pip check` で整合性を確認する。`--only-binary=:all:` によりsdistのbuild(hash検証されないbuild依存の取得)は起こらない。runnerでは `setup-python` 自身がPython導入時にpipを更新し、そのpipはlockの対象外(既知の限界)。`pyproject.toml` との整合(全宣言が含まれ、範囲指定を満たすこと)はテストで検査する。開発用の `pip install -e ".[dev]"` はこれまでどおり使える(lockはCIとLayer B imageの再現性のため)。
+
+#### 依存関係・Action・ベースイメージの更新手順
+
+1. **Python依存関係**: `python -I scripts/lock_dependencies.py` を実行する(PyPIへの通信が必要。認証情報は読まず、リポジトリのコードはimport・buildしない)。CPython 3.9 / manylinux x86_64向けに解決し、PyPIの公開hashと照合して `requirements/ci-lock.txt` を書き換える。差分(version・hashの変化)をレビューしてcommitする。
+2. **Action**: 公式repositoryのrelease/tagを確認し、`gh api repos/<owner>/<repo>/git/ref/tags/<tag>` で得たcommit SHA(annotated tagの場合はcommitまでたどる)と `# <tag>` コメントを更新する。
+3. **ベースimage**: registryからtagのOCI image indexを取得してlinux/amd64のmanifest digestを確認し、Dockerfile冒頭のimage・Python version・digest・index digest・確認日を更新する(runner側の `python-version` も合わせる)。digestの固定は内容の同一性を保証するだけで、含まれるパッケージの脆弱性を保証しないため、更新時(および定期的に)ベースimageのセキュリティ更新を確認する。
+4. いずれもCIの `test`(Layer B自己検査・red check 8件を含む)・`lint`・`type-check`・`generation-workspace` がすべて成功することを確認してからmergeする。
