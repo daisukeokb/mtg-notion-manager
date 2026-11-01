@@ -132,14 +132,27 @@ bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外す�
 
 ### CIの供給網・認証情報の固定(Phase 3H-R2)
 
-- **GitHub Actions**: `uses:` はすべて完全な40文字のcommit SHAで固定し、行末にreleaseタグをコメントで残す(`actions/checkout` v4.4.0、`actions/setup-python` v5.6.0)。許可するActionは `tests/test_ci_supply_chain_config.py` の `ALLOWED_ACTIONS` に限る。
-- **認証情報**: すべての `actions/checkout` で `persist-credentials: false`(`.git/config` にtokenを残さない)。各jobはcheckout直後に `scripts/check_no_persisted_credentials.sh` で、local/global/systemのgit configに `extraheader`・`credential.*`・`includeIf.*` が無く、remote URLに認証情報が含まれないことを確認する(キー名だけを表示し、値は表示しない。設定を読めない場合は失敗扱い)。workflowの権限は `contents: read` のみで、`secrets.` は使わない。
+- **GitHub Actions**: `uses:` はすべて完全な40文字のcommit SHAで固定し、行末にreleaseタグをコメントで残す(`actions/checkout` v4.4.0、`actions/setup-python` v5.6.0)。許可するActionとそのcommit SHAは `ci/static_guard.py` の `ALLOWED_ACTIONS` に限る(Phase 3H-R3で、レビュー済みSHA以外の40文字SHA=fork由来のcommit等も拒否するよう強化)。
+- **認証情報**: すべての `actions/checkout` で `persist-credentials: false`(`.git/config` にtokenを残さない)。各jobはcheckout直後に `python3 -I scripts/check_no_persisted_credentials.py` で認証情報が残っていないことを確認する(Phase 3H-R3で下記のとおり作り直した)。workflowの権限は `contents: read` のみで、`secrets.` は使わない。
 - **ベースimage**: `python:3.9-slim-bookworm` のlinux/amd64 image manifest digestで固定し、`docker build --platform linux/amd64` でbuildする。Dockerがpull時にdigestで内容を検証するため、tagの付け替えでは差し替わらない。CIのrunner側のPython(`setup-python`)もimageと同じ3.9.25に固定する。
-- **Python依存関係**: `requirements/ci-lock.txt` に、両プロジェクトの実行時依存・`dev` 依存・buildバックエンド(hatchling、editables)を推移的依存まで `==` で固定し、各versionの公開ファイルすべてのsha256を記録する。CIとimageは `pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt` で入れ、ローカルの2プロジェクトは `--no-deps --no-build-isolation --no-index` で(取得なしで)入れた後、`pip check` で整合性を確認する。`--only-binary=:all:` によりsdistのbuild(hash検証されないbuild依存の取得)は起こらない。runnerでは `setup-python` 自身がPython導入時にpipを更新し、そのpipはlockの対象外(既知の限界)。`pyproject.toml` との整合(全宣言が含まれ、範囲指定を満たすこと)はテストで検査する。開発用の `pip install -e ".[dev]"` はこれまでどおり使える(lockはCIとLayer B imageの再現性のため)。
+- **Python依存関係**: `requirements/ci-lock.txt` に、両プロジェクトの実行時依存・`dev` 依存・buildバックエンド(hatchling、editables)を推移的依存まで `==` で固定し、各versionの公開ファイルすべてのsha256を記録する。CIとimageは `pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt` で入れ、ローカルの2プロジェクトは `--no-deps --no-build-isolation --no-index` で(取得なしで)入れた後、`pip check` で整合性を確認する。`--only-binary=:all:` によりsdistのbuild(hash検証されないbuild依存の取得)は起こらない。runner側のpipについてはPhase 3H-R3の節を参照。`pyproject.toml` との整合(全宣言が含まれ、範囲指定を満たすこと)はテストで検査する。開発用の `pip install -e ".[dev]"` はこれまでどおり使える(lockはCIとLayer B imageの再現性のため)。
+
+### CI検査器の作り直し(Phase 3H-R3)
+
+- **認証情報の検査(`scripts/check_no_persisted_credentials.py`)**: 個々の設定ファイルをgrepするのではなく、Gitが実際に使う設定を読む。
+  - `git config --list --show-scope --show-origin --includes -z` で、Gitが読むすべてのscope(system・global・local・worktree・組み込み既定・`GIT_CONFIG_PARAMETERS`/`GIT_CONFIG_COUNT` の `command`)を、include先まで含めて取得する。
+  - `git remote get-url --all` と `--push --all` で、`url.*.insteadOf`/`pushInsteadOf` による書き換え後の実効URLを確認する。環境変数 `GIT_ASKPASS`/`SSH_ASKPASS` も確認する。
+  - 検出対象: `credential.*`、`http.*.extraheader`/`cookiefile`/`sslkey`/`sslcert`、`core.askpass`、include(`include.path`/`includeIf.*.path`。include先と条件はレビュー対象外のため、存在自体を不可とする)、設定のキー名・値のどこかにある認証情報付きURL(http/https/ftp/ftpsはユーザー情報の有無、それ以外はパスワードの有無)。`url.https://github.com/.insteadOf git@github.com:` のような安全な書き換えは通す。
+  - 表示はscopeとキー名(subsectionは伏せ字)だけで、値は表示しない。Gitを実行できない、非0で終了する、stderrに何か出力する、出力を解析できない場合は、検出なし扱いにせず失敗する。終了コードは 0=認証情報なし、1=検出、2=検査を完了できない。
+  - CIのrunnerでは、各jobの冒頭(checkout直後)に実行し、検査対象はそのjob自身のGit環境に限る。テストは一時repositoryと一時のglobal設定だけを使い、system設定は無効化する(`GIT_CONFIG_NOSYSTEM=1`。macOSのApple Gitは組み込みの `credential.helper=osxkeychain` を持つため、これを外さないと正しく検出されて失敗する)。
+- **静的検査(`ci/static_guard.py`)**: workflow・Dockerfile・Layer Bのrunner・`scripts/*.sh` を構造的に検査する。YAMLは、レビュー済みの狭い正準形(ブロック形式のmapping/sequence、plain・二重引用符・`|` のscalar)だけを受け付け、anchor/alias・tag・flow形式・引用符付きキー・重複キー・タブ・複数document・エスケープなどは、それだけで違反とする(fail closed)。job・キー・トリガーの集合、`permissions: contents: read`、`persist-credentials` がplainの `false` であること、checkout直後の認証情報検査、setup-python直後のpip bootstrap、`secrets`/式の不使用、`docker run` の隔離optionの完全一致などを不変条件として検査する。pipは、引数を分解してから、hash固定の形またはオフライン・ローカルの形で、かつレビュー済みのoptionだけを使う場合に限って許可する(`pip -q install`、`--find-links https://…`、`pip download`、`pipx` など、検証できない形はすべて違反)。意図して構成を変えるときは、同じ変更でguardも更新する。
+- **runnerのpip(`scripts/bootstrap_locked_pip.sh`、`requirements/ci-pip-lock.txt`)**: setup-pythonの導入処理がlock外で更新したpipを、依存関係を入れる前に、hash固定のpip(26.0.1のwheel)に入れ替える。wheelはHTTPSだけで取得し、そのコードを実行する前にcoreutilsの `sha256sum` で検証する。そのうえで、検証済みwheelの中のpipでオフライン(`--no-index --require-hashes`)に入れ直すため、検証されていないpipは以後実行されない。
+  - 残る境界: setup-pythonがversion指定だけで取得するPython本体と、その導入処理が一度だけ実行した(lock外の)pip。どちらもhash検証されない。lint・type-check・generation-workspaceのjobだけに関係し、これらはsecretsを持たず、tokenも残さない。解消するには、静的検査もdigest固定のimage内で実行するなど、job構成の変更が必要。
+- **負のテスト**: `tests/test_credential_check.py` と `tests/test_ci_static_guard.py` は、ダミー値で危険な設定を作り、期待した理由(終了コード、scope・キー、違反コード)で失敗することを確認する。テスト自身のクラッシュや変異の適用失敗は、成功として数えない。
 
 #### 依存関係・Action・ベースイメージの更新手順
 
-1. **Python依存関係**: `python -I scripts/lock_dependencies.py` を実行する(PyPIへの通信が必要。認証情報は読まず、リポジトリのコードはimport・buildしない)。CPython 3.9 / manylinux x86_64向けに解決し、PyPIの公開hashと照合して `requirements/ci-lock.txt` を書き換える。差分(version・hashの変化)をレビューしてcommitする。
-2. **Action**: 公式repositoryのrelease/tagを確認し、`gh api repos/<owner>/<repo>/git/ref/tags/<tag>` で得たcommit SHA(annotated tagの場合はcommitまでたどる)と `# <tag>` コメントを更新する。
-3. **ベースimage**: registryからtagのOCI image indexを取得してlinux/amd64のmanifest digestを確認し、Dockerfile冒頭のimage・Python version・digest・index digest・確認日を更新する(runner側の `python-version` も合わせる)。digestの固定は内容の同一性を保証するだけで、含まれるパッケージの脆弱性を保証しないため、更新時(および定期的に)ベースimageのセキュリティ更新を確認する。
+1. **Python依存関係**: `python -I scripts/lock_dependencies.py` を実行する(PyPIへの通信が必要。認証情報は読まず、リポジトリのコードはimport・buildしない)。CPython 3.9 / manylinux x86_64向けに解決し、PyPIの公開hashと照合して `requirements/ci-lock.txt` を書き換える。差分(version・hashの変化)をレビューしてcommitする。runnerのpipだけを更新する場合は、`PIP_VERSION` を変えて `--pip-only` を付けて実行する(`requirements/ci-pip-lock.txt` だけを書き換える)。
+2. **Action**: 公式repositoryのrelease/tagを確認し、`gh api repos/<owner>/<repo>/git/ref/tags/<tag>` で得たcommit SHA(annotated tagの場合はcommitまでたどる)と `# <tag>` コメントを、workflowと `ci/static_guard.py` の `ALLOWED_ACTIONS` の両方で更新する。
+3. **ベースimage**: registryからtagのOCI image indexを取得してlinux/amd64のmanifest digestを確認し、Dockerfile冒頭のimage・Python version・digest・index digest・確認日を更新する(runner側の `python-version` と `ci/static_guard.py` の `BASE_IMAGE` も合わせる)。digestの固定は内容の同一性を保証するだけで、含まれるパッケージの脆弱性を保証しないため、更新時(および定期的に)ベースimageのセキュリティ更新を確認する。
 4. いずれもCIの `test`(Layer B自己検査・red check 8件を含む)・`lint`・`type-check`・`generation-workspace` がすべて成功することを確認してからmergeする。
