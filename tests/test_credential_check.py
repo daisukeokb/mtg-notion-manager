@@ -235,11 +235,38 @@ def test_neg02_other_credential_sources_fail(fx: Fixture, key: str, value: str,
     assert_found(fx.run(), expected)
 
 
-@pytest.mark.parametrize("name", [".netrc", "_netrc"])
-def test_neg02_netrc_file_fails(fx: Fixture, name: str) -> None:
-    (Path(fx.env["HOME"]) / name).write_text(
-        f"machine example.invalid login u password {SECRET}\n", encoding="utf-8")
-    assert_found(fx.run(), f"[home] ~/{name}: netrc file (not allowed)")
+@pytest.mark.parametrize(
+    "relative,expected",
+    [
+        (".netrc", "[home] ~/.netrc: netrc file (not allowed)"),
+        ("_netrc", "[home] ~/_netrc: netrc file (not allowed)"),
+        (".git-credentials", "[home] ~/.git-credentials: credential store file (not allowed)"),
+        (".config/git/credentials",
+         "[home] $XDG_CONFIG_HOME/git/credentials: credential store file (not allowed)"),
+        (".ssh/id_ed25519", "[home] ~/.ssh/id_*: ssh private key (not allowed)"),
+    ],
+)
+def test_neg02_home_credential_file_fails(fx: Fixture, relative: str, expected: str) -> None:
+    path = Path(fx.env["HOME"]) / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"dummy {SECRET}\n", encoding="utf-8")
+    assert_found(fx.run(), expected)
+
+
+def test_xdg_credential_store_location_is_followed(fx: Fixture) -> None:
+    config_home = fx.base / "xdg"
+    (config_home / "git").mkdir(parents=True)
+    (config_home / "git" / "credentials").write_text(f"dummy {SECRET}\n", encoding="utf-8")
+    fx.env["XDG_CONFIG_HOME"] = str(config_home)
+    assert_found(fx.run(), "[home] $XDG_CONFIG_HOME/git/credentials: credential store file")
+
+
+def test_public_ssh_key_and_known_hosts_pass(fx: Fixture) -> None:
+    ssh = Path(fx.env["HOME"]) / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_ed25519.pub").write_text("ssh-ed25519 AAAA dummy\n", encoding="utf-8")
+    (ssh / "known_hosts").write_text("example.invalid ssh-ed25519 AAAA\n", encoding="utf-8")
+    assert fx.run().returncode == checker.EXIT_OK
 
 
 # --- NEG-03: the check cannot run (fail closed, reported as an error) -----------------
@@ -276,7 +303,7 @@ def _run_main_with_fake_git(
     monkeypatch.setattr(checker, "subprocess", fake)
     # main() runs in this process: nothing from the caller's environment or home
     # directory may decide the outcome.
-    for name in (*checker.ENV_FINDINGS, *checker.PROXY_ENV):
+    for name in (*checker.ENV_FINDINGS, *checker.PROXY_ENV, "XDG_CONFIG_HOME"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("HOME", str(home))
     status = checker.main()
@@ -441,6 +468,9 @@ def test_neg06_redirected_global_config_fails(fx: Fixture) -> None:
         ("GIT_SSH_COMMAND", "ssh command override"),
         ("GIT_SSL_KEY", "client certificate"),
         ("GIT_SSL_CERT", "client certificate"),
+        ("GIT_PROXY_SSL_KEY", "client certificate"),
+        ("GIT_PROXY_SSL_CERT", "client certificate"),
+        ("SSH_AUTH_SOCK", "ssh agent"),
     ],
 )
 def test_neg06_credential_program_environment_fails(fx: Fixture, name: str, reason: str) -> None:

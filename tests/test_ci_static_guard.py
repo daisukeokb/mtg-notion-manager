@@ -404,7 +404,7 @@ def test_neg12_weakened_workflow_structure_fails(old: str, new: str, code: str) 
         ("python -m ensurepip --upgrade", "FORBIDDEN_INSTALLER"),
         ("$(which pip) install requests", "UNRECOGNIZED_PIP_INVOCATION"),
         ("$PIP install requests", "SHELL_DYNAMIC"),
-        ("env -i pip install requests", "UNRECOGNIZED_PIP_INVOCATION"),
+        ("env -i pip install requests", "SHELL_DYNAMIC"),
         ('pip install "requests', "SHELL_UNPARSABLE"),
         ("pip", "PIP_NO_COMMAND"),
     ],
@@ -429,11 +429,12 @@ def test_n3_pip_before_bootstrap_fails() -> None:
 
 
 def _repo_copy(tmp_path: Path) -> Path:
-    for relative in (".github/workflows/ci.yml", "ci/isolated-tests/Dockerfile"):
+    for relative in (".github/workflows/ci.yml", *guard.REVIEWED_FILES):
         (tmp_path / relative).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(REPO_ROOT / relative, tmp_path / relative)
-    shutil.copytree(REPO_ROOT / "scripts", tmp_path / "scripts",
-                    ignore=shutil.ignore_patterns("__pycache__"))
+    for relative in ("scripts", "tests"):
+        shutil.copytree(REPO_ROOT / relative, tmp_path / relative, dirs_exist_ok=True,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     assert guard.check_repository(tmp_path) == []
     return tmp_path
 
@@ -653,3 +654,134 @@ def test_additional_script_fails(tmp_path: Path) -> None:
     root = _repo_copy(tmp_path)
     (root / "scripts" / "helper.sh").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
     assert "SCRIPT_FILES" in codes(guard.check_repository(root))
+
+
+# --- independent re-audit (Phase 3H-R3) findings ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["pip.py", "pip/__init__.py", "sitecustomize.py", "json.py", "evil.pth", "x.so",
+     "pkg/__init__.py"],
+)
+def test_reaudit_new1_root_module_that_could_shadow_pip_fails(tmp_path: Path,
+                                                             relative: str) -> None:
+    # `python -m pip` runs from the repository root, which is first on sys.path.
+    root = _repo_copy(tmp_path)
+    (root / relative).parent.mkdir(parents=True, exist_ok=True)
+    (root / relative).write_text("print('dummy')\n", encoding="utf-8")
+    assert "ROOT_MODULE" in codes(guard.check_repository(root))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["setup.py", "setup.cfg", "hatch_build.py", "hatch.toml", "mypy.ini", ".mypy.ini",
+     "tools/generation_workspace/hatch_build.py", "tools/generation_workspace/setup.py"],
+)
+def test_reaudit_new1_unreviewed_build_or_mypy_config_fails(tmp_path: Path,
+                                                            relative: str) -> None:
+    root = _repo_copy(tmp_path)
+    (root / relative).write_text("# dummy\n", encoding="utf-8")
+    assert "UNREVIEWED_CONFIG" in codes(guard.check_repository(root))
+
+
+@pytest.mark.parametrize(
+    "relative,change",
+    [
+        # hatch build hooks, an in-tree build backend and mypy plugins live here.
+        ("pyproject.toml", '[tool.hatch.build.hooks.custom]\npath = "x.py"\n'),
+        ("pyproject.toml", '[tool.mypy]\nplugins = ["dummy_plugin"]\n'),
+        ("tools/generation_workspace/pyproject.toml", "[tool.hatch.build.hooks.custom]\n"),
+        ("ci/isolated-tests/run_in_container.sh", "true\n"),
+        ("ci/isolated-tests/verify_isolation.py", "pass\n"),
+        ("conftest.py", "pass\n"),
+        (".dockerignore", "!.env\n"),
+    ],
+)
+def test_reaudit_new1_new4_reviewed_configuration_change_fails(tmp_path: Path, relative: str,
+                                                               change: str) -> None:
+    root = _repo_copy(tmp_path)
+    with (root / relative).open("a", encoding="utf-8") as handle:
+        handle.write(change)
+    assert "REVIEWED_FILE_CHANGED" in codes(guard.check_repository(root))
+
+
+def test_reaudit_new4_extra_file_in_isolated_tests_fails(tmp_path: Path) -> None:
+    root = _repo_copy(tmp_path)
+    (root / "ci" / "isolated-tests" / "extra.sh").write_text("true\n", encoding="utf-8")
+    assert "SCRIPT_FILES" in codes(guard.check_repository(root))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "( pip install x )",
+        "(pip install x)",
+        "true && (pip install x)",
+        "echo pip install x | sh",
+        "echo x | bash -s",
+        "python - < x",
+        "python",
+        "python /tmp/evil.py",
+        "python ../evil.py",
+        'env -S "pip install x"',
+        "busybox sh -c 'pip install x'",
+        "perl -e 'system(1)'",
+        "awk 'BEGIN { system(1) }'",
+    ],
+)
+def test_reaudit_new2_subshell_stdin_and_other_interpreters_fail(command: str) -> None:
+    assert codes(guard.check_shell(command, "fixture")) & {
+        "PIP_UNLOCKED_REQUIREMENT", "SHELL_DYNAMIC"}
+
+
+def test_reaudit_new2_subshell_in_dockerfile_fails() -> None:
+    text = mutate(DF, "    && pip check \\\n", "    && (pip install x) \\\n    && pip check \\\n")
+    assert "PIP_UNLOCKED_REQUIREMENT" in codes(guard.check_dockerfile(text))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "case x in\n  a) pip install x ;;\nesac",  # the command after a pattern is analysed
+        'case "$x" in a) pip install x ;; esac',
+    ],
+)
+def test_reaudit_new2_commands_inside_case_are_analysed(command: str) -> None:
+    assert "PIP_UNLOCKED_REQUIREMENT" in codes(guard.check_shell(command, "fixture"))
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("      - name: Run test suites in the network-isolated container\n"
+         "        run: bash scripts/run_isolated_tests.sh\n", ""),
+        ("      - name: Red checks (isolation must fail closed)\n"
+         "        run: bash scripts/check_isolation_red.sh\n", ""),
+        ("        run: bash scripts/check_isolation_red.sh\n",
+         "        run: bash scripts/check_isolation_red.sh\n"
+         "      - name: again\n        run: ruff check .\n"),
+        ("      - name: Run ruff\n        run: ruff check .\n", ""),
+    ],
+)
+def test_reaudit_new3_changed_step_sequence_fails(old: str, new: str) -> None:
+    assert "JOB_STEPS" in check_wf(mutate(WF, old, new))
+
+
+@pytest.mark.parametrize(
+    "old,new,code",
+    [
+        ("  push:\n    branches:\n      - main\n",
+         "  push:\n    branches-ignore:\n      - main\n", "WORKFLOW_TRIGGERS"),
+        ("  pull_request:\n    branches:\n      - main\n",
+         "  pull_request:\n    branches:\n      - other\n", "WORKFLOW_TRIGGERS"),
+        ("  group: ci-${{ github.workflow }}-${{ github.ref }}",
+         "  group: ${{ github.event.pull_request.title }}", "CONCURRENCY"),
+        ("  cancel-in-progress: true", "  cancel-in-progress: false", "CONCURRENCY"),
+        ("          cache: pip\n", "          cache: poetry\n", "ACTION_INPUTS"),
+        ("cache-dependency-path: requirements/ci-lock.txt",
+         "cache-dependency-path: other.txt", "ACTION_INPUTS"),
+    ],
+)
+def test_reaudit_new3_unreviewed_workflow_values_fail(old: str, new: str, code: str) -> None:
+    assert code in check_wf(mutate(WF, old, new))

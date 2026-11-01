@@ -15,7 +15,10 @@ individual config files, the check reads the configuration Git actually uses:
   proxy variables with credentials, and variables that make `git config` or
   Git read a different configuration or repository than the checkout
   (GIT_CONFIG, GIT_DIR, GIT_COMMON_DIR, GIT_WORK_TREE are not allowed);
-* a ~/.netrc or ~/_netrc file (libcurl in Git reads it); never opened.
+* credential files in the home directory: ~/.netrc / ~/_netrc (libcurl in Git
+  reads them), the credential-store files ~/.git-credentials and
+  $XDG_CONFIG_HOME/git/credentials, and ssh private keys ~/.ssh/id_*; only
+  their existence is checked, they are never opened.
 
 A finding is a credential helper or any credential.* setting, an
 http.*.extraheader / cookiefile / sslkey / sslcert / proxysslkey /
@@ -56,6 +59,9 @@ ENV_FINDINGS = {
     "GIT_SSH_COMMAND": "ssh command override",
     "GIT_SSL_KEY": "client certificate",
     "GIT_SSL_CERT": "client certificate",
+    "GIT_PROXY_SSL_KEY": "client certificate",
+    "GIT_PROXY_SSL_CERT": "client certificate",
+    "SSH_AUTH_SOCK": "ssh agent",
     # `git config` would read another file than the other Git commands, or the
     # check would inspect another repository than the checkout.
     "GIT_CONFIG": "configuration location override (not allowed)",
@@ -64,7 +70,8 @@ ENV_FINDINGS = {
     "GIT_WORK_TREE": "repository location override (not allowed)",
 }
 PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
-NETRC_FILES = (".netrc", "_netrc")
+HOME_CREDENTIAL_FILES = {".netrc": "netrc file", "_netrc": "netrc file",
+                         ".git-credentials": "credential store file"}
 _SECTION = re.compile(r"[a-z0-9-]+")
 _VARIABLE = re.compile(r"[a-z][a-z0-9-]*")
 _URL = re.compile(r"([a-z][a-z0-9+.-]*)://([^/?#\s]*)", re.IGNORECASE)
@@ -229,19 +236,36 @@ def env_findings(environ: dict[str, str]) -> list[Finding]:
     return findings
 
 
-def netrc_findings() -> list[Finding]:
+def _exists(path: str, label: str) -> bool:
+    try:
+        os.lstat(path)  # existence only; never opened
+    except FileNotFoundError:
+        return False
+    except OSError:
+        raise CheckError(f"cannot check for {label}") from None
+    return True
+
+
+def home_findings(environ: dict[str, str]) -> list[Finding]:
     home = os.path.expanduser("~")
     if home == "~":
         raise CheckError("cannot determine the home directory")
-    findings = []
-    for name in NETRC_FILES:
-        try:
-            os.lstat(os.path.join(home, name))  # existence only; never opened
-        except FileNotFoundError:
-            continue
-        except OSError:
-            raise CheckError(f"cannot check for ~/{name}") from None
-        findings.append(Finding("home", f"~/{name}", "netrc file (not allowed)"))
+    findings = [Finding("home", f"~/{name}", f"{reason} (not allowed)")
+                for name, reason in HOME_CREDENTIAL_FILES.items()
+                if _exists(os.path.join(home, name), f"~/{name}")]
+    config_home = environ.get("XDG_CONFIG_HOME") or os.path.join(home, ".config")
+    if _exists(os.path.join(config_home, "git", "credentials"), "the XDG credential store"):
+        findings.append(Finding("home", "$XDG_CONFIG_HOME/git/credentials",
+                                "credential store file (not allowed)"))
+    try:
+        keys = [name for name in os.listdir(os.path.join(home, ".ssh"))
+                if name.startswith("id_") and not name.endswith(".pub")]
+    except FileNotFoundError:
+        keys = []
+    except OSError:
+        raise CheckError("cannot list ~/.ssh") from None
+    if keys:
+        findings.append(Finding("home", "~/.ssh/id_*", "ssh private key (not allowed)"))
     return findings
 
 
@@ -252,7 +276,7 @@ def main() -> int:
         raw = run_git("config", "--list", "--show-scope", "--show-origin", "--includes", "-z")
         findings = config_findings(parse_config_list(raw))
         findings += env_findings(dict(os.environ))
-        findings += netrc_findings()
+        findings += home_findings(dict(os.environ))
         legacy = legacy_remote_findings()
         # With legacy remote files present, newer Git warns on stderr while
         # listing remotes; the result is a finding either way, so stop here.
@@ -267,7 +291,7 @@ def main() -> int:
             print(f"  [{finding.scope}] {finding.key}: {finding.reason}", file=sys.stderr)
         return EXIT_FOUND
     print("ok: no Git credentials in the effective git config (all scopes, includes, "
-          "environment), the effective remote URLs or ~/.netrc")
+          "environment), the effective remote URLs or the home directory credential files")
     return EXIT_OK
 
 

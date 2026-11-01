@@ -17,10 +17,17 @@ Invariants checked:
   credential check; every setup-python is immediately followed by the
   hash-verified pip bootstrap; every line of every `run` is one of the
   reviewed command lines (REVIEWED_RUN_LINES, deny by default);
-* the files that run on the runner or define Layer B (REVIEWED_FILES) have
-  their reviewed content (sha256), and scripts/*.sh is exactly the reviewed
-  set. This pin is the authority for those files: shell is too expressive to
-  be verified completely by static analysis;
+* every job is exactly the reviewed sequence of steps (EXPECTED_STEPS), and
+  the triggers, concurrency and setup-python inputs are the reviewed values;
+* the files that run on the runner, that pip/hatchling/mypy read and execute
+  from there, or that define Layer A/B (REVIEWED_FILES) have their reviewed
+  content (sha256); scripts/*.sh and ci/isolated-tests/ are exactly the
+  reviewed sets; build/type-check configuration files that are not reviewed
+  (setup.py, hatch_build.py, mypy.ini, ...) do not exist; and nothing at the
+  repository root can shadow a module for `python -m pip` (the working
+  directory is first on sys.path, and Python 3.9 has no -P). This pin is the
+  authority for those files: shell is too expressive to be verified
+  completely by static analysis;
 * in addition, as a second line of defence with precise reasons: the
   Dockerfile has a single FROM pinned to the reviewed digest, no parser
   directives, no instruction flags (--from, --mount, ...), no exec-form RUN, no
@@ -61,6 +68,17 @@ WITH_KEYS = {
     "actions/checkout": {"persist-credentials"},
     "actions/setup-python": {"python-version", "cache", "cache-dependency-path"},
 }
+TRIGGER_VALUES = {
+    "push": {"branches": [("plain", "main")]},
+    "pull_request": {"branches": [("plain", "main")]},
+    "workflow_dispatch": ("empty", ""),
+}
+CONCURRENCY_VALUES = {
+    "group": ("plain", "ci-${{ github.workflow }}-${{ github.ref }}"),
+    "cancel-in-progress": ("plain", "true"),
+}
+SETUP_PYTHON_CACHE = {"cache": ("plain", "pip"),
+                      "cache-dependency-path": ("plain", "requirements/ci-lock.txt")}
 CREDENTIAL_CHECK_STEP = ("Verify no persisted Git credentials",
                          "python3 -I scripts/check_no_persisted_credentials.py")
 PIP_BOOTSTRAP_STEP = ("Install hash-verified pip", "bash scripts/bootstrap_locked_pip.sh")
@@ -110,10 +128,53 @@ REVIEWED_RUN_LINES = frozenset({
     "bash scripts/run_isolated_tests.sh python -m generation_workspace --help",
 })
 
-#: Reviewed content (sha256) of the files that run on the runner or define the
-#: Layer B image and runner. After a reviewed change, update the digest here
-#: (the violation prints the new one).
+_INSTALL_PROJECT = (
+    "python -m pip --version",
+    "python -m pip install --require-hashes --no-deps --only-binary=:all: "
+    "-r requirements/ci-lock.txt",
+    "python -m pip install --no-deps --no-build-isolation --no-index -e .",
+)
+_CHECKOUT = ("actions/checkout", ("python3 -I scripts/check_no_persisted_credentials.py",))
+_SETUP = ("actions/setup-python", ("bash scripts/bootstrap_locked_pip.sh",))
+_ISOLATED = "bash scripts/run_isolated_tests.sh"
+#: The reviewed steps of every job: an action (followed by its required run
+#: line) or the lines of a run block.
+EXPECTED_STEPS: dict[str, tuple[Any, ...]] = {
+    "test": (*_CHECKOUT, (_ISOLATED,), ("bash scripts/check_isolation_red.sh",)),
+    "lint": (*_CHECKOUT, *_SETUP, (*_INSTALL_PROJECT, "python -m pip check"),
+             ("ruff check .",)),
+    "type-check": (*_CHECKOUT, *_SETUP, (*_INSTALL_PROJECT, "python -m pip check"),
+                   ("mypy src",)),
+    "generation-workspace": (
+        *_CHECKOUT, *_SETUP,
+        (*_INSTALL_PROJECT, "python -m pip install -e tools/generation_workspace --no-deps "
+         "--no-build-isolation --no-index", "python -m pip check"),
+        (f"{_ISOLATED} pytest tools/generation_workspace/tests",),
+        (f"{_ISOLATED} pytest tools/generation_workspace/tests --collect-only -q",),
+        ("ruff check tools/generation_workspace",),
+        ("mypy tools/generation_workspace/generation_workspace",),
+        (f"{_ISOLATED} generation-workspace --help",),
+        (f"{_ISOLATED} python -m generation_workspace --help",),
+    ),
+}
+
+#: Reviewed content (sha256) of the files that run on the runner, that pip,
+#: hatchling or mypy read (and may execute code from) on the runner, and that
+#: define Layer A and the Layer B image, runner and self-check. After a
+#: reviewed change, update the digest here (the violation prints the new one).
 REVIEWED_FILES = {
+    ".dockerignore":
+        "55f9d1c90ef62c66c77f60f6159712230bd6da0042e7ae322d21cef71f41c22f",
+    "conftest.py":
+        "7636712981b092ae54a30c0c909566cc475a31f73ca57c9dad913d5fa4a4dea1",
+    "pyproject.toml":
+        "33c3d979b6a905ec3eb58a9f8f57b69aafe71821a11bcd555c05b1ad6125610c",
+    "tools/generation_workspace/pyproject.toml":
+        "552f4031fffe4dddd7a3191e9dc8ed9447206a38ed4bdad0f37d2c5314fd03e7",
+    "ci/isolated-tests/run_in_container.sh":
+        "735439d07574b5896a2612834a15ba01ce3b19beb48b9170b2f381af59642839",
+    "ci/isolated-tests/verify_isolation.py":
+        "c070fcec74b3e2021f82b68dc5f5404abc557c3b5174057dc7145e41f7a7bcd0",
     "ci/isolated-tests/Dockerfile":
         "b632c45ef358237584adc49599b1d0899dc6d7a0412612e4644cdac2ed792089",
     "scripts/bootstrap_locked_pip.sh":
@@ -121,11 +182,23 @@ REVIEWED_FILES = {
     "scripts/check_isolation_red.sh":
         "6c3c70d7ead534400629b25649111733e3d0b7d7d4633935dcb2b9dff3eedffb",
     "scripts/check_no_persisted_credentials.py":
-        "d4686ea630df77dceee4ad4c755dd572a112b0b92e6c1d1e235d422d8ef71ffb",
+        "c324783b5f988a0e7095f68e90311a9a4c0ffa7c9682a27804b970f152924290",
     "scripts/run_isolated_tests.sh":
         "6f89fd3f354b648e317d8cf6de37f61e71a4d5e4b2b01d1ef289bcd26f81f9d5",
 }
 REVIEWED_SCRIPTS = ("bootstrap_locked_pip.sh", "check_isolation_red.sh", "run_isolated_tests.sh")
+REVIEWED_ISOLATED_TESTS = ("Dockerfile", "run_in_container.sh", "verify_isolation.py")
+#: Project directories whose build / type-check configuration is reviewed;
+#: other configuration files that pip, hatchling or mypy would read there are
+#: not allowed.
+PROJECT_DIRS = (".", "tools/generation_workspace")
+UNREVIEWED_CONFIG_FILES = ("setup.py", "setup.cfg", "hatch_build.py", "hatch.toml", "mypy.ini",
+                           ".mypy.ini")
+#: Importable entries allowed at the repository root (the working directory of
+#: `python -m pip`, which puts it first on sys.path).
+ROOT_MODULES = {"conftest.py"}
+ROOT_PACKAGES = {"tests"}
+_MODULE_SUFFIXES = (".py", ".pyc", ".pyo", ".pyd", ".so", ".pth")
 
 
 class Violation(NamedTuple):
@@ -373,6 +446,10 @@ def check_workflow(
     triggers = doc.get("on")
     if not isinstance(triggers, dict) or not set(triggers) <= TRIGGERS:
         bad("WORKFLOW_TRIGGERS", "on", "only push, pull_request and workflow_dispatch are allowed")
+    elif _plain(triggers) != TRIGGER_VALUES:
+        bad("WORKFLOW_TRIGGERS", "on", "triggers must be the reviewed values")
+    if _plain(doc.get("concurrency")) != CONCURRENCY_VALUES:
+        bad("CONCURRENCY", "concurrency", "concurrency must be the reviewed values")
     permissions = doc.get("permissions")
     if not (isinstance(permissions, dict) and list(permissions) == ["contents"]
             and _is(permissions["contents"], "read")):
@@ -406,7 +483,32 @@ def check_workflow(
             bad("CHECKOUT_NOT_FIRST", f"jobs.{job_name}.steps[0]", "the first step must be "
                 "actions/checkout")
         found += _check_steps(steps, f"{where}:jobs.{job_name}", image_python)
+        if job_name in EXPECTED_STEPS and _signatures(steps) != EXPECTED_STEPS[job_name]:
+            bad("JOB_STEPS", f"jobs.{job_name}.steps", "the steps must be exactly the reviewed "
+                "sequence (EXPECTED_STEPS)")
     return found
+
+
+def _plain(node: Any) -> Any:
+    if isinstance(node, Scalar):
+        return (node.style, node.text)
+    if isinstance(node, dict):
+        return {key: _plain(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [_plain(value) for value in node]
+    return node
+
+
+def _signatures(steps: list[Any]) -> tuple[Any, ...]:
+    result: list[Any] = []
+    for step in steps:
+        if isinstance(step, dict) and isinstance(step.get("uses"), Scalar):
+            result.append(step["uses"].text.partition("@")[0])
+        elif isinstance(step, dict) and isinstance(step.get("run"), Scalar):
+            result.append(tuple(line for line in step["run"].text.split("\n") if line))
+        else:
+            result.append(None)
+    return tuple(result)
 
 
 def _check_steps(steps: list[Any], where: str, image_python: str | None) -> list[Violation]:
@@ -474,6 +576,9 @@ def _check_action(
         ):
             found.append(Violation("RUNNER_PYTHON", path,
                                    "python-version must be the image Python"))
+        for key, expected in SETUP_PYTHON_CACHE.items():
+            if _plain(with_.get(key)) != expected:
+                found.append(Violation("ACTION_INPUTS", path, f"{key} must be {expected[1]!r}"))
         if not _is_step(following, PIP_BOOTSTRAP_STEP):
             found.append(Violation("PIP_NOT_BOOTSTRAPPED", path,
                                    "the next step must be the hash-verified pip bootstrap"))
@@ -492,11 +597,14 @@ _PIP = re.compile(r"pip(\d+(\.\d+)?)?")
 _PYTHON = re.compile(r"python(\d+(\.\d+)?)?")
 _FORBIDDEN_INSTALLERS = {"pipx", "easy_install", "uv", "poetry", "pdm", "conda", "mamba",
                          "micromamba", "pipenv", "ensurepip"}
-_PREFIXES = {"sudo", "env", "exec", "command", "nice", "time", "nohup",
+_PREFIXES = {"sudo", "env", "exec", "command", "nice", "time", "nohup", "busybox",
              # reserved words that may precede a command
              "{", "}", "!", "if", "then", "else", "elif", "do", "while", "until"}
 _SHELLS = {"sh", "bash", "dash", "zsh", "ksh"}
-_DYNAMIC_COMMANDS = {"eval", "source", ".", "alias", "function"}
+_DYNAMIC_COMMANDS = {"eval", "source", ".", "alias", "function",
+                     # interpreters whose programs the guard does not analyse
+                     "perl", "ruby", "node", "php", "lua", "tclsh", "awk", "gawk", "mawk",
+                     "nawk"}
 _PIP_READ_ONLY = {"check", "list", "freeze", "show"}
 _PIP_GLOBAL_OPTIONS = {"-q", "--quiet", "--disable-pip-version-check"}
 _INSTALL_FLAGS = {"--require-hashes", "--no-deps", "--only-binary=:all:", "--no-build-isolation",
@@ -529,6 +637,8 @@ def _lines(text: str) -> list[list[list[str]]]:
     """Split shell text into logical lines of simple commands (lists of words)."""
     joined = text.replace("\\\n", " ")
     lines: list[list[list[str]]] = []
+    case_depth = 0
+    in_array = False  # inside `NAME=( ... )`, which may span lines
     for line in joined.split("\n"):
         # shlex would also start a comment in the middle of a word (`a#b`),
         # which the shell does not; comments are cut here instead.
@@ -545,19 +655,36 @@ def _lines(text: str) -> list[list[list[str]]]:
         segments: list[list[str]] = []
         current: list[str] = []
         redirect_target = False
+        last_operator = None
         for token in tokens:
+            if in_array:
+                in_array = token != ")"  # array elements are words, not commands
+                continue
+            if token == "(" and current and current[-1].endswith("="):
+                in_array = True
+                continue
             if redirect_target:
                 redirect_target = False  # the file of a redirection, not a command
                 continue
             if set(token) <= set("<>&") and set(token) & set("<>"):
                 redirect_target = True
-            elif token == ")" and not segments and current:
+            elif token == ")" and case_depth and current and current[0] == "case" \
+                    and "in" in current:
+                # `case WORD in PATTERN)` on one line: drop the pattern.
+                segments.append(current[: current.index("in") + 1])
+                current = []
+            elif token == ")" and case_depth and current and last_operator in (None, ";;"):
                 current = []  # a `case` pattern: `pattern) command ;;`
             elif token in _OPERATORS or set(token) <= set("&|;()<>"):
                 if current:
                     segments.append(current)
                 current = []
+                last_operator = token
             else:
+                if not current and token == "case":
+                    case_depth += 1
+                elif not current and token == "esac":
+                    case_depth = max(case_depth - 1, 0)
                 current.append(token)
         if current:
             segments.append(current)
@@ -574,6 +701,8 @@ def _command_words(words: list[str]) -> list[str]:
     while index < len(words) and (
         re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", words[index]) or words[index] in _PREFIXES
     ):
+        if words[index] == "command" and words[index + 1 : index + 2] in (["-v"], ["-V"]):
+            return []  # `command -v NAME` only looks NAME up
         index += 1
     return words[index:]
 
@@ -651,6 +780,15 @@ def check_shell(text: str, where: str, _depth: int = 0) -> list[Violation]:
             if not words:
                 continue
             program = os.path.basename(words[0])
+            if words[0].startswith("-"):
+                # e.g. `env -S "pip install x"`, `env -i ...`: options of a prefix.
+                found.append(Violation("SHELL_DYNAMIC", where,
+                                       f"options of a command prefix ({words[0][:10]})"))
+                continue
+            if program in _SHELLS and all(word.startswith("-") for word in words[1:]):
+                found.append(Violation("SHELL_DYNAMIC", where, f"{program} reading commands "
+                                       "from stdin"))
+                continue
             # "$@" runs a function's own arguments, which are checked where it is called.
             if (program in _DYNAMIC_COMMANDS or (_is_dynamic(words[0]) and words[0] != "$@")
                     or ((program in _SHELLS or _PYTHON.fullmatch(program))
@@ -669,6 +807,10 @@ def check_shell(text: str, where: str, _depth: int = 0) -> list[Violation]:
                 elif rest[:1] and rest[0].startswith("-m"):
                     module = rest[0][2:]
                 target = module if module is not None else (rest[0] if rest else "")
+                if target in ("", "-") or target.startswith(("/", "~", "..")):
+                    found.append(Violation("SHELL_DYNAMIC", where, "python reading stdin or "
+                                           "running a script outside the repository"))
+                    continue
                 if _is_dynamic(target) and os.path.basename(target) != "pip":
                     found.append(Violation("SHELL_DYNAMIC", where,
                                            "python target built from an expansion"))
@@ -909,6 +1051,24 @@ def check_repository(root: Path) -> list[Violation]:
     if scripts != REVIEWED_SCRIPTS:
         found.append(Violation("SCRIPT_FILES", "scripts", f"expected {list(REVIEWED_SCRIPTS)}, "
                                f"found {list(scripts)}"))
+    isolated = tuple(sorted(p.name for p in (root / "ci" / "isolated-tests").iterdir()))
+    if isolated != REVIEWED_ISOLATED_TESTS:
+        found.append(Violation("SCRIPT_FILES", "ci/isolated-tests",
+                               f"expected {list(REVIEWED_ISOLATED_TESTS)}, found {list(isolated)}"))
+    for directory in PROJECT_DIRS:
+        for name in UNREVIEWED_CONFIG_FILES:
+            if os.path.lexists(root / directory / name):
+                found.append(Violation("UNREVIEWED_CONFIG", f"{directory}/{name}",
+                                       "build/type-check configuration outside the reviewed "
+                                       "pyproject.toml is not allowed"))
+    for entry in sorted(root.iterdir()):
+        is_module = entry.name.endswith(_MODULE_SUFFIXES) and entry.name not in ROOT_MODULES
+        is_package = (entry.is_dir() and entry.name not in ROOT_PACKAGES
+                      and any((entry / f"__init__{suffix}").exists()
+                              for suffix in _MODULE_SUFFIXES))
+        if is_module or is_package:
+            found.append(Violation("ROOT_MODULE", entry.name, "importable entry at the repository "
+                                   "root (could shadow a module for `python -m pip`)"))
     for name, digest in REVIEWED_FILES.items():
         actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
         if actual != digest:
