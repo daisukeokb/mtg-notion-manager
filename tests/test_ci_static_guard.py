@@ -670,7 +670,7 @@ def test_reaudit_new1_root_module_that_could_shadow_pip_fails(tmp_path: Path,
     root = _repo_copy(tmp_path)
     (root / relative).parent.mkdir(parents=True, exist_ok=True)
     (root / relative).write_text("print('dummy')\n", encoding="utf-8")
-    assert "ROOT_MODULE" in codes(guard.check_repository(root))
+    assert "IMPORTABLE_ENTRY" in codes(guard.check_repository(root))
 
 
 @pytest.mark.parametrize(
@@ -713,26 +713,26 @@ def test_reaudit_new4_extra_file_in_isolated_tests_fails(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
-    "command",
+    "command,code",
     [
-        "( pip install x )",
-        "(pip install x)",
-        "true && (pip install x)",
-        "echo pip install x | sh",
-        "echo x | bash -s",
-        "python - < x",
-        "python",
-        "python /tmp/evil.py",
-        "python ../evil.py",
-        'env -S "pip install x"',
-        "busybox sh -c 'pip install x'",
-        "perl -e 'system(1)'",
-        "awk 'BEGIN { system(1) }'",
+        ("( pip install x )", "PIP_UNLOCKED_REQUIREMENT"),
+        ("(pip install x)", "PIP_UNLOCKED_REQUIREMENT"),
+        ("true && (pip install x)", "PIP_UNLOCKED_REQUIREMENT"),
+        ("echo pip install x | sh", "SHELL_DYNAMIC"),
+        ("echo x | bash -s", "SHELL_DYNAMIC"),
+        ("python - < x", "SHELL_DYNAMIC"),
+        ("python", "SHELL_DYNAMIC"),
+        ("python /tmp/evil.py", "SHELL_DYNAMIC"),
+        ("python ../evil.py", "SHELL_DYNAMIC"),
+        ('env -S "pip install x"', "SHELL_DYNAMIC"),
+        ("busybox sh -c 'pip install x'", "SHELL_DYNAMIC"),
+        ("perl -e 'system(1)'", "SHELL_DYNAMIC"),
+        ("awk 'BEGIN { system(1) }'", "SHELL_DYNAMIC"),
     ],
 )
-def test_reaudit_new2_subshell_stdin_and_other_interpreters_fail(command: str) -> None:
-    assert codes(guard.check_shell(command, "fixture")) & {
-        "PIP_UNLOCKED_REQUIREMENT", "SHELL_DYNAMIC"}
+def test_reaudit_new2_subshell_stdin_and_other_interpreters_fail(command: str,
+                                                                 code: str) -> None:
+    assert code in codes(guard.check_shell(command, "fixture"))
 
 
 def test_reaudit_new2_subshell_in_dockerfile_fails() -> None:
@@ -785,3 +785,74 @@ def test_reaudit_new3_changed_step_sequence_fails(old: str, new: str) -> None:
 )
 def test_reaudit_new3_unreviewed_workflow_values_fail(old: str, new: str, code: str) -> None:
     assert code in check_wf(mutate(WF, old, new))
+
+
+# --- third independent audit (Phase 3H-R3) findings --------------------------------
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        # The editable installs put src/ and tools/generation_workspace/ on sys.path
+        # of every later Python process on the runner (pip, mypy, build backends).
+        "src/sitecustomize.py",
+        "src/usercustomize.py",
+        "src/orjson.py",
+        "src/brotli.py",
+        "src/pkg/__init__.py",
+        "src/namespace/module.py",
+        "tools/generation_workspace/sitecustomize.py",
+        "tools/generation_workspace/orjson/__init__.py",
+        # A namespace directory with modules at the root, and ABI-tagged extension
+        # package initialisers (D-2).
+        "config/evil.py",
+        "pip/__init__.cpython-39-x86_64-linux-gnu.so",
+        "pip/__init__.abi3.so",
+    ],
+)
+def test_audit3_importable_entry_on_runner_sys_path_fails(tmp_path: Path,
+                                                          relative: str) -> None:
+    root = _repo_copy(tmp_path)
+    (root / relative).parent.mkdir(parents=True, exist_ok=True)
+    (root / relative).write_text("print('dummy')\n", encoding="utf-8")
+    assert "IMPORTABLE_ENTRY" in codes(guard.check_repository(root))
+
+
+def test_audit3_symlink_on_runner_sys_path_fails(tmp_path: Path) -> None:
+    root = _repo_copy(tmp_path)
+    (root / "src").mkdir()
+    (root / "src" / "orjson").symlink_to(root / "tests")
+    assert "IMPORTABLE_ENTRY" in codes(guard.check_repository(root))
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "src/mtg_notion_manager/module.py",
+        "tools/generation_workspace/generation_workspace/module.py",
+        "reports/data.json",
+        "__pycache__/conftest.cpython-39.pyc",
+        "src/__pycache__/x.cpython-39.pyc",
+    ],
+)
+def test_audit3_allowed_or_non_importable_entries_pass(tmp_path: Path, relative: str) -> None:
+    root = _repo_copy(tmp_path)
+    (root / relative).parent.mkdir(parents=True, exist_ok=True)
+    (root / relative).write_text("dummy\n", encoding="utf-8")
+    assert guard.check_repository(root) == []
+
+
+@pytest.mark.parametrize(
+    "command,code",
+    [
+        ("python -m pip install --no-deps --no-index -e ../evil", "PIP_REMOTE_SOURCE"),
+        ("python -m pip install --no-deps --no-index -e ./a/../../evil", "PIP_REMOTE_SOURCE"),
+        ("PIP_INDEX_URL=https://example.invalid/simple python -m pip install --no-deps "
+         "--no-index -e .", "PIP_ENVIRONMENT"),
+        ("export PIP_FIND_LINKS=/tmp/x", "PIP_ENVIRONMENT"),
+        ("PIP_CONFIG_FILE=/tmp/x", "PIP_ENVIRONMENT"),
+        ("declare -x PIP_EXTRA_INDEX_URL", "PIP_ENVIRONMENT"),
+    ],
+)
+def test_audit3_parent_paths_and_pip_environment_fail(command: str, code: str) -> None:
+    assert code in codes(guard.check_shell(command, "fixture"))

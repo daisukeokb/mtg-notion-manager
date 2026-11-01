@@ -19,14 +19,20 @@ Invariants checked:
   reviewed command lines (REVIEWED_RUN_LINES, deny by default);
 * every job is exactly the reviewed sequence of steps (EXPECTED_STEPS), and
   the triggers, concurrency and setup-python inputs are the reviewed values;
-* the files that run on the runner, that pip/hatchling/mypy read and execute
-  from there, or that define Layer A/B (REVIEWED_FILES) have their reviewed
-  content (sha256); scripts/*.sh and ci/isolated-tests/ are exactly the
-  reviewed sets; build/type-check configuration files that are not reviewed
-  (setup.py, hatch_build.py, mypy.ini, ...) do not exist; and nothing at the
-  repository root can shadow a module for `python -m pip` (the working
-  directory is first on sys.path, and Python 3.9 has no -P). This pin is the
-  authority for those files: shell is too expressive to be verified
+* the scripts that run on the runner, the configuration from which
+  pip/hatchling/mypy could load code (build hooks, build backend, mypy
+  plugins), and the files that define Layer A/B (REVIEWED_FILES) have their
+  reviewed content (sha256); scripts/*.sh and ci/isolated-tests/ are exactly
+  the reviewed sets; build/type-check configuration files that are not
+  reviewed (setup.py, hatch_build.py, mypy.ini, ...) do not exist; and the
+  repository directories on sys.path of the runner's Python processes (the
+  root as the working directory of `python -m`, Python 3.9 having no -P, and
+  src/ and tools/generation_workspace/ through the editable installs) hold no
+  importable entry other than the reviewed ones (IMPORT_ROOTS), so nothing can
+  shadow a module those programs import (sitecustomize, an optional
+  dependency, ...). The contents of the allowed packages are not pinned; the
+  runner jobs only analyse them (mypy, ruff) and do not import them. This pin
+  is the authority for those files: shell is too expressive to be verified
   completely by static analysis;
 * in addition, as a second line of defence with precise reasons: the
   Dockerfile has a single FROM pinned to the reviewed digest, no parser
@@ -194,10 +200,18 @@ REVIEWED_ISOLATED_TESTS = ("Dockerfile", "run_in_container.sh", "verify_isolatio
 PROJECT_DIRS = (".", "tools/generation_workspace")
 UNREVIEWED_CONFIG_FILES = ("setup.py", "setup.cfg", "hatch_build.py", "hatch.toml", "mypy.ini",
                            ".mypy.ini")
-#: Importable entries allowed at the repository root (the working directory of
-#: `python -m pip`, which puts it first on sys.path).
-ROOT_MODULES = {"conftest.py"}
-ROOT_PACKAGES = {"tests"}
+#: Repository directories on sys.path for the Python processes on the runner
+#: (pip, its build backend subprocesses, mypy), with the importable entries
+#: allowed there: the repository root (the working directory of `python -m`,
+#: which puts it first on sys.path; Python 3.9 has no -P) and the directories
+#: the editable installs add through .pth files. Any other module, package or
+#: namespace directory with modules there could shadow a module those programs
+#: import at startup or optionally (sitecustomize, orjson, ...).
+IMPORT_ROOTS = {
+    ".": {"conftest.py", "tests", "ci", "scripts", "src", "tools"},
+    "src": {"mtg_notion_manager"},
+    "tools/generation_workspace": {"generation_workspace", "tests"},
+}
 _MODULE_SUFFIXES = (".py", ".pyc", ".pyo", ".pyd", ".so", ".pth")
 
 
@@ -776,6 +790,12 @@ def check_shell(text: str, where: str, _depth: int = 0) -> list[Violation]:
     for segments in lines:
         line_mentions_pip = any(_mentions_pip(words) for words in segments)
         for raw_words in segments:
+            # PIP_* variables (PIP_INDEX_URL, PIP_FIND_LINKS, ...) change what pip
+            # installs without appearing in its arguments.
+            if any(re.match(r"PIP_[A-Za-z0-9_]*(=|$)", word) for word in raw_words):
+                found.append(Violation("PIP_ENVIRONMENT", where, "PIP_* variables are not "
+                                       "allowed (they change pip's sources)"))
+                continue
             words = _command_words(raw_words)
             if not words:
                 continue
@@ -866,7 +886,8 @@ def _check_pip(arguments: list[str], where: str) -> list[Violation]:
     for option, value in values:
         # -r / -e: literal local paths only (an expansion could name a VCS URL).
         # --find-links may be an expansion, but only next to a hash-locked -r.
-        literal = _LOCAL_PATH.fullmatch(value) and "://" not in value and "@" not in value
+        literal = (_LOCAL_PATH.fullmatch(value) and "://" not in value and "@" not in value
+                   and ".." not in value.split("/"))
         dynamic_find_links = (option == "--find-links" and re.fullmatch(r"\$[a-z_]+", value)
                               and requirement_files and not editables)
         if not (literal or dynamic_find_links):
@@ -1031,6 +1052,23 @@ def check_runner(text: str, where: str = "run_isolated_tests.sh") -> list[Violat
 # --- repository --------------------------------------------------------------------
 
 
+def _importable(entry: Path) -> bool:
+    """A module, an extension module, a .pth file, a symlink with an importable
+    name, or a directory with an `__init__*` or any module below it (a regular or
+    namespace package). `__pycache__` is skipped: Python ignores a .pyc there
+    without its source next to it."""
+    if entry.is_symlink():
+        return entry.name.split(".")[0].isidentifier()
+    if entry.name == "__pycache__":
+        return False
+    if entry.is_dir():
+        return entry.name.isidentifier() and any(
+            path.name.startswith("__init__") or path.name.endswith(_MODULE_SUFFIXES)
+            for path in entry.rglob("*")
+        )
+    return entry.name.endswith(_MODULE_SUFFIXES)
+
+
 def check_repository(root: Path) -> list[Violation]:
     found: list[Violation] = []
     workflows_dir = root / ".github" / "workflows"
@@ -1061,14 +1099,14 @@ def check_repository(root: Path) -> list[Violation]:
                 found.append(Violation("UNREVIEWED_CONFIG", f"{directory}/{name}",
                                        "build/type-check configuration outside the reviewed "
                                        "pyproject.toml is not allowed"))
-    for entry in sorted(root.iterdir()):
-        is_module = entry.name.endswith(_MODULE_SUFFIXES) and entry.name not in ROOT_MODULES
-        is_package = (entry.is_dir() and entry.name not in ROOT_PACKAGES
-                      and any((entry / f"__init__{suffix}").exists()
-                              for suffix in _MODULE_SUFFIXES))
-        if is_module or is_package:
-            found.append(Violation("ROOT_MODULE", entry.name, "importable entry at the repository "
-                                   "root (could shadow a module for `python -m pip`)"))
+    for directory, allowed in IMPORT_ROOTS.items():
+        if not (root / directory).is_dir():
+            continue
+        for entry in sorted((root / directory).iterdir()):
+            if entry.name not in allowed and _importable(entry):
+                found.append(Violation("IMPORTABLE_ENTRY", f"{directory}/{entry.name}",
+                                       "importable entry in a directory on sys.path of the "
+                                       "runner (could shadow a module pip or mypy imports)"))
     for name, digest in REVIEWED_FILES.items():
         actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
         if actual != digest:
