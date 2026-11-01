@@ -109,6 +109,9 @@ def test_clean_repository_passes(fx: Fixture) -> None:
         ("remote.mirror.url", "ssh://git@example.invalid/owner/repo.git"),
         ("remote.scp.url", "git@example.invalid:owner/repo.git"),
         ("core.autocrlf", "false"),
+        ("http.proxy", "http://proxy.invalid:3128"),
+        ("http.proxy", "proxy.invalid:3128"),
+        ("core.gitProxy", "none"),
     ],
 )
 def test_safe_settings_pass(fx: Fixture, key: str, value: str) -> None:
@@ -208,6 +211,37 @@ def test_neg02_credentials_in_any_url_valued_setting_fail(fx: Fixture) -> None:
     assert_found(fx.run(), "[local] http.proxy: credentials in URL")
 
 
+@pytest.mark.parametrize(
+    "key,value,expected",
+    [
+        # Audit D-7: Git accepts a proxy without a scheme.
+        ("http.proxy", f"proxy-user:{SECRET}@proxy.invalid:3128",
+         "[local] http.proxy: credentials in proxy URL"),
+        ("remote.origin.proxy", f"proxy-user:{SECRET}@proxy.invalid",
+         "[local] remote.<redacted>.proxy: credentials in proxy URL"),
+        ("core.sshCommand", f"ssh -i /nonexistent/{SECRET}",
+         "[local] core.sshcommand: ssh command override"),
+        ("sendemail.smtpPass", SECRET, "[local] sendemail.smtppass: password setting"),
+        ("sendemail.work.smtpPass", SECRET,
+         "[local] sendemail.<redacted>.smtppass: password setting"),
+        ("imap.pass", SECRET, "[local] imap.pass: password setting"),
+        ("http.proxySSLKey", f"/nonexistent/{SECRET}",
+         "[local] http.proxysslkey: http proxysslkey"),
+    ],
+)
+def test_neg02_other_credential_sources_fail(fx: Fixture, key: str, value: str,
+                                             expected: str) -> None:
+    fx.git("config", key, value)
+    assert_found(fx.run(), expected)
+
+
+@pytest.mark.parametrize("name", [".netrc", "_netrc"])
+def test_neg02_netrc_file_fails(fx: Fixture, name: str) -> None:
+    (Path(fx.env["HOME"]) / name).write_text(
+        f"machine example.invalid login u password {SECRET}\n", encoding="utf-8")
+    assert_found(fx.run(), f"[home] ~/{name}: netrc file (not allowed)")
+
+
 # --- NEG-03: the check cannot run (fail closed, reported as an error) -----------------
 
 
@@ -225,7 +259,7 @@ _CLEAN_GIT = [
 
 
 def _run_main_with_fake_git(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], home: Path,
     failing: tuple[str, ...] | None = None,
 ) -> tuple[int, str]:
     def fake_run(argv: list[str], **_: object) -> subprocess.CompletedProcess[bytes]:
@@ -240,17 +274,20 @@ def _run_main_with_fake_git(
     fake = type("FakeSubprocess", (), {"run": staticmethod(fake_run),
                                         "TimeoutExpired": subprocess.TimeoutExpired})
     monkeypatch.setattr(checker, "subprocess", fake)
-    for name in checker.ASKPASS_ENV:
+    # main() runs in this process: nothing from the caller's environment or home
+    # directory may decide the outcome.
+    for name in (*checker.ENV_FINDINGS, *checker.PROXY_ENV):
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(home))
     status = checker.main()
     captured = capsys.readouterr()
     return status, captured.out + captured.err
 
 
 def test_neg03_fake_git_harness_accepts_a_clean_run(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
-    status, output = _run_main_with_fake_git(monkeypatch, capsys)
+    status, output = _run_main_with_fake_git(monkeypatch, capsys, tmp_path)
     assert status == checker.EXIT_OK and output.startswith("ok: "), output
 
 
@@ -267,10 +304,10 @@ def test_neg03_fake_git_harness_accepts_a_clean_run(
     ],
 )
 def test_neg03_failing_git_call_fails_closed(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path,
     failing: tuple[str, ...], message: str,
 ) -> None:
-    status, output = _run_main_with_fake_git(monkeypatch, capsys, failing)
+    status, output = _run_main_with_fake_git(monkeypatch, capsys, tmp_path, failing)
     assert status == checker.EXIT_ERROR, output
     assert message in output and "ok:" not in output and "simulated" not in output
 
@@ -395,10 +432,49 @@ def test_neg06_redirected_global_config_fails(fx: Fixture) -> None:
     assert_found(fx.run(), "[global] credential.helper: credential setting")
 
 
-@pytest.mark.parametrize("name", ["GIT_ASKPASS", "SSH_ASKPASS"])
-def test_neg06_askpass_environment_fails(fx: Fixture, name: str) -> None:
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        ("GIT_ASKPASS", "askpass program"),
+        ("SSH_ASKPASS", "askpass program"),
+        ("GIT_SSH", "ssh command override"),
+        ("GIT_SSH_COMMAND", "ssh command override"),
+        ("GIT_SSL_KEY", "client certificate"),
+        ("GIT_SSL_CERT", "client certificate"),
+    ],
+)
+def test_neg06_credential_program_environment_fails(fx: Fixture, name: str, reason: str) -> None:
     fx.env[name] = f"/nonexistent/{SECRET}"
-    assert_found(fx.run(), f"[environment] {name}: askpass program")
+    assert_found(fx.run(), f"[environment] {name}: {reason}")
+
+
+def test_neg06_git_config_variable_fails(fx: Fixture) -> None:
+    # Audit D-6: GIT_CONFIG redirects `git config` only; the other Git commands
+    # still use the extraheader in .git/config.
+    fx.git("config", "http.extraheader", f"AUTHORIZATION: basic {SECRET}")
+    empty = fx.base / "empty.gitconfig"
+    empty.write_text("", encoding="utf-8")
+    fx.env["GIT_CONFIG"] = str(empty)
+    assert_found(fx.run(), "[environment] GIT_CONFIG: configuration location override")
+
+
+@pytest.mark.parametrize("name", ["GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"])
+def test_neg06_repository_location_override_fails(fx: Fixture, name: str) -> None:
+    value = str(fx.repo if name == "GIT_WORK_TREE" else fx.repo / ".git")
+    fx.env[name] = value
+    assert_found(fx.run(), f"[environment] {name}: repository location override")
+
+
+@pytest.mark.parametrize("name", ["https_proxy", "HTTPS_PROXY", "http_proxy", "ALL_PROXY"])
+def test_neg06_proxy_environment_with_credentials_fails(fx: Fixture, name: str) -> None:
+    fx.env[name] = f"http://proxy-user:{SECRET}@proxy.invalid:3128"
+    assert_found(fx.run(), f"[environment] {name}: credentials in proxy URL")
+
+
+def test_proxy_environment_without_credentials_passes(fx: Fixture) -> None:
+    fx.env["https_proxy"] = "http://proxy.invalid:3128"
+    fx.env["HTTP_PROXY"] = "proxy.invalid:3128"
+    assert fx.run().returncode == checker.EXIT_OK
 
 
 # --- pure helpers ----------------------------------------------------------------------
@@ -420,6 +496,21 @@ def test_neg06_askpass_environment_fails(fx: Fixture, name: str) -> None:
 )
 def test_url_credential_detection(text: str, expected: bool) -> None:
     assert checker.has_url_credentials(text) is expected
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("http://proxy.invalid:3128", False),
+        ("proxy.invalid:3128", False),
+        ("http://proxy.invalid/path@x", False),
+        ("u:p@proxy.invalid:3128", True),
+        ("socks5://u@proxy.invalid", True),
+        ("", False),
+    ],
+)
+def test_proxy_credential_detection(text: str, expected: bool) -> None:
+    assert checker.has_proxy_credentials(text) is expected
 
 
 @pytest.mark.parametrize(

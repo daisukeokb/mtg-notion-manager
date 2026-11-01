@@ -11,14 +11,21 @@ individual config files, the check reads the configuration Git actually uses:
   url.*.pushInsteadOf rewriting (`git remote get-url --all [--push]`), and
   no legacy remote files ($GIT_DIR/remotes/, $GIT_DIR/branches/), which
   `git remote` does not list;
-* the GIT_ASKPASS / SSH_ASKPASS environment variables.
+* the environment: askpass and ssh command overrides, client certificates,
+  proxy variables with credentials, and variables that make `git config` or
+  Git read a different configuration or repository than the checkout
+  (GIT_CONFIG, GIT_DIR, GIT_COMMON_DIR, GIT_WORK_TREE are not allowed);
+* a ~/.netrc or ~/_netrc file (libcurl in Git reads it); never opened.
 
 A finding is a credential helper or any credential.* setting, an
-http.*.extraheader / cookiefile / sslkey / sslcert, core.askpass, an include
-(includes are not allowed at all: their targets and conditions are not
-reviewed here), or a URL with credentials anywhere in a config key or value
-(any user info for http/https/ftp/ftps, a password for other schemes). Safe
-settings such as `url.https://github.com/.insteadOf git@github.com:` pass.
+http.*.extraheader / cookiefile / sslkey / sslcert / proxysslkey /
+proxysslcert, core.askpass, core.sshCommand, a password setting
+(sendemail.*.smtpPass, imap.pass), an include (includes are not allowed at all:
+their targets and conditions are not reviewed here), a proxy setting with user
+info (with or without a scheme), or a URL with credentials anywhere in a config
+key or value (any user info for http/https/ftp/ftps, a password for other
+schemes). Safe settings such as `url.https://github.com/.insteadOf
+git@github.com:` pass.
 
 Only scopes and key names (with the subsection redacted) are printed, never a
 value. Fail closed: if Git cannot be run, exits non-zero, writes to stderr, or
@@ -41,7 +48,23 @@ EXIT_ERROR = 2
 
 SCOPES = frozenset({"system", "global", "local", "worktree", "command", "unknown"})
 ORIGIN_KINDS = frozenset({"file", "command line", "blob", "standard input"})
-ASKPASS_ENV = ("GIT_ASKPASS", "SSH_ASKPASS")
+#: Environment variables that are findings whenever they are set (non-empty).
+ENV_FINDINGS = {
+    "GIT_ASKPASS": "askpass program",
+    "SSH_ASKPASS": "askpass program",
+    "GIT_SSH": "ssh command override",
+    "GIT_SSH_COMMAND": "ssh command override",
+    "GIT_SSL_KEY": "client certificate",
+    "GIT_SSL_CERT": "client certificate",
+    # `git config` would read another file than the other Git commands, or the
+    # check would inspect another repository than the checkout.
+    "GIT_CONFIG": "configuration location override (not allowed)",
+    "GIT_DIR": "repository location override (not allowed)",
+    "GIT_COMMON_DIR": "repository location override (not allowed)",
+    "GIT_WORK_TREE": "repository location override (not allowed)",
+}
+PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY")
+NETRC_FILES = (".netrc", "_netrc")
 _SECTION = re.compile(r"[a-z0-9-]+")
 _VARIABLE = re.compile(r"[a-z][a-z0-9-]*")
 _URL = re.compile(r"([a-z][a-z0-9+.-]*)://([^/?#\s]*)", re.IGNORECASE)
@@ -127,6 +150,12 @@ def has_url_credentials(text: str) -> bool:
     return False
 
 
+def has_proxy_credentials(text: str) -> bool:
+    # Git and libcurl accept a proxy with or without a scheme (user:pw@host:port).
+    authority = text.strip().partition("://")[2] or text.strip()
+    return "@" in re.split(r"[/?#]", authority, maxsplit=1)[0]
+
+
 def config_findings(entries: list[Entry]) -> list[Finding]:
     findings = []
     for entry in entries:
@@ -136,12 +165,19 @@ def config_findings(entries: list[Entry]) -> list[Finding]:
             reason = "credential setting"
         elif section in ("include", "includeif"):
             reason = "config include (not allowed)"
-        elif section == "http" and variable in ("extraheader", "cookiefile", "sslkey", "sslcert"):
+        elif section == "http" and variable in ("extraheader", "cookiefile", "sslkey", "sslcert",
+                                                 "proxysslkey", "proxysslcert"):
             reason = f"http {variable}"
         elif section == "core" and variable == "askpass":
             reason = "askpass program"
+        elif section == "core" and variable == "sshcommand":
+            reason = "ssh command override"
+        elif (section, variable) in (("sendemail", "smtppass"), ("imap", "pass")):
+            reason = "password setting"
         elif has_url_credentials(subsection or "") or has_url_credentials(entry.value or ""):
             reason = "credentials in URL"
+        elif variable == "proxy" and has_proxy_credentials(entry.value or ""):
+            reason = "credentials in proxy URL"
         if reason:
             findings.append(Finding(entry.scope, redact(entry.key), reason))
     return findings
@@ -186,11 +222,27 @@ def legacy_remote_findings() -> list[Finding]:
 
 
 def env_findings(environ: dict[str, str]) -> list[Finding]:
-    return [
-        Finding("environment", name, "askpass program")
-        for name in ASKPASS_ENV
-        if environ.get(name)
-    ]
+    findings = [Finding("environment", name, reason)
+                for name, reason in ENV_FINDINGS.items() if environ.get(name)]
+    findings += [Finding("environment", name, "credentials in proxy URL")
+                 for name in PROXY_ENV if has_proxy_credentials(environ.get(name, ""))]
+    return findings
+
+
+def netrc_findings() -> list[Finding]:
+    home = os.path.expanduser("~")
+    if home == "~":
+        raise CheckError("cannot determine the home directory")
+    findings = []
+    for name in NETRC_FILES:
+        try:
+            os.lstat(os.path.join(home, name))  # existence only; never opened
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise CheckError(f"cannot check for ~/{name}") from None
+        findings.append(Finding("home", f"~/{name}", "netrc file (not allowed)"))
+    return findings
 
 
 def main() -> int:
@@ -200,6 +252,7 @@ def main() -> int:
         raw = run_git("config", "--list", "--show-scope", "--show-origin", "--includes", "-z")
         findings = config_findings(parse_config_list(raw))
         findings += env_findings(dict(os.environ))
+        findings += netrc_findings()
         legacy = legacy_remote_findings()
         # With legacy remote files present, newer Git warns on stderr while
         # listing remotes; the result is a finding either way, so stop here.
@@ -214,7 +267,7 @@ def main() -> int:
             print(f"  [{finding.scope}] {finding.key}: {finding.reason}", file=sys.stderr)
         return EXIT_FOUND
     print("ok: no Git credentials in the effective git config (all scopes, includes, "
-          "environment) or the effective remote URLs")
+          "environment), the effective remote URLs or ~/.netrc")
     return EXIT_OK
 
 

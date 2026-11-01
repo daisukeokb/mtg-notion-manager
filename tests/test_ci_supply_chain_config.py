@@ -231,14 +231,14 @@ def test_pip_bootstrap_verifies_before_running_and_installs_offline() -> None:
     script = (REPO_ROOT / "scripts" / "bootstrap_locked_pip.sh").read_text(encoding="utf-8")
     download = script.index("curl --fail")
     verify = script.index("sha256sum --check --strict")
-    install = script.index('python "$wheel/pip" install')
+    install = script.index('python -I "$wheel/pip" install')
     assert download < verify < install
     assert "--proto '=https' --proto-redir '=https'" in script
     # Explicit result checks on every step instead of relying on `set -e`.
     assert "set -uo pipefail" in script.splitlines()
     assert not any(re.match(r"set -\w*e", line) for line in script.splitlines())
     for line in script.splitlines():
-        if 'python "$wheel/pip" install' in line:
+        if 'python -I "$wheel/pip" install' in line:
             assert "--require-hashes" in line and "--no-index" in line
 
 

@@ -5,21 +5,31 @@ not try to understand all of GitHub Actions, YAML or shell. It accepts a
 deliberately small, canonical subset and reports everything else as a
 violation (fail closed), so an invariant cannot be hidden behind a YAML anchor,
 a duplicate key, a quoted key, `no` instead of `false`, an extra job, a
-job-level setting or an unusual pip spelling.
+job-level setting, a Unicode line separator or an unusual shell spelling.
 
 Invariants checked:
 
-* workflows: ci.yml is the only workflow and has exactly the reviewed jobs,
-  keys and triggers; read-only permissions; no secrets or dynamic expressions
-  outside `concurrency`; every action is an allowlisted repository at its
-  reviewed commit SHA; every checkout sets `persist-credentials: false` and is
-  immediately followed by the credential check; every setup-python is
-  immediately followed by the hash-verified pip bootstrap;
-* Dockerfile: a single FROM pinned to the reviewed digest, no ADD;
-* Layer B runner: the `docker run` isolation flags are present exactly once
-  and nothing weakens them;
-* every pip invocation in the workflow, the Dockerfile and scripts/*.sh is
-  either hash-locked or offline/local, with only reviewed options.
+* workflows: ci.yml is the only workflow, printable ASCII only, and has exactly
+  the reviewed jobs, keys and triggers; read-only permissions; no secrets or
+  dynamic expressions outside `concurrency`; every action is an allowlisted
+  repository at its reviewed commit SHA; every job starts with a checkout that
+  sets `persist-credentials: false` and is immediately followed by the
+  credential check; every setup-python is immediately followed by the
+  hash-verified pip bootstrap; every line of every `run` is one of the
+  reviewed command lines (REVIEWED_RUN_LINES, deny by default);
+* the files that run on the runner or define Layer B (REVIEWED_FILES) have
+  their reviewed content (sha256), and scripts/*.sh is exactly the reviewed
+  set. This pin is the authority for those files: shell is too expressive to
+  be verified completely by static analysis;
+* in addition, as a second line of defence with precise reasons: the
+  Dockerfile has a single FROM pinned to the reviewed digest, no parser
+  directives, no instruction flags (--from, --mount, ...), no exec-form RUN, no
+  ADD/ARG, only reviewed ENV names, and ends as `USER 10001:10001`; the Layer B
+  runner has exactly one `docker run` with the isolation flags present exactly
+  once and no other docker commands than `info` and a reviewed `build`; every
+  pip invocation in the workflow, the Dockerfile and scripts/*.sh is either
+  hash-locked or offline/local with only reviewed options, and dynamic shell
+  (eval, `sh -c`, `python -c`, a command name built from `$`) is a violation.
 
 Changing any of these on purpose requires updating this guard in the same
 change, which makes the change visible in review.
@@ -27,6 +37,7 @@ change, which makes the change visible in review.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shlex
@@ -56,6 +67,8 @@ PIP_BOOTSTRAP_STEP = ("Install hash-verified pip", "bash scripts/bootstrap_locke
 BASE_IMAGE = ("python:3.9-slim-bookworm@sha256:"
               "03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363")
 DOCKERFILE_INSTRUCTIONS = {"FROM", "ENV", "RUN", "WORKDIR", "COPY", "USER", "CMD"}
+DOCKERFILE_ENV = {"PYTHONDONTWRITEBYTECODE", "PIP_NO_CACHE_DIR", "PIP_DISABLE_PIP_VERSION_CHECK"}
+DOCKERFILE_USER = "10001:10001"
 HASHED_LOCKS = {"requirements/ci-lock.txt", "requirements/ci-pip-lock.txt"}
 
 #: `docker run` options that must appear exactly as given (Layer B).
@@ -71,6 +84,48 @@ REQUIRED_RUN_OPTIONS = (
 )
 #: All `docker run` options the runner may use (anything else is a violation).
 ALLOWED_RUN_OPTIONS = {"--rm", "-e"} | {opt[0] for opt in REQUIRED_RUN_OPTIONS}
+#: `docker build` options of the runner: option -> required value (None: any).
+BUILD_OPTIONS = {"--quiet": None, "--platform": "linux/amd64", "-f": "", "-t": "$IMAGE"}
+
+#: Every line of every workflow `run` must be one of these (deny by default).
+REVIEWED_RUN_LINES = frozenset({
+    CREDENTIAL_CHECK_STEP[1],
+    PIP_BOOTSTRAP_STEP[1],
+    "bash scripts/run_isolated_tests.sh",
+    "bash scripts/check_isolation_red.sh",
+    "python -m pip --version",
+    "python -m pip install --require-hashes --no-deps --only-binary=:all: "
+    "-r requirements/ci-lock.txt",
+    "python -m pip install --no-deps --no-build-isolation --no-index -e .",
+    "python -m pip install -e tools/generation_workspace --no-deps --no-build-isolation "
+    "--no-index",
+    "python -m pip check",
+    "ruff check .",
+    "mypy src",
+    "bash scripts/run_isolated_tests.sh pytest tools/generation_workspace/tests",
+    "bash scripts/run_isolated_tests.sh pytest tools/generation_workspace/tests --collect-only -q",
+    "ruff check tools/generation_workspace",
+    "mypy tools/generation_workspace/generation_workspace",
+    "bash scripts/run_isolated_tests.sh generation-workspace --help",
+    "bash scripts/run_isolated_tests.sh python -m generation_workspace --help",
+})
+
+#: Reviewed content (sha256) of the files that run on the runner or define the
+#: Layer B image and runner. After a reviewed change, update the digest here
+#: (the violation prints the new one).
+REVIEWED_FILES = {
+    "ci/isolated-tests/Dockerfile":
+        "b632c45ef358237584adc49599b1d0899dc6d7a0412612e4644cdac2ed792089",
+    "scripts/bootstrap_locked_pip.sh":
+        "2f2cdbd0174464ec977f8e68f3e6e75bddd6ea8505f377492dd5439fbc6c37e1",
+    "scripts/check_isolation_red.sh":
+        "6c3c70d7ead534400629b25649111733e3d0b7d7d4633935dcb2b9dff3eedffb",
+    "scripts/check_no_persisted_credentials.py":
+        "d4686ea630df77dceee4ad4c755dd572a112b0b92e6c1d1e235d422d8ef71ffb",
+    "scripts/run_isolated_tests.sh":
+        "6f89fd3f354b648e317d8cf6de37f61e71a4d5e4b2b01d1ef289bcd26f81f9d5",
+}
+REVIEWED_SCRIPTS = ("bootstrap_locked_pip.sh", "check_isolation_red.sh", "run_isolated_tests.sh")
 
 
 class Violation(NamedTuple):
@@ -102,6 +157,26 @@ _KEY = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_-]*):(?: (.*))?$")
 # Plain scalars may not start with a YAML indicator (anchors, aliases, tags,
 # flow collections, quotes, block scalars, directives, complex keys, ...).
 _PLAIN_START_FORBIDDEN = set("&*!|>'\"%@`{}[],?#:-<=~")
+
+
+# Characters that some parser could read as a line break or that hide text:
+# C0/C1 controls other than LF, DEL, NEL, the Unicode line/paragraph
+# separators, bidirectional controls and the BOM.
+_HIDDEN_CHARACTER = re.compile(
+    "[\x00-\x09\x0b-\x1f\x7f-\x9f\u2028\u2029\u200e\u200f\u202a-\u202e"
+    "\u2066-\u2069\ufeff]"
+)
+
+
+def check_characters(text: str, ascii_only: bool) -> None:
+    """Raise GuardError for hidden characters (or any non-ASCII if ascii_only)."""
+    match = _HIDDEN_CHARACTER.search(text)
+    if ascii_only and match is None:
+        match = re.search(r"[^\n\x20-\x7e]", text)
+    if match is not None:
+        line = text.count("\n", 0, match.start()) + 1
+        raise GuardError("UNSUPPORTED_CHARACTER",
+                         f"line {line}: character U+{ord(match.group()):04X} is not supported")
 
 
 class _Yaml:
@@ -282,6 +357,9 @@ def check_workflow(
     text: str, where: str = "ci.yml", image_python: str | None = None
 ) -> list[Violation]:
     try:
+        # YAML 1.1 parsers treat NEL, U+2028 and U+2029 as line breaks; the
+        # subset parser does not, so they must not appear at all.
+        check_characters(text, ascii_only=True)
         doc = parse_yaml(text)
     except GuardError as exc:
         return [Violation(exc.code, where, exc.detail)]
@@ -320,6 +398,13 @@ def check_workflow(
         if not isinstance(steps, list) or not steps:
             bad("STEPS", f"jobs.{job_name}.steps", "steps must be a non-empty list")
             continue
+        first = steps[0]
+        if not (isinstance(first, dict) and isinstance(first.get("uses"), Scalar)
+                and first["uses"].text.partition("@")[0] == "actions/checkout"):
+            # Nothing may run (or change $GITHUB_ENV / $GITHUB_PATH) before the
+            # checkout and its credential check.
+            bad("CHECKOUT_NOT_FIRST", f"jobs.{job_name}.steps[0]", "the first step must be "
+                "actions/checkout")
         found += _check_steps(steps, f"{where}:jobs.{job_name}", image_python)
     return found
 
@@ -340,6 +425,10 @@ def _check_steps(steps: list[Any], where: str, image_python: str | None) -> list
             if not isinstance(run, Scalar) or run.style == "empty":
                 found.append(Violation("STEP_KEYS", path, "run must be a string"))
                 continue
+            for line in run.text.split("\n"):
+                if line and line not in REVIEWED_RUN_LINES:
+                    found.append(Violation("RUN_NOT_REVIEWED", path,
+                                           f"unreviewed command line {line[:60]!r}"))
             if _is(run, PIP_BOOTSTRAP_STEP[1]):
                 bootstrapped = True
             elif not bootstrapped and re.search(r"pip", run.text, re.IGNORECASE):
@@ -403,13 +492,37 @@ _PIP = re.compile(r"pip(\d+(\.\d+)?)?")
 _PYTHON = re.compile(r"python(\d+(\.\d+)?)?")
 _FORBIDDEN_INSTALLERS = {"pipx", "easy_install", "uv", "poetry", "pdm", "conda", "mamba",
                          "micromamba", "pipenv", "ensurepip"}
-_PREFIXES = {"sudo", "env", "exec", "command", "nice", "time", "nohup"}
+_PREFIXES = {"sudo", "env", "exec", "command", "nice", "time", "nohup",
+             # reserved words that may precede a command
+             "{", "}", "!", "if", "then", "else", "elif", "do", "while", "until"}
+_SHELLS = {"sh", "bash", "dash", "zsh", "ksh"}
+_DYNAMIC_COMMANDS = {"eval", "source", ".", "alias", "function"}
 _PIP_READ_ONLY = {"check", "list", "freeze", "show"}
 _PIP_GLOBAL_OPTIONS = {"-q", "--quiet", "--disable-pip-version-check"}
 _INSTALL_FLAGS = {"--require-hashes", "--no-deps", "--only-binary=:all:", "--no-build-isolation",
                   "--no-index", "--force-reinstall", "-q", "--quiet"}
 _INSTALL_VALUE_OPTIONS = {"-r", "-e", "--find-links"}
-_LOCAL_PATH = re.compile(r"[A-Za-z0-9_.$/{}-]+")
+_LOCAL_PATH = re.compile(r"[A-Za-z0-9_.][A-Za-z0-9_./-]*")
+
+
+def _strip_comment(line: str) -> str:
+    """Cut a shell comment: `#` outside quotes at the start of a word only."""
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote == "'":
+            quote = None if char == "'" else quote
+        elif char == "\\":
+            index += 1
+        elif quote == '"':
+            quote = None if char == '"' else quote
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (index == 0 or line[index - 1] in " ;&|()<>"):
+            return line[:index]
+        index += 1
+    return line
 
 
 def _lines(text: str) -> list[list[list[str]]]:
@@ -417,17 +530,30 @@ def _lines(text: str) -> list[list[list[str]]]:
     joined = text.replace("\\\n", " ")
     lines: list[list[list[str]]] = []
     for line in joined.split("\n"):
+        # shlex would also start a comment in the middle of a word (`a#b`),
+        # which the shell does not; comments are cut here instead.
+        # A file descriptor number written before a redirection (`2>&1`) is
+        # not an argument.
+        line = re.sub(r"(^|(?<=[\s;&|()]))\d+(?=[<>])", "", _strip_comment(line))
         lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
-        lexer.commenters = "#"
+        lexer.commenters = ""
         try:
             tokens = list(lexer)
         except ValueError as exc:
             raise GuardError("SHELL_UNPARSABLE", f"cannot tokenize shell line: {exc}") from None
         segments: list[list[str]] = []
         current: list[str] = []
+        redirect_target = False
         for token in tokens:
-            if token in _OPERATORS or set(token) <= set("&|;()<>"):
+            if redirect_target:
+                redirect_target = False  # the file of a redirection, not a command
+                continue
+            if set(token) <= set("<>&") and set(token) & set("<>"):
+                redirect_target = True
+            elif token == ")" and not segments and current:
+                current = []  # a `case` pattern: `pattern) command ;;`
+            elif token in _OPERATORS or set(token) <= set("&|;()<>"):
                 if current:
                     segments.append(current)
                 current = []
@@ -478,12 +604,46 @@ def _mentions_pip(words: list[str]) -> bool:
 _OTHER_INSTALLERS = {"apt-get"}
 
 
-def check_shell(text: str, where: str) -> list[Violation]:
+def _is_dynamic(text: str) -> bool:
+    return "$" in text or "`" in text
+
+
+def _runs_inline_code(words: list[str]) -> bool:
+    """`sh -c ...`, `bash -ec ...`, `python -c ...`, `python -Ic ...`."""
+    for word in words[1:]:
+        if not word.startswith("-") or word.startswith("--"):
+            return False
+        for char in word[1:]:
+            if char == "c":
+                return True
+            if char in "mXWo":  # the rest of the word is the option's value
+                break
+    return False
+
+
+def _substitutions(text: str) -> list[str]:
+    """Bodies of the `$(...)` and backtick command substitutions in shell text."""
+    bodies = re.findall(r"`([^`]*)`", text)
+    for match in re.finditer(r"\$\((?!\()", text):
+        depth, index = 1, match.end()
+        while index < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[index], 0)
+            index += 1
+        bodies.append(text[match.end() : index - 1 if depth == 0 else index])
+    return bodies
+
+
+def check_shell(text: str, where: str, _depth: int = 0) -> list[Violation]:
+    if _depth > 3:
+        return [Violation("SHELL_DYNAMIC", where, "nested command substitution")]
     try:
+        check_characters(text, ascii_only=False)
         lines = _lines(text)
     except GuardError as exc:
         return [Violation(exc.code, where, exc.detail)]
     found: list[Violation] = []
+    for body in _substitutions(text):
+        found += check_shell(body, where, _depth + 1)
     for segments in lines:
         line_mentions_pip = any(_mentions_pip(words) for words in segments)
         for raw_words in segments:
@@ -491,10 +651,28 @@ def check_shell(text: str, where: str) -> list[Violation]:
             if not words:
                 continue
             program = os.path.basename(words[0])
+            # "$@" runs a function's own arguments, which are checked where it is called.
+            if (program in _DYNAMIC_COMMANDS or (_is_dynamic(words[0]) and words[0] != "$@")
+                    or ((program in _SHELLS or _PYTHON.fullmatch(program))
+                        and _runs_inline_code(words))):
+                found.append(Violation("SHELL_DYNAMIC", where,
+                                       f"{program[:20]}: code the guard cannot inspect"))
+                continue
+            if program == "trap" and len(words) > 1:
+                found += check_shell(words[1], where, _depth + 1)
+                continue
             module = None
-            if _PYTHON.fullmatch(program) and "-m" in words[1:3]:
-                position = words.index("-m") + 1
-                module = words[position] if position < len(words) else None
+            if _PYTHON.fullmatch(program):
+                rest = [word for word in words[1:] if word not in ("-I", "-E", "-s", "-B", "-u")]
+                if rest[:1] == ["-m"]:
+                    module = rest[1] if len(rest) > 1 else None
+                elif rest[:1] and rest[0].startswith("-m"):
+                    module = rest[0][2:]
+                target = module if module is not None else (rest[0] if rest else "")
+                if _is_dynamic(target) and os.path.basename(target) != "pip":
+                    found.append(Violation("SHELL_DYNAMIC", where,
+                                           "python target built from an expansion"))
+                    continue
             if program in _FORBIDDEN_INSTALLERS or module in _FORBIDDEN_INSTALLERS:
                 found.append(Violation("FORBIDDEN_INSTALLER", where,
                                        f"{module or program} is not allowed"))
@@ -540,12 +718,17 @@ def _check_pip(arguments: list[str], where: str) -> list[Violation]:
             return [Violation("PIP_UNLOCKED_REQUIREMENT", where,
                               f"positional requirement {option}")]
         i += 1
-    for option, value in values:
-        if "://" in value or "@" in value or not _LOCAL_PATH.fullmatch(value):
-            return [Violation("PIP_REMOTE_SOURCE", where, f"{option} must be a local path")]
     requirement_files = {value for option, value in values if option == "-r"}
     editables = [value for option, value in values if option == "-e"]
     find_links = [value for option, value in values if option == "--find-links"]
+    for option, value in values:
+        # -r / -e: literal local paths only (an expansion could name a VCS URL).
+        # --find-links may be an expansion, but only next to a hash-locked -r.
+        literal = _LOCAL_PATH.fullmatch(value) and "://" not in value and "@" not in value
+        dynamic_find_links = (option == "--find-links" and re.fullmatch(r"\$[a-z_]+", value)
+                              and requirement_files and not editables)
+        if not (literal or dynamic_find_links):
+            return [Violation("PIP_REMOTE_SOURCE", where, f"{option} must be a local path")]
     if "--no-deps" not in flags:
         return [Violation("PIP_RESOLVES_DEPENDENCIES", where, "--no-deps is required")]
     if find_links and "--no-index" not in flags:
@@ -566,45 +749,110 @@ def _check_pip(arguments: list[str], where: str) -> list[Violation]:
 
 
 def check_dockerfile(text: str, where: str = "Dockerfile") -> list[Violation]:
+    try:
+        check_characters(text, ascii_only=False)
+    except GuardError as exc:
+        return [Violation(exc.code, where, exc.detail)]
     joined = text.replace("\\\n", " ")
     found: list[Violation] = []
     froms = []
+    instructions: list[tuple[str, str]] = []
     for number, line in enumerate(joined.split("\n"), 1):
         stripped = line.strip()
+        here = f"{where}:{number}"
+        if stripped.startswith("#") and re.match(r"#\s*[A-Za-z]+\s*=", stripped):
+            # `# syntax=` pulls an unpinned BuildKit frontend; `# escape=` and
+            # `# check=` change how the file is read.
+            found.append(Violation("DOCKERFILE_DIRECTIVE", here, "parser directives are not "
+                                   "allowed"))
+            continue
         if not stripped or stripped.startswith("#"):
             continue
         instruction, _, rest = stripped.partition(" ")
+        rest = rest.strip()
         if instruction != instruction.upper() or instruction not in DOCKERFILE_INSTRUCTIONS:
-            found.append(Violation("DOCKERFILE_INSTRUCTION", f"{where}:{number}",
+            found.append(Violation("DOCKERFILE_INSTRUCTION", here,
                                    f"unreviewed instruction {instruction}"))
             continue
+        instructions.append((instruction, rest))
+        if rest.startswith("--"):
+            # --from (another image), --mount (bind another image), --network,
+            # --security, --platform, --chown, ...
+            found.append(Violation("DOCKERFILE_FLAG", here, f"{instruction} flags are not "
+                                   "allowed"))
+            continue
         if instruction == "FROM":
-            froms.append(rest.strip())
+            froms.append(rest)
         elif instruction == "RUN":
-            found += check_shell(rest, f"{where}:{number}")
+            if rest.startswith("["):
+                found.append(Violation("DOCKERFILE_EXEC_FORM", here, "exec-form RUN is not "
+                                       "analysed"))
+            else:
+                found += check_shell(rest, here)
+        elif instruction == "ENV":
+            names = [item.partition("=")[0] for item in rest.split()]
+            if not all("=" in item for item in rest.split()) or not set(names) <= DOCKERFILE_ENV:
+                found.append(Violation("DOCKERFILE_ENV", here, f"ENV names must be within "
+                                       f"{sorted(DOCKERFILE_ENV)}"))
     if froms != [BASE_IMAGE]:
         found.append(Violation("BASE_IMAGE_NOT_PINNED", where,
                                "exactly one FROM pinned to the reviewed digest is required"))
+    users = [rest for instruction, rest in instructions if instruction == "USER"]
+    last_run = max((i for i, (name, _) in enumerate(instructions) if name == "RUN"), default=-1)
+    last_user = max((i for i, (name, _) in enumerate(instructions) if name == "USER"),
+                    default=-1)
+    if users != [DOCKERFILE_USER] or last_user < last_run:
+        found.append(Violation("DOCKERFILE_USER", where, f"exactly one USER {DOCKERFILE_USER} "
+                               "after the last RUN is required"))
     return found
 
 
-def _docker_run_words(text: str) -> list[list[str]]:
-    return [words for words in _segments(text) if words[:2] == ["docker", "run"]]
+def _check_build(words: list[str], where: str) -> list[Violation]:
+    options, i = words[2:], 0
+    while i < len(options):
+        option = options[i]
+        if not option.startswith("-"):
+            if i != len(options) - 1:
+                return [Violation("LAYER_B_BUILD", where, "the build context must be last")]
+            return []
+        if option not in BUILD_OPTIONS:
+            return [Violation("LAYER_B_BUILD", where, f"unreviewed docker build option {option}")]
+        expected = BUILD_OPTIONS[option]
+        if expected is not None:
+            value = options[i + 1] if i + 1 < len(options) else None
+            if value is None or (expected and value != expected):
+                return [Violation("LAYER_B_BUILD", where, f"docker build {option} must be "
+                                  f"{expected or 'given'}")]
+            i += 1
+        i += 1
+    return [Violation("LAYER_B_BUILD", where, "docker build without a context")]
 
 
 def check_runner(text: str, where: str = "run_isolated_tests.sh") -> list[Violation]:
     try:
-        runs = _docker_run_words(text)
+        check_characters(text, ascii_only=False)
+        segments = [_command_words(words) for words in _segments(text)]
     except GuardError as exc:
         return [Violation(exc.code, where, exc.detail)]
+    found: list[Violation] = []
+    runs = []
+    for words in segments:
+        if not words or os.path.basename(words[0]) != "docker":
+            continue
+        if words[1:2] == ["run"]:
+            runs.append(words)
+        elif words[1:2] == ["build"]:
+            found += _check_build(words, where)
+        elif words[1:] != ["info"]:
+            found.append(Violation("LAYER_B_DOCKER", where,
+                                   f"unreviewed docker command {' '.join(words[1:2])!r}"))
     if len(runs) != 1:
-        return [Violation("LAYER_B_RUN", where, "exactly one `docker run` is required")]
+        return found + [Violation("LAYER_B_RUN", where, "exactly one `docker run` is required")]
     words = runs[0][2:]
     image_index = next((i for i, w in enumerate(words) if w == '$IMAGE'), None)
     if image_index is None:
-        return [Violation("LAYER_B_RUN", where, "the image must be $IMAGE")]
+        return found + [Violation("LAYER_B_RUN", where, "the image must be $IMAGE")]
     options = words[:image_index]
-    found: list[Violation] = []
     seen: list[tuple[str, ...]] = []
     i = 0
     while i < len(options):
@@ -652,11 +900,20 @@ def check_repository(root: Path) -> list[Violation]:
         found.append(Violation("LOCAL_ACTION", ".github", "local actions are not reviewed"))
     dockerfile = root / "ci" / "isolated-tests" / "Dockerfile"
     runner = root / "scripts" / "run_isolated_tests.sh"
-    for required in (workflows_dir / "ci.yml", dockerfile, runner):
+    for required in (workflows_dir / "ci.yml", *(root / name for name in REVIEWED_FILES)):
         if not required.is_file():
             found.append(Violation("MISSING_FILE", str(required.relative_to(root)), "missing"))
     if found:
         return found
+    scripts = tuple(sorted(p.name for p in (root / "scripts").glob("*.sh")))
+    if scripts != REVIEWED_SCRIPTS:
+        found.append(Violation("SCRIPT_FILES", "scripts", f"expected {list(REVIEWED_SCRIPTS)}, "
+                               f"found {list(scripts)}"))
+    for name, digest in REVIEWED_FILES.items():
+        actual = hashlib.sha256((root / name).read_bytes()).hexdigest()
+        if actual != digest:
+            found.append(Violation("REVIEWED_FILE_CHANGED", name,
+                                   f"sha256 {actual} is not the reviewed content"))
     docker_text = dockerfile.read_text(encoding="utf-8")
     image_python = re.search(r"\(Python (3\.\d+\.\d+)\)", docker_text)
     found += check_workflow((workflows_dir / "ci.yml").read_text(encoding="utf-8"),

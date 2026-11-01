@@ -43,10 +43,10 @@ curl --fail --silent --show-error --location --proto '=https' --proto-redir '=ht
 printf '%s  %s\n' "$digest" "$wheel" | sha256sum --check --strict --quiet \
   || fail "sha256 of the downloaded pip ${version} wheel does not match $LOCK"
 
-python "$wheel/pip" install --require-hashes --no-deps --no-index --only-binary=:all: --force-reinstall --find-links "$work" -r requirements/ci-pip-lock.txt \
+python -I "$wheel/pip" install --require-hashes --no-deps --no-index --only-binary=:all: --force-reinstall --find-links "$work" -r requirements/ci-pip-lock.txt \
   || fail "installing the verified pip ${version} failed"
 
-installed="$(python -m pip --version)" || fail "python -m pip --version failed"
+installed="$(python -I -m pip --version)" || fail "python -I -m pip --version failed"
 case "$installed" in
   "pip ${version} from "*) echo "ok: hash-verified $installed" ;;
   *) fail "unexpected pip after bootstrap: $installed" ;;

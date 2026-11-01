@@ -123,13 +123,13 @@ def write_pip_lock() -> int:
 
 
 def main() -> int:
+    if sys.argv[1:] not in ([], ["--pip-only"]):
+        print("usage: lock_dependencies.py [--pip-only]", file=sys.stderr)
+        return 2
     if write_pip_lock() != 0:
         return 1
     if sys.argv[1:] == ["--pip-only"]:
         return 0
-    if sys.argv[1:]:
-        print("usage: lock_dependencies.py [--pip-only]", file=sys.stderr)
-        return 2
     lines = [HEADER]
     with tempfile.TemporaryDirectory() as tmp:
         items = resolve(requirement_specs(), Path(tmp))
