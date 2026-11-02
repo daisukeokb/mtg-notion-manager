@@ -33,7 +33,11 @@ Invariants checked:
   reviewed ones (IMPORT_ROOTS), so nothing can
   shadow a module those programs import (sitecustomize, an optional
   dependency, ...). The contents of the allowed packages are not pinned; the
-  runner jobs only analyse them (mypy, ruff) and do not import them. This pin
+  runner jobs only analyse them (mypy, ruff) and do not import them. In CI
+  the guard runs inside the Layer B image, which is built without the paths
+  of .dockerignore, so no tracked file may be under those paths (checked with
+  `git ls-files`, fail closed): the image then holds the whole tracked tree,
+  which is what the runner's checkout has besides generated caches. This pin
   is the authority for those files: shell is too expressive to be verified
   completely by static analysis;
 * in addition, as a second line of defence with precise reasons: the
@@ -56,6 +60,7 @@ import hashlib
 import os
 import re
 import shlex
+import subprocess
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -215,6 +220,19 @@ IMPORT_ROOTS = {
     "tools/generation_workspace": {"generation_workspace", "tests"},
 }
 _MODULE_SUFFIXES = (".py", ".pyc", ".pyo", ".pyd", ".so", ".pth")
+#: The patterns of the reviewed .dockerignore (pinned in REVIEWED_FILES). The
+#: Layer B image, where this guard runs in CI, is built from a fresh checkout
+#: of HEAD with these paths removed, while the runner's checkout keeps them. A
+#: tracked file there would be on the runner but invisible to the guard, so it
+#: is not allowed (TRACKED_FILE_EXCLUDED); then the container holds the whole
+#: tracked tree and the checks above see everything the runner has.
+DOCKERIGNORE_PATTERNS = (
+    ".env", ".env.*", "!.env.example", "**/.env", ".venv/", "venv/", "reports/",
+    "config/local/", "**/__pycache__/", "**/.pytest_cache/", "**/.mypy_cache/",
+    "**/.ruff_cache/",
+)
+_EXCLUDED_TOP_LEVEL = {".env", ".venv", "venv", "reports"}
+_EXCLUDED_ANYWHERE = {".env", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
 
 
 class Violation(NamedTuple):
@@ -1071,6 +1089,47 @@ def _importable(entry: Path) -> bool:
     return entry.name.endswith(_MODULE_SUFFIXES)
 
 
+def tracked_files(root: Path) -> list[str]:
+    """Paths in the git index of `root` (`git ls-files`); raises GuardError.
+
+    GIT_DIR / GIT_WORK_TREE are set explicitly and every other GIT_* variable is
+    dropped, so a broken .git cannot make git fall back to a parent repository
+    and the caller's environment cannot redirect the index (fail closed)."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_DIR=str(root / ".git"), GIT_WORK_TREE=str(root))
+    try:
+        result = subprocess.run(["git", "ls-files", "-z"], cwd=root, env=env,
+                                capture_output=True, check=False, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GuardError("GIT_TRACKED_FILES", f"git ls-files could not run: {exc}") from exc
+    if result.returncode != 0 or result.stderr:
+        raise GuardError("GIT_TRACKED_FILES", f"git ls-files failed (exit {result.returncode})")
+    try:
+        return [path for path in result.stdout.decode("utf-8").split("\0") if path]
+    except UnicodeDecodeError as exc:
+        raise GuardError("GIT_TRACKED_FILES", "git ls-files output is not UTF-8") from exc
+
+
+def excluded_from_layer_b(path: str) -> bool:
+    """Whether DOCKERIGNORE_PATTERNS remove the tracked `path` from the image."""
+    parts = path.split("/")
+    if path == ".env.example":
+        return False
+    return (parts[0] in _EXCLUDED_TOP_LEVEL or parts[0].startswith(".env.")
+            or parts[:2] == ["config", "local"]
+            or any(part in _EXCLUDED_ANYWHERE for part in parts))
+
+
+def check_tracked_files(root: Path) -> list[Violation]:
+    try:
+        paths = tracked_files(root)
+    except GuardError as exc:
+        return [Violation(exc.code, ".git", exc.detail)]
+    return [Violation("TRACKED_FILE_EXCLUDED", path, "tracked but removed from the Layer B "
+                      "build context by .dockerignore (the guard there cannot see it)")
+            for path in paths if excluded_from_layer_b(path)]
+
+
 def check_repository(root: Path) -> list[Violation]:
     found: list[Violation] = []
     workflows_dir = root / ".github" / "workflows"
@@ -1128,4 +1187,6 @@ def check_repository(root: Path) -> list[Violation]:
     found += check_runner(runner.read_text(encoding="utf-8"))
     for script in sorted((root / "scripts").glob("*.sh")):
         found += check_shell(script.read_text(encoding="utf-8"), f"scripts/{script.name}")
+    if os.path.lexists(root / ".git"):
+        found += check_tracked_files(root)
     return found

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import shutil
+import subprocess
 from pathlib import Path
 from types import ModuleType
 
@@ -892,3 +893,99 @@ def test_audit4_symlinked_parent_of_import_root_fails(tmp_path: Path) -> None:
     violations = guard.check_repository(root)
     assert ("IMPORT_ROOT", "tools/generation_workspace") in {(v.code, v.where)
                                                              for v in violations}
+
+
+# --- Human Acceptance follow-up F-1: files hidden from the Layer B guard -----------
+
+
+def _git(root: Path, *args: str) -> None:
+    subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+
+def _git_repo_copy(tmp_path: Path) -> Path:
+    root = _repo_copy(tmp_path)
+    _git(root, "init", "-q")
+    _git(root, "add", "-A")
+    assert guard.check_repository(root) == []
+    return root
+
+
+def test_f1_dockerignore_patterns_are_the_reviewed_file() -> None:
+    # The matcher below implements exactly these patterns; .dockerignore is pinned.
+    lines = (REPO_ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    patterns = tuple(line for line in lines if line and not line.startswith("#"))
+    assert patterns == guard.DOCKERIGNORE_PATTERNS
+
+
+@pytest.mark.parametrize(
+    "path,excluded",
+    [
+        (".env", True), (".env.local", True), ("x/.env", True), (".env.example", False),
+        (".venv/x.py", True), ("venv/__init__.py", True), ("reports/__init__.py", True),
+        ("config/local/x.py", True), ("config/x.py", False), ("src/venv/x.py", False),
+        ("src/pkg/__pycache__/m.cpython-39.pyc", True), ("tests/.pytest_cache/v", True),
+        ("a/.mypy_cache/x", True), (".ruff_cache/x", True), ("reportsx/a.py", False),
+        ("ci/static_guard.py", False),
+    ],
+)
+def test_f1_layer_b_exclusion_matches_dockerignore(path: str, excluded: bool) -> None:
+    assert guard.excluded_from_layer_b(path) is excluded
+
+
+@pytest.mark.parametrize(
+    "relative",
+    [
+        "venv/__init__.py",  # would shadow the stdlib venv for `python -m pip`
+        "reports/__init__.py",
+        "config/local/__init__.py",
+        ".venv/sitecustomize.py",
+        "src/mtg_notion_manager/__pycache__/x.cpython-39.pyc",
+        "tests/.pytest_cache/x.py",
+        "tools/generation_workspace/.mypy_cache/x.py",
+    ],
+)
+@pytest.mark.parametrize("view", ["runner", "layer_b"])
+def test_f1_tracked_file_hidden_from_layer_b_fails(tmp_path: Path, relative: str,
+                                                   view: str) -> None:
+    root = _git_repo_copy(tmp_path)
+    (root / relative).parent.mkdir(parents=True, exist_ok=True)
+    (root / relative).write_text("print('dummy')\n", encoding="utf-8")
+    _git(root, "add", "-f", relative)
+    if view == "layer_b":
+        # The image is built with .dockerignore applied: tracked, but not on disk.
+        (root / relative).unlink()
+    violations = guard.check_repository(root)
+    assert ("TRACKED_FILE_EXCLUDED", relative) in {(v.code, v.where) for v in violations}
+
+
+def test_f1_untracked_ignored_directories_pass(tmp_path: Path) -> None:
+    root = _git_repo_copy(tmp_path)
+    (root / "reports").mkdir()
+    (root / "reports" / "data.json").write_text("{}\n", encoding="utf-8")
+    assert guard.check_repository(root) == []
+
+
+def test_f1_broken_git_metadata_fails_closed(tmp_path: Path) -> None:
+    root = _repo_copy(tmp_path)
+    (root / ".git").mkdir()  # not a repository; git must not fall back to a parent
+    assert "GIT_TRACKED_FILES" in codes(guard.check_repository(root))
+
+
+def test_f1_caller_git_environment_cannot_redirect_the_index(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = _git_repo_copy(tmp_path)
+    (root / "venv").mkdir()
+    (root / "venv" / "__init__.py").write_text("pass\n", encoding="utf-8")
+    _git(root, "add", "-f", "venv/__init__.py")
+    monkeypatch.setenv("GIT_INDEX_FILE", str(tmp_path / "empty-index"))
+    assert "TRACKED_FILE_EXCLUDED" in codes(guard.check_repository(root))
+
+
+def test_f1_real_repository_tracked_files_are_enumerated() -> None:
+    # In CI this runs inside the Layer B container: it fails (closed) if the
+    # image has no git metadata, so the tracked-file check above cannot be
+    # skipped there silently.
+    assert (REPO_ROOT / ".git").exists()
+    paths = guard.tracked_files(REPO_ROOT)
+    assert "ci/static_guard.py" in paths and ".dockerignore" in paths
+    assert guard.check_tracked_files(REPO_ROOT) == []
