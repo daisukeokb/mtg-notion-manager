@@ -27,8 +27,10 @@ Invariants checked:
   reviewed (setup.py, hatch_build.py, mypy.ini, ...) do not exist; and the
   repository directories on sys.path of the runner's Python processes (the
   root as the working directory of `python -m`, Python 3.9 having no -P, and
-  src/ and tools/generation_workspace/ through the editable installs) hold no
-  importable entry other than the reviewed ones (IMPORT_ROOTS), so nothing can
+  src/ and tools/generation_workspace/ through the editable installs) are real
+  directories (not missing, no symlink on the way, which could resolve
+  differently on the runner) and hold no importable entry other than the
+  reviewed ones (IMPORT_ROOTS), so nothing can
   shadow a module those programs import (sitecustomize, an optional
   dependency, ...). The contents of the allowed packages are not pinned; the
   runner jobs only analyse them (mypy, ruff) and do not import them. This pin
@@ -1100,7 +1102,13 @@ def check_repository(root: Path) -> list[Violation]:
                                        "build/type-check configuration outside the reviewed "
                                        "pyproject.toml is not allowed"))
     for directory, allowed in IMPORT_ROOTS.items():
-        if not (root / directory).is_dir():
+        # A missing directory or a symlink (which may resolve differently on the
+        # runner) would hide what the editable install puts on sys.path there.
+        parts = Path(directory).parts
+        components = [root.joinpath(*parts[: i + 1]) for i in range(len(parts))]
+        if any(path.is_symlink() for path in components) or not (root / directory).is_dir():
+            found.append(Violation("IMPORT_ROOT", directory, "must be a real directory in the "
+                                   "repository (not missing, not a symlink)"))
             continue
         for entry in sorted((root / directory).iterdir()):
             if entry.name not in allowed and _importable(entry):

@@ -435,6 +435,7 @@ def _repo_copy(tmp_path: Path) -> Path:
     for relative in ("scripts", "tests"):
         shutil.copytree(REPO_ROOT / relative, tmp_path / relative, dirs_exist_ok=True,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    (tmp_path / "src" / "mtg_notion_manager").mkdir(parents=True)
     assert guard.check_repository(tmp_path) == []
     return tmp_path
 
@@ -820,7 +821,6 @@ def test_audit3_importable_entry_on_runner_sys_path_fails(tmp_path: Path,
 
 def test_audit3_symlink_on_runner_sys_path_fails(tmp_path: Path) -> None:
     root = _repo_copy(tmp_path)
-    (root / "src").mkdir()
     (root / "src" / "orjson").symlink_to(root / "tests")
     assert "IMPORTABLE_ENTRY" in codes(guard.check_repository(root))
 
@@ -856,3 +856,39 @@ def test_audit3_allowed_or_non_importable_entries_pass(tmp_path: Path, relative:
 )
 def test_audit3_parent_paths_and_pip_environment_fail(command: str, code: str) -> None:
     assert code in codes(guard.check_shell(command, "fixture"))
+
+
+# --- fourth independent audit (Phase 3H-R3) finding --------------------------------
+
+
+def _replace_with_symlink(path: Path, target: Path) -> None:
+    shutil.move(str(path), str(target))
+    path.symlink_to(target)
+
+
+@pytest.mark.parametrize("case", ["missing", "relative", "absolute", "dangling"])
+def test_audit4_src_must_be_a_real_directory(tmp_path: Path, case: str) -> None:
+    # Moving src/ to a non-identifier name and linking to it must not hide a
+    # sitecustomize.py that the editable install would put on sys.path.
+    root = _repo_copy(tmp_path)
+    if case == "missing":
+        shutil.rmtree(root / "src")
+    elif case == "dangling":
+        shutil.rmtree(root / "src")
+        (root / "src").symlink_to("/nonexistent/evil-dir")
+    else:
+        _replace_with_symlink(root / "src", root / "evil-dir")
+        (root / "evil-dir" / "sitecustomize.py").write_text("pass\n", encoding="utf-8")
+        if case == "relative":
+            (root / "src").unlink()
+            (root / "src").symlink_to("evil-dir")
+    violations = guard.check_repository(root)
+    assert ("IMPORT_ROOT", "src") in {(v.code, v.where) for v in violations}
+
+
+def test_audit4_symlinked_parent_of_import_root_fails(tmp_path: Path) -> None:
+    root = _repo_copy(tmp_path)
+    _replace_with_symlink(root / "tools", root / "evil-tools")
+    violations = guard.check_repository(root)
+    assert ("IMPORT_ROOT", "tools/generation_workspace") in {(v.code, v.where)
+                                                             for v in violations}
