@@ -22,7 +22,9 @@ DOCKERFILE = REPO_ROOT / "ci" / "isolated-tests" / "Dockerfile"
 RUNNER = REPO_ROOT / "scripts" / "run_isolated_tests.sh"
 RED_CHECKS = REPO_ROOT / "scripts" / "check_isolation_red.sh"
 BOOTSTRAP = REPO_ROOT / "scripts" / "bootstrap_locked_pip.sh"
-CHECKOUT_SHA = "11d5960a326750d5838078e36cf38b85af677262"
+CHECKOUT_SHA = "3d3c42e5aac5ba805825da76410c181273ba90b1"
+#: The runner / image Python (Phase 3H-R4).
+RUNTIME_PYTHON = "3.14.10"
 
 
 def _load_guard() -> ModuleType:
@@ -50,7 +52,7 @@ def codes(violations: list) -> set[str]:
 
 
 def check_wf(text: str) -> set[str]:
-    return codes(guard.check_workflow(text, image_python="3.9.25"))
+    return codes(guard.check_workflow(text, image_python=RUNTIME_PYTHON))
 
 
 # --- positive fixtures -------------------------------------------------------------
@@ -182,35 +184,35 @@ def test_neg07_credential_check_continue_on_error_fails() -> None:
 @pytest.mark.parametrize(
     "reference,code",
     [
-        ("actions/checkout@v4 # v4.4.0", "ACTION_NOT_PINNED"),
-        ("actions/checkout@main # v4.4.0", "ACTION_NOT_PINNED"),
-        ("actions/checkout@11d5960 # v4.4.0", "ACTION_NOT_PINNED"),
+        ("actions/checkout@v7 # v7.0.1", "ACTION_NOT_PINNED"),
+        ("actions/checkout@main # v7.0.1", "ACTION_NOT_PINNED"),
+        ("actions/checkout@3d3c42e # v7.0.1", "ACTION_NOT_PINNED"),
         # A full SHA that is not the reviewed one (e.g. a commit from a fork).
-        ("actions/checkout@" + "0" * 40 + " # v4.4.0", "ACTION_NOT_PINNED"),
-        (f"actions/checkout@{CHECKOUT_SHA} # v4.3.0", "ACTION_VERSION_COMMENT"),
+        ("actions/checkout@" + "0" * 40 + " # v7.0.1", "ACTION_NOT_PINNED"),
+        (f"actions/checkout@{CHECKOUT_SHA} # v7.0.0", "ACTION_VERSION_COMMENT"),
         (f"actions/checkout@{CHECKOUT_SHA}", "ACTION_VERSION_COMMENT"),
-        (f"evil/checkout@{CHECKOUT_SHA} # v4.4.0", "ACTION_NOT_ALLOWED"),
-        (f"Actions/Checkout@{CHECKOUT_SHA} # v4.4.0", "ACTION_NOT_ALLOWED"),
+        (f"evil/checkout@{CHECKOUT_SHA} # v7.0.1", "ACTION_NOT_ALLOWED"),
+        (f"Actions/Checkout@{CHECKOUT_SHA} # v7.0.1", "ACTION_NOT_ALLOWED"),
         ("./.github/actions/local", "ACTION_NOT_ALLOWED"),
         ("docker://alpine:3", "ACTION_NOT_ALLOWED"),
-        (f'"actions/checkout@{CHECKOUT_SHA}" # v4.4.0', "ACTION_REFERENCE"),
+        (f'"actions/checkout@{CHECKOUT_SHA}" # v7.0.1', "ACTION_REFERENCE"),
     ],
 )
 def test_neg08_unpinned_or_unreviewed_action_fails(reference: str, code: str) -> None:
-    text = mutate(WF, f"actions/checkout@{CHECKOUT_SHA} # v4.4.0", reference)
+    text = mutate(WF, f"actions/checkout@{CHECKOUT_SHA} # v7.0.1", reference)
     assert code in check_wf(text)
 
 
 @pytest.mark.parametrize(
     "line",
     [
-        f'      - "uses": actions/checkout@{CHECKOUT_SHA} # v4.4.0',  # quoted key
+        f'      - "uses": actions/checkout@{CHECKOUT_SHA} # v7.0.1',  # quoted key
         f"      - {{uses: actions/checkout@{CHECKOUT_SHA}}}",  # flow mapping
         f"      - ? uses\n        : actions/checkout@{CHECKOUT_SHA}",  # complex key
     ],
 )
 def test_neg08_alternative_uses_syntax_fails(line: str) -> None:
-    text = mutate(WF, f"      - uses: actions/checkout@{CHECKOUT_SHA} # v4.4.0", line)
+    text = mutate(WF, f"      - uses: actions/checkout@{CHECKOUT_SHA} # v7.0.1", line)
     assert check_wf(text) & {"YAML_UNSUPPORTED_KEY", "YAML_UNSUPPORTED_SCALAR",
                              "YAML_STRUCTURE"}
 
@@ -307,7 +309,7 @@ def test_neg10_second_docker_run_fails() -> None:
         ("persist-credentials: false", "persist-credentials: 'false'", "YAML_UNSUPPORTED_SCALAR"),
         ("persist-credentials: false", "\tpersist-credentials: false", "UNSUPPORTED_CHARACTER"),
         ("name: CI\n", "---\nname: CI\n", "YAML_DOCUMENT"),
-        ('python-version: "3.9.25"', 'python-version: "3.9.2\\x35"', "YAML_UNSUPPORTED_SCALAR"),
+        ('python-version: "3.14.10"', 'python-version: "3.14.1\\x30"', "YAML_UNSUPPORTED_SCALAR"),
         ("run: bash scripts/run_isolated_tests.sh\n", "run: >\n          bash x\n",
          "YAML_UNSUPPORTED_SCALAR"),
         ("    steps:\n      - uses:", "    steps:\n    - uses:", "YAML_INDENT"),
@@ -344,8 +346,11 @@ def test_neg12_unsupported_or_ambiguous_yaml_fails(old: str, new: str, code: str
          "run: echo ${{ secrets.NOTION_API_KEY }}", "SECRET_REFERENCE"),
         ("run: bash scripts/check_isolation_red.sh",
          "run: echo ${{ github.event.pull_request.title }}", "DYNAMIC_EXPRESSION"),
-        ('python-version: "3.9.25"', "python-version: 3.10", "RUNNER_PYTHON"),
-        ('python-version: "3.9.25"', 'python-version: "3.12"', "RUNNER_PYTHON"),
+        ('python-version: "3.14.10"', "python-version: 3.10", "RUNNER_PYTHON"),
+        ('python-version: "3.14.10"', 'python-version: "3.12"', "RUNNER_PYTHON"),
+        # Phase 3H-R4: the previous runner Python (end of life) and a floating minor.
+        ('python-version: "3.14.10"', 'python-version: "3.9.25"', "RUNNER_PYTHON"),
+        ('python-version: "3.14.10"', 'python-version: "3.14"', "RUNNER_PYTHON"),
     ],
 )
 def test_neg12_weakened_workflow_structure_fails(old: str, new: str, code: str) -> None:
@@ -989,3 +994,48 @@ def test_f1_real_repository_tracked_files_are_enumerated() -> None:
     paths = guard.tracked_files(REPO_ROOT)
     assert "ci/static_guard.py" in paths and ".dockerignore" in paths
     assert guard.check_tracked_files(REPO_ROOT) == []
+
+
+# --- Phase 3H-R4: runtime modernization ----------------------------------------------
+
+#: The values reviewed before Phase 3H-R4 (Node.js 20 actions, Python 3.9 image).
+PREVIOUS_ACTIONS = {
+    "actions/checkout": ("11d5960a326750d5838078e36cf38b85af677262", "v4.4.0"),
+    "actions/setup-python": ("a26af69be951a213d495a4c3e4e4022e16d87065", "v5.6.0"),
+}
+PREVIOUS_BASE_IMAGE = ("python:3.9-slim-bookworm@sha256:"
+                       "03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363")
+
+
+@pytest.mark.parametrize("repo", sorted(PREVIOUS_ACTIONS))
+def test_r4_previous_action_commit_fails(repo: str) -> None:
+    sha, version = guard.ALLOWED_ACTIONS[repo]
+    old_sha, old_version = PREVIOUS_ACTIONS[repo]
+    assert (sha, version) != (old_sha, old_version)
+    text = mutate(WF, f"{repo}@{sha} # {version}", f"{repo}@{old_sha} # {old_version}")
+    assert "ACTION_NOT_PINNED" in check_wf(text)
+
+
+def test_r4_previous_base_image_fails() -> None:
+    assert guard.BASE_IMAGE != PREVIOUS_BASE_IMAGE
+    text = mutate(DF, "FROM " + guard.BASE_IMAGE, "FROM " + PREVIOUS_BASE_IMAGE)
+    assert "BASE_IMAGE_NOT_PINNED" in codes(guard.check_dockerfile(text))
+
+
+def test_r4_image_python_mismatch_fails(tmp_path: Path) -> None:
+    # The runner Python is compared with the "(Python X.Y.Z)" of the Dockerfile
+    # header: changing only the header (or only the workflow) is a violation.
+    root = _repo_copy(tmp_path)
+    dockerfile = root / "ci" / "isolated-tests" / "Dockerfile"
+    dockerfile.write_text(mutate(DF, f"(Python {RUNTIME_PYTHON})", "(Python 3.9.25)"),
+                          encoding="utf-8")
+    found = codes(guard.check_repository(root))
+    assert "RUNNER_PYTHON" in found and "REVIEWED_FILE_CHANGED" in found
+
+
+def test_r4_reviewed_values_are_the_workflow_and_dockerfile_values() -> None:
+    for repo, (sha, version) in guard.ALLOWED_ACTIONS.items():
+        assert WF.count(f"uses: {repo}@") == WF.count(f"uses: {repo}@{sha} # {version}") > 0
+    assert f"FROM {guard.BASE_IMAGE}\n" in DF
+    assert f"(Python {RUNTIME_PYTHON})" in DF
+    assert WF.count('python-version: "') == WF.count(f'python-version: "{RUNTIME_PYTHON}"') == 3

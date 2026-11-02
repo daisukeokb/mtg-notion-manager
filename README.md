@@ -132,9 +132,10 @@ bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外す�
 
 ### CIの供給網・認証情報の固定(Phase 3H-R2)
 
-- **GitHub Actions**: `uses:` はすべて完全な40文字のcommit SHAで固定し、行末にreleaseタグをコメントで残す(`actions/checkout` v4.4.0、`actions/setup-python` v5.6.0)。許可するActionとそのcommit SHAは `ci/static_guard.py` の `ALLOWED_ACTIONS` に限る(Phase 3H-R3で、レビュー済みSHA以外の40文字SHA=fork由来のcommit等も拒否するよう強化)。
+- **GitHub Actions**: `uses:` はすべて完全な40文字のcommit SHAで固定し、行末にreleaseタグをコメントで残す(`actions/checkout` v7.0.1、`actions/setup-python` v7.1.0。Phase 3H-R4でNode.js 24で動く版へ更新)。許可するActionとそのcommit SHAは `ci/static_guard.py` の `ALLOWED_ACTIONS` に限る(Phase 3H-R3で、レビュー済みSHA以外の40文字SHA=fork由来のcommit等も拒否するよう強化)。
 - **認証情報**: すべての `actions/checkout` で `persist-credentials: false`(`.git/config` にtokenを残さない)。各jobはcheckout直後に `python3 -I scripts/check_no_persisted_credentials.py` で認証情報が残っていないことを確認する(Phase 3H-R3で下記のとおり作り直した)。workflowの権限は `contents: read` のみで、`secrets.` は使わない。
-- **ベースimage**: `python:3.9-slim-bookworm` のlinux/amd64 image manifest digestで固定し、`docker build --platform linux/amd64` でbuildする。Dockerがpull時にdigestで内容を検証するため、tagの付け替えでは差し替わらない。CIのrunner側のPython(`setup-python`)もimageと同じ3.9.25に固定する。
+- **ベースimage**: `python:3.14.10-slim-trixie`(Debian 13)のlinux/amd64 image manifest digestで固定し、`docker build --platform linux/amd64` でbuildする。Dockerがpull時にdigestで内容を検証するため、tagの付け替えでは差し替わらない。CIのrunner側のPython(`setup-python`)もimageと同じ3.14.10に固定する(Phase 3H-R4でサポート終了済みの3.9.25・Debian 12から更新)。
+- **対応Pythonの範囲**: CIで実行・テストするのはCPython 3.14.10だけである。`pyproject.toml` の `requires-python = ">=3.9"`、ruffの `target-version = "py39"`、mypyの `python_version = "3.9"` は、手元の開発環境(CPython 3.9)でも動かせるよう3.9の構文・標準ライブラリの範囲に書くための下限として残している(静的検査だけで、3.9での実行はCIで検証しない。3.9はサポート終了済みのため、手元の環境の更新は別作業とする)。
 - **Python依存関係**: `requirements/ci-lock.txt` に、両プロジェクトの実行時依存・`dev` 依存・buildバックエンド(hatchling、editables)を推移的依存まで `==` で固定し、各versionの公開ファイルすべてのsha256を記録する。CIとimageは `pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt` で入れ、ローカルの2プロジェクトは `--no-deps --no-build-isolation --no-index` で(取得なしで)入れた後、`pip check` で整合性を確認する。`--only-binary=:all:` によりsdistのbuild(hash検証されないbuild依存の取得)は起こらない。runner側のpipについてはPhase 3H-R3の節を参照。`pyproject.toml` との整合(全宣言が含まれ、範囲指定を満たすこと)はテストで検査する。開発用の `pip install -e ".[dev]"` はこれまでどおり使える(lockはCIとLayer B imageの再現性のため)。
 
 ### CI検査器の作り直し(Phase 3H-R3)
@@ -158,7 +159,7 @@ bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外す�
 
 #### 依存関係・Action・ベースイメージの更新手順
 
-1. **Python依存関係**: `python -I scripts/lock_dependencies.py` を実行する(PyPIへの通信が必要。認証情報は読まず、リポジトリのコードはimport・buildしない)。CPython 3.9 / manylinux x86_64向けに解決し、PyPIの公開hashと照合して `requirements/ci-lock.txt` を書き換える。差分(version・hashの変化)をレビューしてcommitする。runnerのpipだけを更新する場合は、`PIP_VERSION` を変えて `--pip-only` を付けて実行する(`requirements/ci-pip-lock.txt` だけを書き換える)。
+1. **Python依存関係**: `python -I scripts/lock_dependencies.py` を実行する(PyPIへの通信が必要。認証情報は読まず、リポジトリのコードはimport・buildしない)。CPython 3.14 / manylinux x86_64向けに解決し、PyPIの公開hashと照合して `requirements/ci-lock.txt` を書き換える。pipは環境マーカー(`python_version < "3.11"` 等)を実行中のPythonで評価するため、解決結果をCIのPython(`TARGET_PYTHON`)のマーカーで評価し直し、不要な配布物は除き、CIのPythonだけが必要とする依存(や版)が足りなければ、それを明示して解決し直す。既存のlockのversionは制約として維持し(差分を最小にする)、最新へ上げる場合は `--upgrade` を付ける。差分(version・hashの変化)をレビューしてcommitする。runnerのpipだけを更新する場合は、`PIP_VERSION` を変えて `--pip-only` を付けて実行する(`requirements/ci-pip-lock.txt` だけを書き換える)。
 2. **Action**: 公式repositoryのrelease/tagを確認し、`gh api repos/<owner>/<repo>/git/ref/tags/<tag>` で得たcommit SHA(annotated tagの場合はcommitまでたどる)と `# <tag>` コメントを、workflowと `ci/static_guard.py` の `ALLOWED_ACTIONS` の両方で更新する。
-3. **ベースimage**: registryからtagのOCI image indexを取得してlinux/amd64のmanifest digestを確認し、Dockerfile冒頭のimage・Python version・digest・index digest・確認日を更新する(runner側の `python-version` と `ci/static_guard.py` の `BASE_IMAGE`、Dockerfileの内容固定(`REVIEWED_FILES`)も合わせる)。digestの固定は内容の同一性を保証するだけで、含まれるパッケージの脆弱性を保証しないため、更新時(および定期的に)ベースimageのセキュリティ更新を確認する。
+3. **ベースimage**: registryからtagのOCI image indexを取得してlinux/amd64のmanifest digestを確認し、Dockerfile冒頭のimage・Python version・OS・digest・index digest・確認日を更新する(runner側の `python-version`、`scripts/lock_dependencies.py` の `TARGET_PYTHON`、`ci/static_guard.py` の `BASE_IMAGE`、Dockerfileの内容固定(`REVIEWED_FILES`)も合わせる。これらの一致はテストで検査する)。digestの固定は内容の同一性を保証するだけで、含まれるパッケージの脆弱性を保証しないため、更新時(および定期的に)ベースimageのセキュリティ更新を確認する。
 4. いずれもCIの `test`(Layer B自己検査・red check 8件を含む)・`lint`・`type-check`・`generation-workspace` がすべて成功することを確認してからmergeする。
