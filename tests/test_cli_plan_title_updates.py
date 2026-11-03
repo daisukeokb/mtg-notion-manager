@@ -340,7 +340,8 @@ class TestHelpIsReadOnly:
         )
 
         assert result.exit_code != 0
-        assert "no such option" in result.stdout.lower() or "unexpected" in result.stdout.lower()
+        # click writes usage errors to stderr; `output` holds it with click 8.1 and 8.2+.
+        assert "no such option" in result.output.lower() or "unexpected" in result.output.lower()
 
 
 class TestEntrypointReadOnlyGuard:

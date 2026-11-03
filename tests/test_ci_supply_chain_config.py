@@ -280,6 +280,9 @@ def test_runtime_python_is_the_same_everywhere_and_supported() -> None:
     generator = (REPO_ROOT / "scripts" / "lock_dependencies.py").read_text(encoding="utf-8")
     assert f'TARGET_PYTHON = "{python}"' in generator
     assert f"# Target: CPython {minor} / manylinux x86_64." in LOCK.read_text(encoding="utf-8")
+    # mypy analyses the CI dependencies, which may need this Python (click 8.5: >= 3.10).
+    mypy = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["mypy"]
+    assert mypy["python_version"] == minor
 
 
 def test_lock_holds_no_distribution_only_older_pythons_need() -> None:

@@ -349,7 +349,8 @@ class TestNoApplyOption:
         result = runner.invoke(cli.app, ["verify-import", URL, "--apply"])
 
         assert result.exit_code != 0
-        assert "No such option" in result.stdout or "no such option" in result.stdout.lower()
+        # click writes usage errors to stderr; `output` holds it with click 8.1 and 8.2+.
+        assert "No such option" in result.output or "no such option" in result.output.lower()
 
 
 class TestReportWriting:

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import json
 import re
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
+from packaging.version import Version
 from typer.testing import CliRunner
 
 from mtg_notion_manager import cli
@@ -77,6 +79,9 @@ from mtg_notion_manager.services.verify_import import (
 )
 
 runner = CliRunner()
+#: click 8.2+ CliRunner raises EOFError when the input is exhausted, like a real
+#: terminal; click 8.1 returned an empty string instead (Phase 3H-R4).
+_CLICK_RUNNER_RAISES_EOF = Version(version("click")) >= Version("8.2")
 URL = "https://magic.wizards.com/ja/news/announcements/secrets-of-strixhaven-commander-decklists"
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -2032,9 +2037,12 @@ def test_import_declined_confirmation_human_and_error_json_parity(
 
 
 def test_import_eof_non_interactive_behaves_like_decline(monkeypatch: pytest.MonkeyPatch) -> None:
-    """非対話環境(stdin未提供/EOF)は、このプロジェクトの実行基盤(CliRunner)上では
-    click.Abortではなくdefault値(confirm拒否相当)に解決される(実測で確認済み)。
-    --error-jsonはこの挙動を変更しない。
+    """非対話環境(stdin未提供/EOF)では登録されない。--error-jsonはこの挙動を変更しない。
+
+    実端末のstdinがEOFのとき、click(8.1.8・8.5.0とも)のconfirmはEOFErrorをclick.Abortに
+    変換する(exit 1)。click 8.1のCliRunnerだけはEOFで空文字列を返すため、default値
+    (confirm拒否相当、exit 0)に解決されていた。click 8.2以降のCliRunnerは実端末と同じく
+    EOFErrorを送出する(Phase 3H-R4でCIのclickを8.5.0へ更新した際にclickのソースで確認)。
     """
     monkeypatch.setattr(cli.Config, "load", staticmethod(_fake_config))
     monkeypatch.setattr(
@@ -2045,9 +2053,14 @@ def test_import_eof_non_interactive_behaves_like_decline(monkeypatch: pytest.Mon
     human = runner.invoke(cli.app, ["import", IMPORT_URL], input="")
     structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"], input="")
 
-    assert human.exit_code == structured.exit_code == 0
-    assert human.exception is None
-    assert structured.exception is None
+    if _CLICK_RUNNER_RAISES_EOF:
+        assert human.exit_code == structured.exit_code == 1
+        assert isinstance(human.exception, SystemExit)
+        assert isinstance(structured.exception, SystemExit)
+    else:
+        assert human.exit_code == structured.exit_code == 0
+        assert human.exception is None
+        assert structured.exception is None
     assert human.stdout == structured.stdout
     assert executed["count"] == 0
     with pytest.raises(json.JSONDecodeError):

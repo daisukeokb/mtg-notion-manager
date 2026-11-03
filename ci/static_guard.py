@@ -181,7 +181,7 @@ REVIEWED_FILES = {
     "conftest.py":
         "7636712981b092ae54a30c0c909566cc475a31f73ca57c9dad913d5fa4a4dea1",
     "pyproject.toml":
-        "33c3d979b6a905ec3eb58a9f8f57b69aafe71821a11bcd555c05b1ad6125610c",
+        "27c55658f6f79b3451dcbad455415b160554205bc5673a803db71b2318dc78f9",
     "tools/generation_workspace/pyproject.toml":
         "552f4031fffe4dddd7a3191e9dc8ed9447206a38ed4bdad0f37d2c5314fd03e7",
     "ci/isolated-tests/run_in_container.sh":

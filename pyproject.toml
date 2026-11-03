@@ -45,7 +45,7 @@ select = ["E", "F", "I", "UP", "B"]
 extend-immutable-calls = ["typer.Option", "typer.Argument"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.14"
 packages = ["mtg_notion_manager"]
 mypy_path = "src"
 ignore_missing_imports = true
