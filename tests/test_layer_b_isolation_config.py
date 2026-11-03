@@ -128,7 +128,7 @@ def test_container_entrypoint_runs_self_check_first() -> None:
 
 def test_dockerfile_is_pinned_unprivileged_and_rejects_dotenv() -> None:
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    assert re.search(r"^FROM python:3\.9-slim-bookworm@sha256:[0-9a-f]{64}$", dockerfile, re.M)
+    assert re.search(r"^FROM python:3\.14\.\d+-slim-trixie@sha256:[0-9a-f]{64}$", dockerfile, re.M)
     assert "USER 10001:10001" in dockerfile
     assert "find /work -name .env" in dockerfile
     assert "cp -R /work /app" in dockerfile

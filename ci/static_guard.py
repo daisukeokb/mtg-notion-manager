@@ -26,7 +26,7 @@ Invariants checked:
   the reviewed sets; build/type-check configuration files that are not
   reviewed (setup.py, hatch_build.py, mypy.ini, ...) do not exist; and the
   repository directories on sys.path of the runner's Python processes (the
-  root as the working directory of `python -m`, Python 3.9 having no -P, and
+  root as the working directory of `python -m`, which the workflow runs without -P, and
   src/ and tools/generation_workspace/ through the editable installs) are real
   directories (not missing, no symlink on the way, which could resolve
   differently on the runner) and hold no importable entry other than the
@@ -68,8 +68,8 @@ from typing import Any, NamedTuple
 
 #: Allowed external actions: repository -> (reviewed commit SHA, release tag).
 ALLOWED_ACTIONS = {
-    "actions/checkout": ("11d5960a326750d5838078e36cf38b85af677262", "v4.4.0"),
-    "actions/setup-python": ("a26af69be951a213d495a4c3e4e4022e16d87065", "v5.6.0"),
+    "actions/checkout": ("3d3c42e5aac5ba805825da76410c181273ba90b1", "v7.0.1"),
+    "actions/setup-python": ("6d4fd22b20465ccc0f7354476588e8df7c9ca0e0", "v7.1.0"),
 }
 EXPECTED_WORKFLOWS = ("ci.yml",)
 EXPECTED_JOBS = ("test", "lint", "type-check", "generation-workspace")
@@ -95,8 +95,8 @@ SETUP_PYTHON_CACHE = {"cache": ("plain", "pip"),
 CREDENTIAL_CHECK_STEP = ("Verify no persisted Git credentials",
                          "python3 -I scripts/check_no_persisted_credentials.py")
 PIP_BOOTSTRAP_STEP = ("Install hash-verified pip", "bash scripts/bootstrap_locked_pip.sh")
-BASE_IMAGE = ("python:3.9-slim-bookworm@sha256:"
-              "03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363")
+BASE_IMAGE = ("python:3.14.10-slim-trixie@sha256:"
+              "ec6a14df5b63e3fbb3498e3240f7f640c230f9dca67683d23265db3866697f2d")
 DOCKERFILE_INSTRUCTIONS = {"FROM", "ENV", "RUN", "WORKDIR", "COPY", "USER", "CMD"}
 DOCKERFILE_ENV = {"PYTHONDONTWRITEBYTECODE", "PIP_NO_CACHE_DIR", "PIP_DISABLE_PIP_VERSION_CHECK"}
 DOCKERFILE_USER = "10001:10001"
@@ -181,7 +181,7 @@ REVIEWED_FILES = {
     "conftest.py":
         "7636712981b092ae54a30c0c909566cc475a31f73ca57c9dad913d5fa4a4dea1",
     "pyproject.toml":
-        "33c3d979b6a905ec3eb58a9f8f57b69aafe71821a11bcd555c05b1ad6125610c",
+        "27c55658f6f79b3451dcbad455415b160554205bc5673a803db71b2318dc78f9",
     "tools/generation_workspace/pyproject.toml":
         "552f4031fffe4dddd7a3191e9dc8ed9447206a38ed4bdad0f37d2c5314fd03e7",
     "ci/isolated-tests/run_in_container.sh":
@@ -189,7 +189,7 @@ REVIEWED_FILES = {
     "ci/isolated-tests/verify_isolation.py":
         "c070fcec74b3e2021f82b68dc5f5404abc557c3b5174057dc7145e41f7a7bcd0",
     "ci/isolated-tests/Dockerfile":
-        "b632c45ef358237584adc49599b1d0899dc6d7a0412612e4644cdac2ed792089",
+        "9685a59fc09c843770bd5d30781ce270498c4e593e91daf47948a6aa6bc8c186",
     "scripts/bootstrap_locked_pip.sh":
         "2f2cdbd0174464ec977f8e68f3e6e75bddd6ea8505f377492dd5439fbc6c37e1",
     "scripts/check_isolation_red.sh":
@@ -210,7 +210,7 @@ UNREVIEWED_CONFIG_FILES = ("setup.py", "setup.cfg", "hatch_build.py", "hatch.tom
 #: Repository directories on sys.path for the Python processes on the runner
 #: (pip, its build backend subprocesses, mypy), with the importable entries
 #: allowed there: the repository root (the working directory of `python -m`,
-#: which puts it first on sys.path; Python 3.9 has no -P) and the directories
+#: which puts it first on sys.path; the workflow does not pass -P) and the directories
 #: the editable installs add through .pth files. Any other module, package or
 #: namespace directory with modules there could shadow a module those programs
 #: import at startup or optionally (sitecustomize, orjson, ...).

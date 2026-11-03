@@ -7,17 +7,20 @@
 # preparation phase; the test run itself happens with `docker run --network none`
 # and must not fetch anything.
 
-# Pinned by digest (Phase 3H-R2). Docker verifies the pulled content against
-# this digest, so a re-pushed tag cannot substitute the image.
-#   image:     docker.io/library/python:3.9-slim-bookworm (Python 3.9.25)
+# Pinned by digest (Phase 3H-R2; refreshed in Phase 3H-R4). Docker verifies the
+# pulled content against this digest, so a re-pushed tag cannot substitute the
+# image.
+#   image:     docker.io/library/python:3.14.10-slim-trixie (Python 3.14.10)
+#   os:        Debian GNU/Linux 13 (trixie), 13.7
 #   platform:  linux/amd64 (the GitHub-hosted ubuntu runners); the build is run
 #              with --platform linux/amd64
 #   digest:    linux/amd64 image manifest (application/vnd.oci.image.manifest.v1+json)
-#   index:     sha256:a02e9c5406c416c504d6c9a1a306ff4080c3173f1008d192f953bd20382a2d5c
+#   index:     sha256:930e1abba7c4e8f96ed93e8012c35d174d7732752731bbd5e8e757d7ec6f3966
 #              (OCI image index of the tag, which lists this manifest for linux/amd64)
-#   verified:  2026-10-31 against registry-1.docker.io (sha256 of the manifest body)
+#   verified:  2026-11-02 against registry-1.docker.io (sha256 of the index,
+#              manifest, config and layer bodies; PYTHON_VERSION in the config)
 # Update procedure: README "依存関係・Action・ベースイメージの更新手順".
-FROM python:3.9-slim-bookworm@sha256:03dee9ce00747bb5390e7b4ad00307b4dbc7790f7da77cc3581f93cfa99a6363
+FROM python:3.14.10-slim-trixie@sha256:ec6a14df5b63e3fbb3498e3240f7f640c230f9dca67683d23265db3866697f2d
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
