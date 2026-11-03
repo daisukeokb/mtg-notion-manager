@@ -2036,7 +2036,7 @@ def test_import_declined_confirmation_human_and_error_json_parity(
         json.loads(structured.stdout)
 
 
-def test_import_eof_non_interactive_behaves_like_decline(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_import_eof_non_interactive_never_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     """非対話環境(stdin未提供/EOF)では登録されない。--error-jsonはこの挙動を変更しない。
 
     実端末のstdinがEOFのとき、click(8.1.8・8.5.0とも)のconfirmはEOFErrorをclick.Abortに
@@ -2054,9 +2054,11 @@ def test_import_eof_non_interactive_behaves_like_decline(monkeypatch: pytest.Mon
     structured = runner.invoke(cli.app, ["import", IMPORT_URL, "--error-json"], input="")
 
     if _CLICK_RUNNER_RAISES_EOF:
+        # click.Abort (typer prints "Aborted!" to stderr and exits with 1).
         assert human.exit_code == structured.exit_code == 1
         assert isinstance(human.exception, SystemExit)
         assert isinstance(structured.exception, SystemExit)
+        assert "Aborted" in human.stderr and "Aborted" in structured.stderr
     else:
         assert human.exit_code == structured.exit_code == 0
         assert human.exception is None

@@ -13,13 +13,17 @@ runs this script. The resolved set is therefore re-walked from the requirements
 with the markers evaluated for TARGET_ENVIRONMENT: distributions the target
 does not need are left out, and a dependency the target needs that the
 resolution did not include is an error. The versions already in the lock are
-kept as constraints (minimal change); pass --upgrade to resolve the newest.
+kept as constraints (minimal change); pass --upgrade to resolve the newest, or
+--upgrade-package NAME (repeatable) to lift the pin of NAME only (e.g. for a
+security fix). Run it with an interpreter that has `packaging` installed (the
+development venv), as well as `tomli` before Python 3.11.
 
 Usage (needs network access to PyPI; reads no credentials and never imports or
 builds repository code):
 
     python -I scripts/lock_dependencies.py             # both lock files
     python -I scripts/lock_dependencies.py --upgrade   # both, newest versions
+    python -I scripts/lock_dependencies.py --upgrade-package anyio  # lift one pin
     python -I scripts/lock_dependencies.py --pip-only  # only ci-pip-lock.txt
 
 Phase 3H-R3: it also writes requirements/ci-pip-lock.txt, the pip installed on
@@ -201,16 +205,24 @@ def write_pip_lock() -> int:
 
 
 def main() -> int:
-    if sys.argv[1:] not in ([], ["--pip-only"], ["--upgrade"]):
-        print("usage: lock_dependencies.py [--pip-only | --upgrade]", file=sys.stderr)
+    args = sys.argv[1:]
+    lifted = {canonicalize_name(name) for flag, name in zip(args[::2], args[1::2])
+              if flag == "--upgrade-package"}
+    if args not in ([], ["--pip-only"], ["--upgrade"]) and not (
+        len(args) % 2 == 0 and set(args[::2]) == {"--upgrade-package"}
+    ):
+        print("usage: lock_dependencies.py [--pip-only | --upgrade | "
+              "--upgrade-package NAME ...]", file=sys.stderr)
         return 2
     if write_pip_lock() != 0:
         return 1
-    if sys.argv[1:] == ["--pip-only"]:
+    if args == ["--pip-only"]:
         return 0
     lines = [HEADER]
     specs = requirement_specs()
-    constraints = [] if sys.argv[1:] == ["--upgrade"] else locked_versions()
+    constraints = [] if args == ["--upgrade"] else [
+        pin for pin in locked_versions() if canonicalize_name(pin.split("==")[0]) not in lifted
+    ]
     # A requirement only the target needs (its marker is false for this
     # interpreter) is passed to pip explicitly, and its pin is lifted.
     target_specs: list[str] = []
