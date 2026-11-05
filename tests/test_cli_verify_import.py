@@ -369,7 +369,9 @@ class TestReportWriting:
         result = runner.invoke(cli.app, ["verify-import", URL, "--output-dir", str(tmp_path)])
 
         assert result.exit_code == 0
-        assert "verify-import-x.json" in result.stdout
+        # rich wraps the printed path at the console width (80 columns without a
+        # terminal), which a long tmp_path (macOS) exceeds.
+        assert "verify-import-x.json" in result.stdout.replace("\n", "")
 
 
 class TestReadOnlyGuarantee:
