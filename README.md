@@ -107,6 +107,17 @@ mtg-notion-manager import <URL>
 pytest
 ```
 
+### ローカル実行環境(Python 3.14、Phase 3H-R5)
+
+既存の `.venv`(CPython 3.9.6)は変更せず、CIと同じCPython 3.14.10の別の仮想環境を、CIと同じhash検証付きの手順で作る。Python本体の取得・検証、切り替え・切り戻しの手順は [docs/local-python-runtime.md](docs/local-python-runtime.md) を参照(本番CLIの切り替えは別途承認が必要)。
+
+```bash
+"$PY314" -I scripts/setup_local_venv.py .venv-py314-r5      # 新規作成のみ(既存のpathなら失敗する)
+.venv-py314-r5/bin/python -I scripts/check_local_runtime.py   # 読み取り専用の確認(lock一致・pip check・全commandの--help)
+```
+
+`$PY314` はCPython 3.14.10の本体(仮想環境ではないもの)。新しい環境のeditable installは既存環境と同じ `src/` を指すため、command本体を実行すると同じリポジトリ直下の `.env` を読む(`--help` は読まない。`check_local_runtime.py` はaudit hookでそれを確認する)。
+
 ### テスト実行時の安全ガード(ネットワーク隔離・認証情報隔離)
 
 リポジトリ直下の `conftest.py` が、リポジトリ内のテストを実行する通常のpytest(`pytest`、`pytest tools/generation_workspace/tests` 等)で、テストのcollectionより前に次のガードを有効にする。ガードを無効にするためのオプション・設定は用意していない。
@@ -135,7 +146,7 @@ bash scripts/check_isolation_red.sh     # 隔離の各条件を1つずつ外す�
 - **GitHub Actions**: `uses:` はすべて完全な40文字のcommit SHAで固定し、行末にreleaseタグをコメントで残す(`actions/checkout` v7.0.1、`actions/setup-python` v7.1.0。Phase 3H-R4でNode.js 24で動く版へ更新)。許可するActionとそのcommit SHAは `ci/static_guard.py` の `ALLOWED_ACTIONS` に限る(Phase 3H-R3で、レビュー済みSHA以外の40文字SHA=fork由来のcommit等も拒否するよう強化)。
 - **認証情報**: すべての `actions/checkout` で `persist-credentials: false`(`.git/config` にtokenを残さない)。各jobはcheckout直後に `python3 -I scripts/check_no_persisted_credentials.py` で認証情報が残っていないことを確認する(Phase 3H-R3で下記のとおり作り直した)。workflowの権限は `contents: read` のみで、`secrets.` は使わない。
 - **ベースimage**: `python:3.14.10-slim-trixie`(Debian 13)のlinux/amd64 image manifest digestで固定し、`docker build --platform linux/amd64` でbuildする。Dockerがpull時にdigestで内容を検証するため、tagの付け替えでは差し替わらない。CIのrunner側のPython(`setup-python`)もimageと同じ3.14.10に固定する(Phase 3H-R4でサポート終了済みの3.9.25・Debian 12から更新)。
-- **対応Pythonの範囲**: CIで実行・テストするのはCPython 3.14.10だけで、mypyもCIの依存関係(Python 3.10以上を要するclick 8.5等)と同じ `python_version = "3.14"` で検査する。`pyproject.toml` の `requires-python = ">=3.9"` とruffの `target-version = "py39"` は、手元の開発環境(CPython 3.9)でもインストール・構文解析できるよう残している下限であり、3.9での実行・型検査はCIで検証しない(3.9はサポート終了済みのため、手元の環境の更新は別作業とする)。
+- **対応Pythonの範囲**: CIで実行・テストするのはCPython 3.14.10だけで、mypyもCIの依存関係(Python 3.10以上を要するclick 8.5等)と同じ `python_version = "3.14"` で検査する。`pyproject.toml` の `requires-python = ">=3.9"` とruffの `target-version = "py39"` は、手元の開発環境(CPython 3.9)でもインストール・構文解析できるよう残している下限であり、3.9での実行・型検査はCIで検証しない(3.9はサポート終了済み。手元のCPython 3.14.10環境は下記「ローカル実行環境(Python 3.14)」)。
 - **Python依存関係**: `requirements/ci-lock.txt` に、両プロジェクトの実行時依存・`dev` 依存・buildバックエンド(hatchling、editables)を推移的依存まで `==` で固定し、各versionの公開ファイルすべてのsha256を記録する。CIとimageは `pip install --require-hashes --no-deps --only-binary=:all: -r requirements/ci-lock.txt` で入れ、ローカルの2プロジェクトは `--no-deps --no-build-isolation --no-index` で(取得なしで)入れた後、`pip check` で整合性を確認する。`--only-binary=:all:` によりsdistのbuild(hash検証されないbuild依存の取得)は起こらない。runner側のpipについてはPhase 3H-R3の節を参照。`pyproject.toml` との整合(全宣言が含まれ、範囲指定を満たすこと)はテストで検査する。開発用の `pip install -e ".[dev]"` はこれまでどおり使える(lockはCIとLayer B imageの再現性のため)。
 
 ### CI検査器の作り直し(Phase 3H-R3)
