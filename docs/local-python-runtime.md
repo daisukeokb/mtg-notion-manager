@@ -32,7 +32,8 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 ## 切り替え手順(Human Acceptance後のみ)
 
-1. mainに本変更が入っていること、作業treeが意図したbranchであることを確認する(editable installなので、checkoutしているコードがそのまま動く)。
+0. 切り戻しの比較用に、旧環境の状態を記録する: `.venv/bin/python -m pip freeze --all` の出力とそのsha256。あわせてPython本体を再検証する: releaseから同じarchiveを取得し直し、sha256が `~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/ARCHIVE_SHA256` と一致し `gh attestation verify` が通ることを確認したうえで、展開済みの各ファイルがarchiveの内容と一致することを確認する(`__pycache__` は実行時に生成されるため除く)。本体のdirectoryはユーザーが書き込めるため、作成時の検証だけでは後からの改変を検出できない。
+1. mainに本変更が入っていること、作業treeが意図したbranchであることを確認する。どちらの環境もeditable installなので、checkoutしているコード(と作業directory相対の `config/`・`reports/` 等)がそのまま使われる。
 2. `.venv-py314-r5/bin/python -I scripts/check_local_runtime.py` が成功することを確認する。失敗すれば中止。
 3. 起動方法を切り替える。PATHやshell設定は変更せず、明示的なpathで起動する。
    - 変更前: `.venv/bin/mtg-notion-manager <command> ...`(または `source .venv/bin/activate` 後に `mtg-notion-manager`)
@@ -55,7 +56,7 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 - 既存の `.venv` は作成・検証・切り替えのどの段階でも変更しないため、`.venv/bin/mtg-notion-manager` での起動に戻すだけでよい(activateしていた場合は `deactivate` してから `source .venv/bin/activate`)。PATH・shell設定・起動scriptは変更していないので、戻す設定もない。
 - 設定ファイル: `.env` は移動・複製・編集しないため、復旧作業は不要。切り戻しのために `.env` を複製しない。
 - 確認: `.venv/bin/python --version` が `Python 3.9.6`、`.venv/bin/python -m pip freeze --all` が切り替え前に記録した出力と同じ、`.venv/bin/mtg-notion-manager --help` が表示される。
-- 新しい環境を消す場合(任意・ユーザー判断): `.venv-py314-r5/` と `~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/` を削除する。どちらも他から参照されていない。
+- 新しい環境を消す場合(任意・ユーザー判断): `.venv-py314-r5/` と `~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/` を削除する。Python本体は、それを基にした仮想環境(`.venv-py314-r5/` と、検証用に作った一時的な仮想環境)からだけ参照される。既存の `.venv` からは参照されない。
 - 本番Notion上のデータを戻す手順はここには含めない(切り替え自体はデータを変更しない。書き込みcommandの結果はそれぞれのcommandの記録で扱う)。
 
 ## 既知の差異・残課題
@@ -64,3 +65,4 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 - macOSでは `tmp_path` が長く、richがCLI出力のpathを80桁で折り返すことがある(`tests/test_cli_verify_import.py` のpath表示の検査は折り返しに依存しないよう修正済み)。
 - Python本体はpython-build-standaloneのself-hosted runnerでbuildされたもの(provenanceの `runnerEnvironment`)。ad-hoc署名のため、Gatekeeperの公証(notarization)は無い。
 - Google Drive同期フォルダ内に仮想環境を置く点は既存の `.venv` と同じ。
+- Python本体に同梱されているpip(26.2.2)は、`setup_local_venv.py` からは実行しない。ただし環境の棚卸し時に一度だけ `python3.14 -I -m pip --version` で実行した(何もinstallしていない)。また本体を `-I` で実行すると本体directory内に `__pycache__` が作られる(切り替え前の再検証で除外するのはこのため)。

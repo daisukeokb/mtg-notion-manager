@@ -7,14 +7,18 @@ Run it with the interpreter of that environment:
 It checks that the interpreter is CPython LOCAL_PYTHON in a virtual
 environment, that the installed distributions are exactly the lock (plus the
 locked pip and the two local projects), runs `pip check`, and then renders the
-`--help` of the CLI and of each of its commands in-process.
+`--help` of the CLI and of each of its commands in-process. It also checks
+that the editable install of the CLI points at this repository's src/.
 
 The CLI part runs under a CPython audit hook installed first, which refuses
 (before it happens) opening any file named .env*, every socket connection,
 send, bind and name lookup, and starting any process. No command body runs
 (`--help` is handled before it), so Config.load() and the Notion client are
-never reached; the hook makes that an observed fact instead of an assumption.
-Nothing is written. Exit status: 0 = all checks passed, 1 = a check failed.
+never reached; the hook makes that an observation instead of an assumption.
+It is a best-effort observation, not a sandbox: native code, ctypes and a
+link to .env under another name are not seen by the hook.
+Nothing is written except Python bytecode caches (__pycache__, ignored by git).
+Exit status: 0 = all checks passed, 1 = a check failed.
 """
 
 from __future__ import annotations
@@ -98,6 +102,38 @@ def local_python() -> str:
     return str(module.LOCAL_PYTHON)
 
 
+def pip_environment() -> dict[str, str]:
+    """As in setup_local_venv.py: no user pip configuration, no credentials."""
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith(("PIP_", "NOTION_", "PYTHON"))}
+    env["PIP_CONFIG_FILE"] = os.devnull
+    return env
+
+
+def installed_distributions() -> tuple[dict[str, str], list[str]]:
+    """name -> version of the installed distributions, and the problems found."""
+    installed: dict[str, str] = {}
+    problems = []
+    for dist in importlib.metadata.distributions():
+        raw = dist.metadata["Name"]
+        if not raw:
+            problems.append(f"distribution without a name at {dist}")
+            continue
+        name = _normalize(raw)
+        if name in installed:
+            problems.append(f"{name} is installed more than once")
+        installed[name] = dist.version
+    return installed, problems
+
+
+def editable_problems() -> list[str]:
+    spec = importlib.util.find_spec("mtg_notion_manager")
+    expected = REPO_ROOT / "src" / "mtg_notion_manager" / "__init__.py"
+    if spec is None or spec.origin is None or Path(spec.origin).resolve() != expected:
+        return [f"mtg_notion_manager is {spec.origin if spec else None}, expected {expected}"]
+    return []
+
+
 def check_environment() -> list[str]:
     problems = []
     expected = local_python()
@@ -106,11 +142,11 @@ def check_environment() -> list[str]:
         problems.append(f"interpreter is {found}, expected CPython {expected}")
     if sys.prefix == sys.base_prefix:
         problems.append(f"{sys.executable} is not in a virtual environment")
-    installed = {_normalize(d.metadata["Name"]): d.version
-                 for d in importlib.metadata.distributions()}
+    installed, duplicates = installed_distributions()
+    problems += duplicates
     problems += distribution_differences(installed, {**pins(LOCK), **pins(PIP_LOCK)})
-    env = {key: value for key, value in os.environ.items() if not key.startswith("NOTION_")}
-    result = subprocess.run([sys.executable, "-I", "-m", "pip", "check"], env=env,
+    problems += editable_problems()
+    result = subprocess.run([sys.executable, "-I", "-m", "pip", "check"], env=pip_environment(),
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             check=False)
     if result.returncode != 0:

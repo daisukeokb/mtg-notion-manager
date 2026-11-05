@@ -110,6 +110,11 @@ def create(target: Path) -> None:
     version, digest = pinned_pip()
     with tempfile.TemporaryDirectory() as tmp:
         wheel = download_verified_pip(version, digest, Path(tmp))
+        # Created here, not only checked before the download: mkdir fails if the
+        # path appeared in the meantime, so an existing environment is never
+        # written into.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.mkdir()
         venv.EnvBuilder(with_pip=False).create(target)
         python = target / "bin" / "python"
         run(python, "-I", wheel / "pip", "install", "--require-hashes", "--no-deps", "--no-index",

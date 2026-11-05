@@ -271,3 +271,60 @@ def test_check_cli_refuses_and_reports_an_env_read(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stdout
     assert "refused: open of .env" in result.stdout
     assert "leaky --help: PermissionError" in result.stdout
+
+
+def test_target_that_appears_during_the_download_is_not_written_into(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load()
+    target = tmp_path / "venv"
+
+    def download(version: str, digest: str, directory: Path) -> Path:
+        target.mkdir()  # another process creates the path after check_target()
+        return directory / "pip.whl"
+
+    monkeypatch.setattr(module, "download_verified_pip", download)
+    monkeypatch.setattr(module.venv.EnvBuilder, "create",
+                        lambda self, env_dir: pytest.fail("wrote into an existing path"))
+    with pytest.raises(FileExistsError):
+        module.create(target)
+    assert list(target.iterdir()) == []
+
+
+class _Dist:
+    def __init__(self, name: str | None, version: str) -> None:
+        self.metadata = {"Name": name}
+        self.version = version
+
+
+def test_duplicate_and_nameless_distributions_are_reported(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    check = _load_check()
+    monkeypatch.setattr(check.importlib.metadata, "distributions",
+                        lambda: [_Dist("Click", "8.5.0"), _Dist("click", "8.1.8"),
+                                 _Dist(None, "0")])
+    installed, problems = check.installed_distributions()
+    assert installed == {"click": "8.1.8"}
+    assert any("installed more than once" in text for text in problems)
+    assert any("without a name" in text for text in problems)
+
+
+def test_editable_install_must_point_at_this_repository(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.machinery
+
+    check = _load_check()
+    assert check.editable_problems() == []
+    other = importlib.machinery.ModuleSpec("mtg_notion_manager", None,
+                                           origin=str(tmp_path / "__init__.py"))
+    monkeypatch.setattr(check.importlib.util, "find_spec", lambda name: other)
+    assert check.editable_problems()
+
+
+def test_pip_check_runs_without_user_configuration_or_credentials(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    check = _load_check()
+    monkeypatch.setenv("PIP_INDEX_URL", "https://example.invalid/simple")
+    env = check.pip_environment()
+    assert env["PIP_CONFIG_FILE"] == check.os.devnull
+    assert not [key for key in env if key.startswith(("NOTION_", "PYTHON"))
+                or key == "PIP_INDEX_URL"]
