@@ -64,7 +64,8 @@ def test_venv_is_created_without_the_base_pip_and_after_the_wheel_is_verified() 
     text = SCRIPT.read_text(encoding="utf-8")
     assert "venv.EnvBuilder(with_pip=False)" in text
     body = text[text.index("def create("):]
-    assert body.index("download_verified_pip(") < body.index("EnvBuilder(") < body.index('"pip", "install"')
+    download, create = body.index("download_verified_pip("), body.index("EnvBuilder(")
+    assert download < create < body.index('"pip", "install"')
 
 
 def test_pip_pin_is_the_ci_pip_lock() -> None:
