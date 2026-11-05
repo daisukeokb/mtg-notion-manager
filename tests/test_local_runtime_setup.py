@@ -1,6 +1,8 @@
-"""Phase 3H-R5: the local Python 3.14 environment setup (scripts/setup_local_venv.py).
+"""Phase 3H-R5: the local Python 3.14 environment (scripts/setup_local_venv.py and
+scripts/check_local_runtime.py).
 
-Offline: the download is replaced by a fake, and no environment is created.
+Offline: the download is replaced by a fake and no environment is created. The
+audit hook of the check is only installed in a child process.
 """
 
 from __future__ import annotations
@@ -8,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -162,3 +166,107 @@ def test_pip_runs_without_user_configuration_or_credentials(
 def test_local_environments_are_ignored_by_git() -> None:
     patterns = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert ".venv/" in patterns and ".venv-*/" in patterns
+
+
+# --- scripts/check_local_runtime.py ---------------------------------------------------
+
+CHECK = REPO_ROOT / "scripts" / "check_local_runtime.py"
+
+
+def _load_check() -> Any:
+    spec = importlib.util.spec_from_file_location("check_local_runtime_r5", CHECK)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_check_lists_every_cli_command() -> None:
+    import typer
+
+    from mtg_notion_manager.cli import app
+
+    group = typer.main.get_command(app)
+    assert tuple(sorted(getattr(group, "commands", {}))) == _load_check().COMMANDS
+
+
+def test_check_reads_the_same_lock_files_as_setup() -> None:
+    check, setup = _load_check(), _load()
+    assert check.LOCK == REPO_ROOT / setup.LOCK
+    assert check.PIP_LOCK == REPO_ROOT / setup.PIP_LOCK
+    assert check.local_python() == setup.LOCAL_PYTHON
+
+
+@pytest.mark.parametrize(("installed", "problem"), [
+    ({"a": "1", "pip": "2"}, "is not installed"),
+    ({"a": "1", "pip": "2", "mtg-notion-manager": "0", "wp-claim-exit-generation-workspace": "0",
+      "extra": "9"}, "extra==9 is not in the lock"),
+    ({"a": "0", "pip": "2", "mtg-notion-manager": "0", "wp-claim-exit-generation-workspace": "0"},
+     "a: expected 1, installed 0"),
+])
+def test_distribution_differences_are_reported(installed: dict[str, str], problem: str) -> None:
+    problems = _load_check().distribution_differences(installed, {"a": "1", "pip": "2"})
+    assert any(problem in text for text in problems), problems
+
+
+def test_exact_lock_has_no_differences() -> None:
+    installed = {"a": "1", "pip": "2", "mtg-notion-manager": "0",
+                 "wp-claim-exit-generation-workspace": "0"}
+    assert _load_check().distribution_differences(installed, {"a": "1", "pip": "2"}) == []
+
+
+@pytest.mark.parametrize(("event", "args", "blocked"), [
+    ("open", ("/repo/.env", "r", 0), True),
+    ("open", (b"/repo/.env.production", "r", 0), True),
+    ("open", (Path("/repo/.env"), "r", 0), True),
+    ("open", ("/repo/.env.example.txt", "r", 0), True),
+    ("open", ("/repo/src/config.py", "r", 0), False),
+    ("open", (3, "r", 0), False),
+    ("socket.connect", (None, ("api.notion.com", 443)), True),
+    ("socket.getaddrinfo", ("api.notion.com", 443, 0, 0, 0), True),
+    ("subprocess.Popen", ("git", ["git"], None, None), True),
+    ("os.system", (b"true",), True),
+    ("import", ("json", None, [], [], []), False),
+])
+def test_blocked_reason(event: str, args: tuple[Any, ...], blocked: bool) -> None:
+    assert (_load_check().blocked_reason(event, args) is not None) is blocked
+
+
+# The audit hook cannot be removed again, so it is only installed in a child
+# process (which gets no network and no credentials: it only opens a dummy file).
+_CHILD = r"""
+import importlib.util, sys
+from pathlib import Path
+
+import click, typer.main
+
+spec = importlib.util.spec_from_file_location("check", sys.argv[1])
+check = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(check)
+dummy = Path(sys.argv[2])
+
+
+class Leaky(click.Command):
+    def format_help(self, ctx, formatter):
+        dummy.read_text()  # what a command that loads .env while rendering help would do
+        super().format_help(ctx, formatter)
+
+
+group = click.Group(commands=[Leaky("leaky")])
+typer.main.get_command = lambda app: group
+check.COMMANDS = ("leaky",)
+problems = check.check_cli()
+print("\n".join(problems))
+sys.exit(0 if problems else 3)
+"""
+
+
+def test_check_cli_refuses_and_reports_an_env_read(tmp_path: Path) -> None:
+    dummy = tmp_path / ".env"
+    dummy.write_text("NOTION_API_KEY=test-dummy-not-a-real-secret\n", encoding="utf-8")
+    result = subprocess.run([sys.executable, "-I", "-c", _CHILD, str(CHECK), str(dummy)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            check=False, timeout=60)
+    assert result.returncode == 0, result.stdout
+    assert "refused: open of .env" in result.stdout
+    assert "leaky --help: PermissionError" in result.stdout
