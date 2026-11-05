@@ -12,6 +12,7 @@ import importlib.util
 import re
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -292,7 +293,7 @@ def test_target_that_appears_during_the_download_is_not_written_into(
 
 class _Dist:
     def __init__(self, name: str | None, version: str) -> None:
-        self.metadata = {"Name": name}
+        self.metadata = {"Name": name} if name is not None else {}
         self.version = version
 
 
@@ -313,10 +314,19 @@ def test_editable_install_must_point_at_this_repository(
     import importlib.machinery
 
     check = _load_check()
-    assert check.editable_problems() == []
-    other = importlib.machinery.ModuleSpec("mtg_notion_manager", None,
-                                           origin=str(tmp_path / "__init__.py"))
-    monkeypatch.setattr(check.importlib.util, "find_spec", lambda name: other)
+    here = REPO_ROOT / "src" / "mtg_notion_manager" / "__init__.py"
+    # The same file under another Unicode normalization of its path still passes.
+    for origin in (str(here), unicodedata.normalize("NFD", str(here))):
+        spec = importlib.machinery.ModuleSpec("mtg_notion_manager", None, origin=origin)
+        monkeypatch.setattr(check.importlib.util, "find_spec", lambda name, s=spec: s)
+        assert check.editable_problems() == []
+    elsewhere = tmp_path / "__init__.py"
+    elsewhere.write_text("", encoding="utf-8")
+    for origin in (str(elsewhere), str(tmp_path / "missing.py"), None):
+        spec = importlib.machinery.ModuleSpec("mtg_notion_manager", None, origin=origin)
+        monkeypatch.setattr(check.importlib.util, "find_spec", lambda name, s=spec: s)
+        assert check.editable_problems()
+    monkeypatch.setattr(check.importlib.util, "find_spec", lambda name: None)
     assert check.editable_problems()
 
 

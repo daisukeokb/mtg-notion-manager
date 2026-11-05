@@ -103,7 +103,7 @@ def local_python() -> str:
 
 
 def pip_environment() -> dict[str, str]:
-    """As in setup_local_venv.py: no user pip configuration, no credentials."""
+    """No user pip configuration, PIP_*, PYTHON* or NOTION_* (as in setup_local_venv.py)."""
     env = {key: value for key, value in os.environ.items()
            if not key.startswith(("PIP_", "NOTION_", "PYTHON"))}
     env["PIP_CONFIG_FILE"] = os.devnull
@@ -115,7 +115,7 @@ def installed_distributions() -> tuple[dict[str, str], list[str]]:
     installed: dict[str, str] = {}
     problems = []
     for dist in importlib.metadata.distributions():
-        raw = dist.metadata["Name"]
+        raw = dist.metadata.get("Name")
         if not raw:
             problems.append(f"distribution without a name at {dist}")
             continue
@@ -129,8 +129,11 @@ def installed_distributions() -> tuple[dict[str, str], list[str]]:
 def editable_problems() -> list[str]:
     spec = importlib.util.find_spec("mtg_notion_manager")
     expected = REPO_ROOT / "src" / "mtg_notion_manager" / "__init__.py"
-    if spec is None or spec.origin is None or Path(spec.origin).resolve() != expected:
-        return [f"mtg_notion_manager is {spec.origin if spec else None}, expected {expected}"]
+    # samefile, not a path comparison: the editable .pth may spell the same
+    # path in another Unicode normalization (macOS returns NFD for マイドライブ).
+    origin = spec.origin if spec is not None else None
+    if origin is None or not os.path.exists(origin) or not os.path.samefile(origin, expected):
+        return [f"mtg_notion_manager is {origin}, expected {expected}"]
     return []
 
 

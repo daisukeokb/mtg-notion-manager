@@ -22,7 +22,7 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 .venv-py314-r5/bin/python -I scripts/check_local_runtime.py
 ```
 
-- `setup_local_venv.py` はCIと同じ手順(hash検証済みpipのwheelから実行したpipでpipを入れる → lockを `--require-hashes --no-deps --only-binary=:all:` → 2つのローカルprojectを `--no-deps --no-build-isolation --no-index -e` → `pip check`)で入れる。作成先が既に存在すれば何もせず失敗する。pipはユーザーのpip設定・`PIP_*`・`PYTHON*`・`NOTION_*` 環境変数なしで実行する。途中で失敗した場合、作りかけの作成先が残るので、内容を確認してから手で削除して作り直す。
+- `setup_local_venv.py` はCIと同じ手順(hash検証済みpipのwheelから実行したpipでpipを入れる → lockを `--require-hashes --no-deps --only-binary=:all:` → 2つのローカルprojectを `--no-deps --no-build-isolation --no-index -e` → `pip check`)で入れる。作成先が既に存在すれば何もせず失敗する。pipはユーザーのpip設定・`PIP_*`・`PYTHON*`・`NOTION_*` 環境変数なしで実行する。途中で失敗した場合、作りかけ(空のこともある)の作成先が残り、再実行は既存pathとして拒否されるので、内容を確認してから手で削除して作り直す。
 - `check_local_runtime.py`(読み取り専用)は、CPython 3.14.10の仮想環境であること、入っている配布物がlockと完全に一致すること(余分・不足・version違いなし)、`pip check` を確認し、CLIと12個のcommandの `--help` をプロセス内で表示する。CLIの確認はCPythonのaudit hookの下で行い、`.env*` という名前のファイルを開くこと、socketの接続・送信・bind・名前解決、プロセスの起動を、実行される前に拒否して失敗にする(`--help` はcommand本体より前に処理されるため `Config.load()` には到達しない。それを前提ではなく観測結果にするための確認)。
 - テスト一式は、`.env` を含まないcommit済みtreeの複製(`git init` + `git fetch --depth=1 file://<repo> <HEAD>`)と、そのtreeから作った別の仮想環境で実行する(CIのLayer Bと同じく、ホストの環境変数は引き継がずダミーの `NOTION_*` だけを渡す)。手元ではDockerが無いためLayer B(と red check)は実行できず、その検証はCIで行う。
 
@@ -32,7 +32,7 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 ## 切り替え手順(Human Acceptance後のみ)
 
-0. 切り戻しの比較用に、旧環境の状態を記録する: `.venv/bin/python -m pip freeze --all` の出力とそのsha256。あわせてPython本体を再検証する: releaseから同じarchiveを取得し直し、sha256が `~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/ARCHIVE_SHA256` と一致し `gh attestation verify` が通ることを確認したうえで、展開済みの各ファイルがarchiveの内容と一致することを確認する(`__pycache__` は実行時に生成されるため除く)。本体のdirectoryはユーザーが書き込めるため、作成時の検証だけでは後からの改変を検出できない。
+0. 切り戻しの比較用に、旧環境の状態を記録する: `.venv/bin/python -m pip freeze --all` の出力とそのsha256(editable installの2行 `-e git+...@<commit>` にはcheckout中のcommitが入るため、比較はcommitを揃えるか、その2行を除いて行う)。あわせてPython本体を再検証する: releaseから同じarchiveを取得し直し、sha256が `~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/ARCHIVE_SHA256` と一致し `gh attestation verify` が通ることを確認したうえで、展開済みの各ファイルがarchiveの内容と一致することを確認する。archiveに含まれない実行時生成の `__pycache__` は比較できないため、比較の前に本体directory内の `__pycache__` を削除する(改変されたbytecodeが残らないようにするため。次回の実行時に再生成される)。本体のdirectoryはユーザーが書き込めるため、作成時の検証だけでは後からの改変を検出できない。
 1. mainに本変更が入っていること、作業treeが意図したbranchであることを確認する。どちらの環境もeditable installなので、checkoutしているコード(と作業directory相対の `config/`・`reports/` 等)がそのまま使われる。
 2. `.venv-py314-r5/bin/python -I scripts/check_local_runtime.py` が成功することを確認する。失敗すれば中止。
 3. 起動方法を切り替える。PATHやshell設定は変更せず、明示的なpathで起動する。
@@ -65,4 +65,6 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 - macOSでは `tmp_path` が長く、richがCLI出力のpathを80桁で折り返すことがある(`tests/test_cli_verify_import.py` のpath表示の検査は折り返しに依存しないよう修正済み)。
 - Python本体はpython-build-standaloneのself-hosted runnerでbuildされたもの(provenanceの `runnerEnvironment`)。ad-hoc署名のため、Gatekeeperの公証(notarization)は無い。
 - Google Drive同期フォルダ内に仮想環境を置く点は既存の `.venv` と同じ。
+- pipのwheel取得のHTTPS確認はredirect後の最終URLに対して行う。proxy・CA関連の環境変数は引き継ぐ。完全性はsha256(pip wheel・lock)に依拠する。
+- `tests/test_local_runtime_setup.py` の一部はscriptのsource文字列を検査するため、同等な書き換えでも失敗しうる。audit hookのネットワーク・プロセス拒否は判定関数の単体テストで確認している(子プロセスでの通し確認は `.env` の場合のみ)。
 - Python本体に同梱されているpip(26.2.2)は、`setup_local_venv.py` からは実行しない。ただし環境の棚卸し時に一度だけ `python3.14 -I -m pip --version` で実行した(何もinstallしていない)。また本体を `-I` で実行すると本体directory内に `__pycache__` が作られる(切り替え前の再検証で除外するのはこのため)。
