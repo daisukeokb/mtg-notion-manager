@@ -32,7 +32,7 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 ## 切り替え手順(Human Acceptance後のみ)
 
-0. mainに本変更が入っていること、作業treeが意図したbranch・commitであり、`git status --short -- src tools requirements scripts pyproject.toml` が空であることを確認する。確認できなければ中止。どちらの環境もeditable installなので、checkoutしているコード(と作業directory相対の `config/`・`reports/` 等)がそのまま使われる。
+0. mainに本変更が入っていること、作業treeが意図したbranch・commitであり、`git status --short -- src tools requirements scripts pyproject.toml config` が空であることを確認する。確認できなければ中止。どちらの環境もeditable installなので、checkoutしているコード(と作業directory相対の `config/`・`reports/` 等)がそのまま使われる。
 1. 下記「切り替え前の安全ゲート」の全項目を確認し、結果を記録する。全項目が合格でなければ、手順2以降へ進まない。
 2. 切り替えの直前に、`.venv-py314-r5/bin/python -I scripts/check_local_runtime.py` が成功することを再度確認する。失敗すれば中止。
 3. 起動方法を切り替える。PATHやshell設定は変更せず、明示的なpathで起動する。
@@ -45,20 +45,34 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 本番CLIを切り替える前に、次の8項目をすべて確認する。**いずれかがFAIL・BLOCKED・NOT VERIFIED(確認できない、ツールやネットワークが使えない、実施を省略した場合を含む)なら、切り替えを禁止する。** 警告として記録して続行してはならない。
 
-項目は1→2→3→4の比較→4のversion→5→6・7→8の順に実施し、最初の不合格で止める(項目1〜3と項目4の比較が合格するまで、Python本体を実行しない)。`<archive名>` は上記「構成」のarchiveのfile名、`<archive>` は取得したfileのpath、`$PY314` は上記「作成と確認」のPython本体。
+8項目は `scripts/verify_cutover_gate.py` が文書の順(手順0→1→2→3→4→5→6・7→8)に実行する。archiveの取得(項目1の確認方法の `gh release download`)だけは人が先に行う:
+
+```bash
+/usr/bin/python3 -I -B scripts/verify_cutover_gate.py --archive <archive> --report <リポジトリ外の新しいfile>
+```
+
+各項目は、それより前の項目がこの実行の中ですべて合格していなければ実行されない(script内で強制し、呼び出されても `GateOrderError` で止まる)。最初の不合格(FAIL・BLOCKED)で止まり、残りは `NOT_RUN` になる。以前の実行結果は再利用しない。終了コードは、全項目合格なら0、FAILがあれば1、BLOCKED等なら2。scriptはインストール済みのCPython 3.14以外のinterpreter(macOSのsystem Python等)で実行する。インストール済みのPython本体を最初に実行するのは項目5で、項目1〜4がすべて合格した後である。`<archive名>` は上記「構成」のarchiveのfile名、`<archive>` は取得したfileのpath、`$PY314` は上記「作成と確認」のPython本体。
 
 | # | 確認項目 | 確認方法 | 合格条件 | 実行方法 |
 |---|---|---|---|---|
-| 1 | Python配布archiveのSHA-256 | 同じarchiveを、リポジトリ外の新しい空directoryへ取得し直す(`gh release download 20261026 -R astral-sh/python-build-standalone -p '<archive名>' -D <dir>`)。`shasum -a 256 <archive>` | 上記「構成」のsha256と一致。`~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/ARCHIVE_SHA256` もこの値と一致(このfileは本体と同じくユーザーが書き込めるため、基準にしない) | 手動 |
-| 2 | Release assetのdigest | `gh api repos/astral-sh/python-build-standalone/releases/tags/20261026 --jq '.assets[] \| select(.name=="<archive名>") \| .digest'` | `sha256:` に続く値が同じsha256 | 手動 |
-| 3 | Provenance | `gh attestation verify <archive> -R astral-sh/python-build-standalone` | 終了コード0。署名者が `.github/workflows/release.yml@refs/heads/main` | 手動 |
-| 4 | ローカルのPython本体 | `"$PY314" -I -c 'import platform; print(platform.python_implementation(), platform.python_version(), platform.machine())'`。あわせて、展開済みの各fileの内容をarchiveと比較する(下記) | `CPython 3.14.10 arm64`。比較で不一致(内容・symlinkの参照先・実行bit)・不足・archiveに無いfileが無い | 手動(比較用のscriptは未実装) |
-| 5 | 仮想環境の実行file解決先 | `.venv-py314-r5/bin/python -I -c 'import sys; print(sys.executable); print(sys.prefix); print(sys.base_prefix)'` | `sys.executable` と `sys.prefix` がリポジトリの `.venv-py314-r5` の中。`sys.base_prefix` が上記「構成」の本体の場所 | 手動(`check_local_runtime.py` は仮想環境であることだけを確認し、場所までは確認しない) |
-| 6 | 依存関係lockとの整合 | `.venv-py314-r5/bin/python -I scripts/check_local_runtime.py` | 終了コード0 | scriptで確認(配布物の名前とversionの一致まで。installed fileの内容のhashは確認しない) |
-| 7 | `pip check` | 同上 | 同上 | scriptで確認 |
-| 8 | 既存のPython 3.9環境が変更されていない | `.venv/bin/python --version`、下記のfingerprint、`pip freeze` のhash | `Python 3.9.6`、かつ両方のhashが下記の値と一致 | 手動 |
+| 1 | Python配布archiveのSHA-256 | 同じarchiveを、リポジトリ外の新しい空directoryへ取得し直す(`gh release download 20261026 -R astral-sh/python-build-standalone -p '<archive名>' -D <dir>`)。`shasum -a 256 <archive>` | 上記「構成」のsha256と一致。`~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/ARCHIVE_SHA256` もこの値と一致(このfileは本体と同じくユーザーが書き込めるため、基準にしない) | script(archiveの取得は手動) |
+| 2 | Release assetのdigest | `gh api repos/astral-sh/python-build-standalone/releases/tags/20261026 --jq '.assets[] \| select(.name=="<archive名>") \| .digest'` | `sha256:` に続く値が同じsha256 | script |
+| 3 | Provenance | `gh attestation verify <archive> -R astral-sh/python-build-standalone --signer-workflow astral-sh/python-build-standalone/.github/workflows/release.yml` | 終了コード0。署名者が `.github/workflows/release.yml@refs/heads/main` | script |
+| 4 | ローカルのPython本体 | archiveの全memberを検査したうえで、インストール済みのtreeと比較し、すべての `.pyc` を検証済みのsourceから隔離環境で再compileして比較する(下記)。インストール済みのPython本体はこの項目では実行しない | 下記「項目4の判定」のすべて | script |
+| 5 | 仮想環境の実行file解決先 | `"$PY314" -I -B -c 'import platform; print(platform.python_implementation(), platform.python_version(), platform.machine())'` と `.venv-py314-r5/bin/python -I -B -c 'import sys; print(sys.executable); print(sys.prefix); print(sys.base_prefix)'` | `CPython 3.14.10`。`sys.executable` と `sys.prefix` がリポジトリの `.venv-py314-r5` の中。`sys.base_prefix` が上記「構成」の本体の場所 | script |
+| 6 | 依存関係lockとの整合 | `.venv-py314-r5/bin/python -I scripts/check_local_runtime.py` | 終了コード0 | script(`check_local_runtime.py` を呼ぶ。配布物の名前とversionの一致まで。installed fileの内容のhashは確認しない) |
+| 7 | `pip check` | 同上 | 同上 | script |
+| 8 | 既存のPython 3.9環境が変更されていない | `.venv/bin/python --version`、下記のfingerprint、`pip freeze` のhash | `Python 3.9.6`、かつ両方のhashが下記の値と一致 | script |
 
-**項目4の比較**: archiveには `python/lib/python3.14/encodings/__pycache__/` の `.pyc` 3件だけが含まれ、それ以外の `.pyc` は実行時に生成されたもので比較できない。比較の直前の準備として、Python本体のdirectory内にあるarchiveに含まれない `.pyc`(と空になった `__pycache__`)を削除し、archiveに含まれる3件は他のfileと同様に比較する(削除は、改変されたbytecodeが残らないようにするため。削除したものは次回の実行時に再生成される)。削除の前に、削除するfileの一覧と件数を記録する。archiveのpath `python/...` は、本体の場所の `python/...` に対応する。本体のdirectoryはユーザーが書き込めるため、作成時の検証だけでは後からの改変を検出できない。削除の対象はPython本体の `.pyc` だけで、`.venv` と `.venv-py314-r5` は対象にしない。比較の結果不一致だった場合に、修復や展開し直しをしない(下記)。
+**項目4の判定**(Phase 3H-R6で定義を修正。理由は下記「既知の差異・残課題」):
+
+1. archiveの全memberの検査: 絶対path・`..`・`python/` 以外の場所・重複member・symlinkのmemberの下のmember・archive外を指すsymlink・hardlink・通常file/directory/symlink以外の種類・setuid/setgid/sticky・誰でも書き込めるmodeが1件でもあればFAIL。
+2. `.pyc` 以外の全member(1,698件)について、インストール済みの対応entryと、種類・内容のsha256・symlinkの参照先・実行bitが一致すること。symlinkは追わない(`lstat`)。不足があればFAIL。
+3. archiveに無いentryは、archiveのdirectoryの下の `__pycache__` directory(`__pycache__` の中の `__pycache__` は不可)と、`<名前>.cpython-314[.opt-1|.opt-2].pyc`(対応する `.py` がarchiveにあり、実行bitの無い通常file)だけを許す。それ以外(symlink、拡張module、別versionのcache等)はFAIL。生成された `.pyc` は件数を記録する。
+4. すべての `.pyc`(archive同梱の3件と、実行時に生成されたもの)を再compileして比較する: 検査済みのarchiveを一時directoryへ安全に展開し(上書き・link追従なし)、その展開先のCPython 3.14.10を、macOSのsandbox(`sandbox-exec`。network・home directoryの読み取り・一時directory外への書き込みを拒否)の中で `-I -B -S`・最小限の環境変数で実行する。sandboxが使えない、または使う前の検査(networkへの接続・home directoryの読み取り・外への書き込みが拒否され、一時directoryへの書き込みはできること)で確認できなければBLOCKED。再compileは `py_compile`(timestamp方式、file名の `opt-N` に対応する最適化level、`dfile` はインストール済みのsourceのpath、出力は一時directoryの中だけ)で行い、sourceの更新時刻はインストール済みのsourceに合わせる(一時directoryの複製だけを変更する)。
+5. 再compileの結果がインストール済みの `.pyc` と、header(magic number・flags・sourceの更新時刻と大きさ)を含めてbyte単位ですべて一致し、展開先のinterpreterがCPython 3.14.10(cache tag `cpython-314`)で、インストール済みの `.pyc` のmagic numberがそれと同じであること。1件でも違えばFAIL(差分の位置・sha256・compile条件を記録する。修復しない)。
+
+インストール済みのPython本体・`.pyc`・2つの仮想環境は読むだけで、変更・削除しない。一時directoryは最後に削除する。再compileの一致は、archiveの真正性(項目1〜3)と組み合わせて意味を持つ(展開先のinterpreterも、比較元のsourceも、検証済みのarchiveのもの)。第三者buildそのものの安全性を示すものではない。
 
 **項目8の基準値**(fingerprintはPhase 3H-R5の作業前の測定値。fingerprintは `.pyc`(`site-packages/__pycache__` は全体)と `bin/python*` のsymlinkを対象にしない。`pip freeze` のhashはPhase 3H-R5の完了時の測定値で、`-e` の2行以外は作業前と同じ):
 
@@ -73,7 +87,7 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 **不合格・未確認の場合**: Python本体の完全性、provenance、interpreterの同一性、依存関係の整合性、旧環境の保全のいずれかの確認が失敗した、または確認できない場合は、切り替えを中止する。自動で修復・再インストールをせず、旧環境を変更・削除せず、新たな明示的な承認を得るまで先へ進まない。この時点では起動方法を切り替えていないため、切り戻す作業は無く、引き続き `.venv` を使う。
 
-**このゲートの限界**: このゲートは文書で定めた手順であり、技術的には強制されていない。`scripts/check_local_runtime.py` が確認するのは項目6・7と、Pythonのversion・仮想環境であること・editable installの向き先・command一覧と、audit hookの下での各 `--help` の表示だけで、また確認に使うscriptとlockは作業treeのものである(手順0の確認に依存する)。項目1〜5・8は人が実行して判定する。`.venv-py314-r5/bin/mtg-notion-manager` は、このゲートを通さなくても起動できてしまう。
+**このゲートの限界**: `scripts/verify_cutover_gate.py` は確認のためのscriptで、切り替えを技術的に強制するものではない(`.venv-py314-r5/bin/mtg-notion-manager` は、このゲートを通さなくても起動できてしまう)。archiveの取得は人が行う。項目6・7は `scripts/check_local_runtime.py` に依存し(Pythonのversion・仮想環境であること・editable installの向き先・command一覧と、audit hookの下での各 `--help` の表示)、確認に使うscriptとlockは作業treeのもの(手順0の確認に依存する)。項目4の隔離はmacOSの `sandbox-exec` に依存する(Apple自身が非推奨としている仕組みで、将来使えなくなればBLOCKEDになる)。scriptを実行したshellの `PYTHON*`・`NOTION_*` 環境変数は、名前だけを報告する。
 
 ### 切り替え後の確認項目
 
@@ -89,6 +103,7 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 - 既存の `.venv` は作成・検証・切り替えのどの段階でも変更しないため、`.venv/bin/mtg-notion-manager` での起動に戻すだけでよい(activateしていた場合は `deactivate` してから `source .venv/bin/activate`)。PATH・shell設定・起動scriptは変更していないので、戻す設定もない。
 - 設定ファイル: `.env` は移動・複製・編集しないため、復旧作業は不要。切り戻しのために `.env` を複製しない。
+- 切り戻しの前提(読み取りのみ): `scripts/verify_cutover_gate.py` は全項目が合格した場合に続けて、`.venv/bin/mtg-notion-manager` が存在しその1行目が `.venv` のinterpreterを指すこと、そのinterpreterが `Python 3.9.6` であること、旧環境でCLIの `--help` がaudit hookの下で表示できることを確認する(`rollback_readiness`)。本番での切り戻し自体は行わない。
 - 確認: `.venv/bin/python --version` が `Python 3.9.6`、`.venv/bin/python -I -m pip freeze --all` が安全ゲートで記録した出力と(`-e` の2行を除いて)同じ、項目8の2つのhashが基準値と一致、`.venv/bin/mtg-notion-manager --help` が表示される。
 - 新しい環境を消す場合(任意・ユーザー判断): `.venv-py314-r5/` と `~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/` を削除する。Python本体は、それを基にした仮想環境(`.venv-py314-r5/` と、検証用に作った一時的な仮想環境)からだけ参照される。既存の `.venv` からは参照されない。
 - 本番Notion上のデータを戻す手順はここには含めない(切り替え自体はデータを変更しない。書き込みcommandの結果はそれぞれのcommandの記録で扱う)。
@@ -101,4 +116,6 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 - Google Drive同期フォルダ内に仮想環境を置く点は既存の `.venv` と同じ。
 - pipのwheel取得のHTTPS確認はredirect後の最終URLに対して行う。proxy・CA関連の環境変数は引き継ぐ。完全性はsha256(pip wheel・lock)に依拠する。
 - `tests/test_local_runtime_setup.py` の一部はscriptのsource文字列を検査するため、同等な書き換えでも失敗しうる。audit hookのネットワーク・プロセス拒否は判定関数の単体テストで確認している(子プロセスでの通し確認は `.env` の場合のみ)。
-- Python本体に同梱されているpip(26.2.2)は、`setup_local_venv.py` からは実行しない。ただし環境の棚卸し時に一度だけ `python3.14 -I -m pip --version` で実行した(何もinstallしていない)。また本体を `-I` で実行すると本体directory内に `.pyc` が作られる(切り替え前の再検証の前に、archiveに含まれないものを削除するのはこのため)。
+- Python本体に同梱されているpip(26.2.2)は、`setup_local_venv.py` からは実行しない。ただし環境の棚卸し時に一度だけ `python3.14 -I -m pip --version` で実行した(何もinstallしていない)。
+- 項目4の定義の修正(Phase 3H-R6): 以前の定義は、archive同梱の `.pyc` 3件を他のfileと同様に内容で比較し、それ以外の `.pyc` を比較前に削除するものだった。しかしarchiveの `.pyc` は、build時のsourceの更新時刻(1793023270)を記録している一方、archive内のsourceの更新時刻は1704067200に正規化されているため、初回の実行でCPythonが作り直す。作り直した `.pyc` はsourceのpath(`co_filename`。archiveではbuild machineの一時path)も異なる。このため以前の定義は一度でも実行したruntimeでは必ずFAILし、削除も読み取り専用の確認と両立しない。修正後は、`.pyc` をすべて検証済みのsourceから隔離環境で作り直し、byte単位で比較する。
+- 環境変数(C-2・C-3): `load_dotenv()` は既に設定されている環境変数を上書きしないため、CLIを起動するshellに `NOTION_*` があれば `.env` より優先される(空の値でも `.env` の値は使われない)。console script(`.venv-py314-r5/bin/mtg-notion-manager` 等)はinterpreterを `-I` なしで起動するため、`PYTHONPATH` 等の `PYTHON*` 環境変数もCLIに影響する。どちらも合成値のテストで確認した(`tests/test_config_env_precedence.py`)。提案(未実施・未承認): 切り替え後の起動は、許可した環境変数だけを渡す形(例: `env -i HOME="$HOME" PATH=/usr/bin:/bin .venv-py314-r5/bin/mtg-notion-manager ...`)にする。
