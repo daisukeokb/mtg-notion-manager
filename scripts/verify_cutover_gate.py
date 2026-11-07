@@ -552,11 +552,24 @@ def compile_worker(jobs_file: str, result_file: str, out_dir: str) -> int:
 
 
 def first_difference(a: bytes, b: bytes) -> dict:
-    offset = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), min(len(a), len(b)))
+    """Where two .pyc files differ (diagnostics only; any difference is a FAIL).
+
+    `flag_ref_bit_only` is true when the lengths are equal and every differing
+    byte differs only in 0x80, marshal's FLAG_REF bit, which depends on the
+    reference counts of the compiling process rather than on the code.
+    """
+    offsets = [i for i, (x, y) in enumerate(zip(a, b)) if x != y]
+    if len(a) != len(b):
+        offsets.append(min(len(a), len(b)))
+    offset = offsets[0] if offsets else min(len(a), len(b))
     end = offset
     while end < min(len(a), len(b)) and a[end] != b[end]:
         end += 1
-    return {"offset": offset, "range": [offset, max(end, offset + 1)], "header": offset < 16}
+    return {"offset": offset, "range": [offset, max(end, offset + 1)], "header": offset < 16,
+            "differing_bytes": len(offsets), "lengths": [len(a), len(b)],
+            "bytes": [[i, a[i:i + 1].hex(), b[i:i + 1].hex()] for i in offsets[:20]],
+            "flag_ref_bit_only": len(a) == len(b) and bool(offsets)
+            and all(a[i] ^ b[i] == 0x80 for i in offsets)}
 
 
 def recompile_and_compare(ctx: Context, comparison: Comparison, manifest: Manifest) -> dict:

@@ -172,6 +172,17 @@ def test_different_bytecode_fails(tmp_path: Path, installed: tuple[Path, Path]) 
     assert mismatch["installed_sha256"] != mismatch["recompiled_sha256"]
 
 
+def test_difference_report_classifies_flag_ref_only_changes() -> None:
+    base = bytes(16) + b"\x7a\x05hello\xe3\x01"
+    flagged = bytes(16) + b"\xfa\x05hello\xe3\x01"
+    report = gate.first_difference(base, flagged)
+    assert report["flag_ref_bit_only"] is True and report["differing_bytes"] == 1
+    assert report["bytes"] == [[16, "7a", "fa"]] and report["header"] is False
+    other = gate.first_difference(base, bytes(16) + b"\x7a\x05jello\xe3\x01")
+    assert other["flag_ref_bit_only"] is False
+    assert gate.first_difference(base, base + b"x")["flag_ref_bit_only"] is False
+
+
 def test_header_mismatch_fails(tmp_path: Path, installed: tuple[Path, Path]) -> None:
     archive, runtime_dir = installed
     pyc = _pyc(runtime_dir, "mod")
