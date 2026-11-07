@@ -47,8 +47,15 @@ gate = _load()
 def _compile(source: Path, cfile: Path, dfile: str, optimize: int = 0,
              mode: py_compile.PycInvalidationMode = py_compile.PycInvalidationMode.TIMESTAMP
              ) -> None:
-    py_compile.compile(str(source), cfile=str(cfile), dfile=dfile, doraise=True,
-                       optimize=optimize, invalidation_mode=mode)
+    # In a fresh process, as the runtime does on import: marshal output can depend on
+    # the reference counts of the compiling process (FLAG_REF), so the long-running
+    # test process would not stand in for it.
+    code = ("import py_compile, sys; py_compile.compile(sys.argv[1], cfile=sys.argv[2], "
+            "dfile=sys.argv[3], doraise=True, optimize=int(sys.argv[4]), "
+            "invalidation_mode=py_compile.PycInvalidationMode[sys.argv[5]])")
+    subprocess.run([sys.executable, "-I", "-B", "-S", "-c", code, str(source), str(cfile),
+                    dfile, str(optimize), mode.name], check=True, timeout=60,
+                   env={"PATH": os.environ.get("PATH", "/usr/bin:/bin")})
 
 
 def _build_archive(tmp: Path, extra: list[tarfile.TarInfo] | None = None) -> Path:
@@ -100,7 +107,9 @@ def _context(tmp: Path, archive: Path, runtime_dir: Path, *, passed: list[str] |
     (tmp / "work").mkdir(exist_ok=True)
     options = {"archive": archive, "repo": tmp, "runtime_dir": runtime_dir,
                "work_parent": tmp / "work", "python_version": platform.python_version(),
-               "cache_tag": TAG, "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}
+               "cache_tag": TAG,
+               "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest()
+               if archive.is_file() else "0" * 64}
     options.update(settings)
     environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin")}
     return gate.Context(
@@ -236,7 +245,7 @@ def test_missing_shipped_pyc_fails(tmp_path: Path, installed: tuple[Path, Path])
 
 @pytest.mark.parametrize("name", [
     f"ghost.{TAG}.pyc",  # no verified source
-    "other.cpython-39.pyc",  # another interpreter's cache
+    "other.cpython-27.pyc",  # another interpreter's cache
     "notes.txt",
     f"other.{TAG}.opt-3.pyc",
     "evil.so",
