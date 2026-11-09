@@ -20,7 +20,15 @@ source by the attested interpreter of a fresh extraction of the archive in a
 temporary directory, inside a macOS sandbox (sandbox-exec) that denies network
 access, reads of the home directory and writes outside the temporary directory;
 the sandbox is probed before use. The result must be byte-for-byte identical to
-the installed .pyc, header included. The installed runtime, its .pyc files and
+the installed .pyc, header included (BYTE_IDENTICAL). A .pyc that is not is
+parsed, without being unmarshalled or run, by the CPython 3.14.10 marshal
+reader below (Human Acceptance Decision 03); it is accepted as
+MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF only if the headers are identical, both
+streams parse completely, their trees are identical once TYPE_REF is resolved,
+the reader has just been checked against the isolated interpreter's own marshal
+output, and the file is one of the four of REF_LAYOUT_APPROVED with the content
+the decision was taken on. Anything else is STRUCTURAL_MISMATCH or REJECTED,
+and FAIL. The installed runtime, its .pyc files and
 both virtual environments are only read. If the sandbox is not available or the
 probe does not show it working, item 4 is BLOCKED.
 
@@ -97,6 +105,8 @@ class Settings:
     python_version: str = PYTHON_VERSION
     cache_tag: str = CACHE_TAG
     archive_sha256: str = ARCHIVE_SHA256
+    ref_layout_approved: dict[str, str] = dataclasses.field(
+        default_factory=lambda: dict(REF_LAYOUT_APPROVED))
 
     @property
     def runtime_root(self) -> Path:
@@ -112,6 +122,8 @@ class Context:
     interpreter: Callable[[Path], Path] = lambda fresh: fresh / ARCHIVE_ROOT / "bin" / "python3"
     passed: list[str] = dataclasses.field(default_factory=list)
     manifest: Manifest | None = None
+    #: The reader conformance check (run_oracle when None).
+    oracle: Callable[..., dict] | None = None
 
 
 @dataclasses.dataclass
@@ -572,6 +584,632 @@ def first_difference(a: bytes, b: bytes) -> dict:
             and all(a[i] ^ b[i] == 0x80 for i in offsets)}
 
 
+# --- item 4: structural marshal comparison (Human Acceptance Decision 03) -------------------
+#
+# A reader for the marshal stream of a CPython 3.14.10 .pyc, written against
+# Python/marshal.c, Objects/codeobject.c and Include/internal/pycore_code.h at tag
+# v3.14.10 (PYC_MAGIC_NUMBER 3627, header bytes 2b0e0d0a, Py_MARSHAL_VERSION 5).
+# It turns the bytes into inert tuples: nothing is unmarshalled, compiled or run
+# (no marshal.loads, pickle, eval or exec), and it is only used on a .pyc that is
+# not byte-identical to its recompilation.
+#
+# Only what a compiled module can contain is accepted: None, True, False,
+# Ellipsis, int (TYPE_INT, TYPE_LONG), float and complex (binary), bytes, the six
+# str encodings, tuple, frozenset, slice and code. Anything else - an unknown tag,
+# TYPE_NULL, a list, dict or set, FLAG_REF on a singleton or on TYPE_REF, a
+# TYPE_REF to an object still being read (CPython would accept a cycle through a
+# tuple; the writer cannot produce one) - is rejected.
+#
+# Every object becomes a node (tag, scalars, children) in a table shared by the
+# two streams compared, so two nodes have the same id exactly when their resolved
+# trees are equal; TYPE_REF is resolved to the node it designates in its own
+# stream. FLAG_REF and the reference indices are the only information dropped:
+# the tag keeps the rest (interned or not, ASCII, short or long string, small or
+# large tuple), floats keep their 8 bytes and frozensets their stream order.
+
+MARSHAL_FORMAT = {"python": PYTHON_VERSION, "pyc_magic_number": 3627, "magic": "2b0e0d0a",
+                  "marshal_version": 5,
+                  "source": "CPython v3.14.10: Python/marshal.c, Objects/codeobject.c"}
+
+BYTE_IDENTICAL = "BYTE_IDENTICAL"
+REF_LAYOUT_EQUIVALENT = "MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF"
+STRUCTURAL_MISMATCH = "STRUCTURAL_MISMATCH"
+REJECTED = "REJECTED"
+
+#: The only files to which MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF may apply (Decision 03):
+#: archive path -> sha256 of the installed file the decision was taken on. Another
+#: file, or another content, is REJECTED even if it is equivalent.
+REF_LAYOUT_APPROVED: dict[str, str] = {
+    "python/lib/python3.14/__pycache__/argparse.cpython-314.pyc":
+        "456c9a04733335ac851b27c181b164ebf53fb802467cc8c4aafef2fb073bcc9f",
+    "python/lib/python3.14/__pycache__/inspect.cpython-314.pyc":
+        "6e934df79a444dc62ca886c4a5e7b04b769dc5358a30e94bd5c58d4f8c772b32",
+    "python/lib/python3.14/__pycache__/typing.cpython-314.pyc":
+        "83aba4fe3e19880f888a057b72c1bcb3da75b0ad9ff3d657daa76fe157e63573",
+    "python/lib/python3.14/__pycache__/weakref.cpython-314.pyc":
+        "209a12ba13956f14df6f1935608f01439a464b202acd6a6bf5720a26dc7e1a33",
+}
+
+
+@dataclasses.dataclass(frozen=True)
+class MarshalLimits:
+    """Bounds of the reader. The four files of Decision 03 are 27,707-171,917 bytes."""
+
+    input_bytes: int = 8 << 20  # over 45 times the largest of the four
+    objects: int = 1_000_000  # every object is at least one byte of input
+    # Nesting while reading (CPython's own limit is 2000) and of the resolved tree (a
+    # TYPE_REF can graft a subtree). The reader and the tree walks are recursive, with
+    # at most five Python frames per level (a code record: read_object, _object,
+    # _value, _code, _children), so both stay under the default recursion limit of
+    # 1000; a RecursionError is a rejection anyway.
+    depth: int = 100
+    height: int = 150
+    container: int = 1_000_000  # items of one tuple or frozenset
+    string: int = 8 << 20  # bytes of one str or bytes object
+    refs: int = 1_000_000  # FLAG_REF entries
+    long_digits: int = 2_000  # 15-bit digits of one TYPE_LONG (30,000 bits)
+
+
+MARSHAL_LIMITS = MarshalLimits()
+FLAG_REF = 0x80
+SIZE32_MAX = 0x7FFFFFFF
+_SINGLETONS = frozenset("NFT.")
+_ASCII_TAGS = frozenset("aAzZ")
+STRING_TAGS = frozenset("aAzZut")
+_TUPLE_TAGS = frozenset("()")
+_SUPPORTED = frozenset("ilgys>:c") | STRING_TAGS | _TUPLE_TAGS
+CODE_SCALARS = ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_stacksize",
+                "co_flags", "co_firstlineno")
+CODE_CHILDREN = ("co_code", "co_consts", "co_names", "co_localsplusnames",
+                 "co_localspluskinds", "co_filename", "co_name", "co_qualname", "co_linetable",
+                 "co_exceptiontable")
+CO_VARARGS, CO_VARKEYWORDS = 0x04, 0x08
+CO_FAST_LOCAL, CO_FAST_CELL, CO_FAST_FREE = 0x20, 0x40, 0x80
+
+
+class MarshalRejected(Exception):
+    def __init__(self, reason: str, offset: int) -> None:
+        super().__init__(f"{reason} at offset {offset}")
+        self.reason, self.offset = reason, offset
+
+
+Node = tuple  # (tag, scalars, children): children are node ids
+
+
+class NodeTable:
+    """Hash-consed nodes: equal resolved trees get the same id."""
+
+    def __init__(self, limits: MarshalLimits = MARSHAL_LIMITS) -> None:
+        self.limits = limits
+        self.ids: dict[Node, int] = {}
+        self.nodes: list[Node] = []
+        self.heights: list[int] = []
+        #: tuple nodes already found to hold only str (see MarshalReader._validate_code)
+        self.string_tuples: set[int] = set()
+
+    def intern(self, tag: str, scalars: tuple, children: tuple, offset: int) -> int:
+        key = (tag, scalars, children)
+        found = self.ids.get(key)
+        if found is not None:
+            return found
+        height = 1 + max((self.heights[child] for child in children), default=0)
+        if height > self.limits.height:
+            raise MarshalRejected("resolved structure nested too deeply", offset)
+        self.ids[key] = len(self.nodes)
+        self.nodes.append(key)
+        self.heights.append(height)
+        return len(self.nodes) - 1
+
+
+class MarshalReader:
+    def __init__(self, data: bytes, start: int, table: NodeTable) -> None:
+        self.data, self.pos, self.table, self.limits = data, start, table, table.limits
+        self.refs: list[int | None] = []
+        self.depth = self.max_depth = self.objects = self.type_refs = 0
+        self.tags: dict[str, int] = {}
+
+    def _take(self, size: int) -> bytes:
+        if size < 0 or size > len(self.data) - self.pos:
+            raise MarshalRejected("truncated stream", self.pos)
+        chunk = self.data[self.pos:self.pos + size]
+        self.pos += size
+        return chunk
+
+    def _long(self) -> int:
+        return struct.unpack("<i", self._take(4))[0]
+
+    def _size(self, size: int, what: str, limit: int, offset: int) -> int:
+        if size < 0 or size > SIZE32_MAX:
+            raise MarshalRejected(f"{what} size out of range", offset)
+        if size > limit:
+            raise MarshalRejected(f"{what} size {size} over the limit {limit}", offset)
+        if size > len(self.data) - self.pos:  # every item takes at least one byte
+            raise MarshalRejected(f"{what} size {size} beyond the end of the stream", offset)
+        return size
+
+    def read_object(self) -> int:
+        offset = self.pos
+        code = self._take(1)[0]
+        self.objects += 1
+        if self.objects > self.limits.objects:
+            raise MarshalRejected("too many objects", offset)
+        self.depth += 1
+        if self.depth > self.limits.depth:
+            raise MarshalRejected("nested too deeply", offset)
+        self.max_depth = max(self.max_depth, self.depth)
+        try:
+            return self._object(code, offset)
+        finally:
+            self.depth -= 1
+
+    def _object(self, code: int, offset: int) -> int:
+        flag, tag = code & FLAG_REF, chr(code & ~FLAG_REF)
+        self.tags[tag] = self.tags.get(tag, 0) + 1
+        if tag == "r":
+            if flag:
+                raise MarshalRejected("FLAG_REF on TYPE_REF", offset)
+            self.type_refs += 1
+            index = self._long()
+            if index < 0 or index >= len(self.refs):
+                raise MarshalRejected(f"invalid reference {index}", offset)
+            target = self.refs[index]
+            if target is None:
+                raise MarshalRejected(f"reference {index} to an object still being read", offset)
+            return target
+        if tag in _SINGLETONS:
+            if flag:
+                raise MarshalRejected(f"FLAG_REF on {tag!r}", offset)
+            return self.table.intern(tag, (), (), offset)
+        if tag not in _SUPPORTED:
+            raise MarshalRejected(f"unsupported marshal type 0x{code & ~FLAG_REF:02x}", offset)
+        slot = None
+        if flag:  # the index is reserved before the children are read, as CPython does
+            if len(self.refs) >= self.limits.refs:
+                raise MarshalRejected("too many references", offset)
+            slot = len(self.refs)
+            self.refs.append(None)
+        node = self._value(tag, offset)
+        if slot is not None:
+            self.refs[slot] = node
+        return node
+
+    def _children(self, count: int) -> tuple:
+        items = []
+        for _ in range(count):
+            items.append(self.read_object())
+        return tuple(items)
+
+    def _value(self, tag: str, offset: int) -> int:
+        limits = self.limits
+        scalars: tuple = ()
+        children: tuple = ()
+        if tag == "i":
+            scalars = (self._long(),)
+        elif tag == "l":
+            count = self._long()
+            if count == 0 or abs(count) > limits.long_digits:
+                raise MarshalRejected(f"long size {count} out of range", offset)
+            digits = struct.unpack(f"<{abs(count)}H", self._take(2 * abs(count)))
+            if any(digit >= 1 << 15 for digit in digits):
+                raise MarshalRejected("digit out of range in long", offset)
+            if digits[-1] == 0:
+                raise MarshalRejected("unnormalized long", offset)
+            value = sum(digit << (15 * i) for i, digit in enumerate(digits))
+            scalars = (-value if count < 0 else value,)
+        elif tag == "g":
+            scalars = (self._take(8),)
+        elif tag == "y":
+            scalars = (self._take(16),)
+        elif tag == "s":
+            scalars = (self._take(self._size(self._long(), "bytes", limits.string, offset)),)
+        elif tag in STRING_TAGS:
+            size = self._take(1)[0] if tag in "zZ" else self._long()
+            payload = self._take(self._size(size, "str", limits.string, offset))
+            if tag in _ASCII_TAGS and any(byte >= 0x80 for byte in payload):
+                raise MarshalRejected("non-ASCII data in an ASCII string", offset)
+            if tag in "ut":
+                try:
+                    payload.decode("utf-8", "surrogatepass")
+                except UnicodeDecodeError:
+                    raise MarshalRejected("invalid UTF-8 in a string", offset) from None
+            scalars = (payload,)
+        elif tag in _TUPLE_TAGS or tag == ">":
+            size = self._take(1)[0] if tag == ")" else self._long()
+            children = self._children(self._size(size, "container", limits.container, offset))
+        elif tag == ":":
+            children = self._children(3)
+        else:  # "c"
+            return self._code(offset)
+        return self.table.intern(tag, scalars, children, offset)
+
+    def _code(self, offset: int) -> int:
+        head = tuple(self._long() for _ in range(5))  # argcount ... flags
+        before = self._children(8)  # co_code ... co_qualname
+        firstlineno = self._long()
+        after = self._children(2)  # co_linetable, co_exceptiontable
+        scalars, children = head + (firstlineno,), before + after
+        self._validate_code(scalars, children, offset)
+        return self.table.intern("c", scalars, children, offset)
+
+    def _validate_code(self, scalars: tuple, children: tuple, offset: int) -> None:
+        """The checks of _PyCode_Validate() and the field types the code constructor needs."""
+        argcount, posonly, kwonly, stacksize, flags, _ = scalars
+        nodes = self.table.nodes
+        field = dict(zip(CODE_CHILDREN, (nodes[child] for child in children)))
+
+        def fail(problem: str) -> None:
+            raise MarshalRejected(f"invalid code record: {problem}", offset)
+
+        if argcount < posonly or posonly < 0 or kwonly < 0 or stacksize < 0 or flags < 0:
+            fail("negative or inconsistent counts")
+        for name in ("co_code", "co_localspluskinds", "co_linetable", "co_exceptiontable"):
+            if field[name][0] != "s":
+                fail(f"{name} is not bytes")
+        for name in ("co_filename", "co_name", "co_qualname"):
+            if field[name][0] not in STRING_TAGS:
+                fail(f"{name} is not a str")
+        for name in ("co_consts", "co_names", "co_localsplusnames"):
+            if field[name][0] not in _TUPLE_TAGS:
+                fail(f"{name} is not a tuple")
+        for name in ("co_names", "co_localsplusnames"):
+            # Each tuple node is checked once: a shared names tuple must not make the
+            # validation quadratic (independent review finding).
+            tuple_id = children[CODE_CHILDREN.index(name)]
+            if tuple_id in self.table.string_tuples:
+                continue
+            if any(nodes[item][0] not in STRING_TAGS for item in field[name][2]):
+                fail(f"{name} holds a non-str")
+            self.table.string_tuples.add(tuple_id)
+        if len(field["co_code"][1][0]) % 2:
+            fail("co_code has an odd length")
+        kinds = field["co_localspluskinds"][1][0]
+        if len(kinds) != len(field["co_localsplusnames"][2]):
+            fail("co_localsplusnames and co_localspluskinds differ in length")
+        locals_count = sum(1 for kind in kinds if kind & CO_FAST_LOCAL)
+        if locals_count < argcount + kwonly + bool(flags & CO_VARARGS) \
+                + bool(flags & CO_VARKEYWORDS):
+            fail("co_varnames is too small")
+
+
+@dataclasses.dataclass
+class ParsedPyc:
+    header: bytes
+    root: int
+    stats: dict[str, Any]
+
+
+def parse_marshal(data: bytes, table: NodeTable, start: int = 0) -> tuple[int, MarshalReader]:
+    """One complete marshal object filling data[start:] (trailing bytes are rejected)."""
+    if len(data) > table.limits.input_bytes:
+        raise MarshalRejected(f"input of {len(data)} bytes over the limit", 0)
+    reader = MarshalReader(data, start, table)
+    root = reader.read_object()
+    if reader.pos != len(data):
+        raise MarshalRejected(f"{len(data) - reader.pos} trailing bytes", reader.pos)
+    return root, reader
+
+
+def parse_pyc(data: bytes, table: NodeTable) -> ParsedPyc:
+    if len(data) < 16:
+        raise MarshalRejected("truncated header", len(data))
+    if data[:4].hex() != MARSHAL_FORMAT["magic"]:
+        raise MarshalRejected(f"incorrect magic number {data[:4].hex()}", 0)
+    root, reader = parse_marshal(data, table, 16)
+    if table.nodes[root][0] != "c":
+        raise MarshalRejected("the top-level object is not a code record", 16)
+    return ParsedPyc(data[:16], root, {
+        "objects": reader.objects, "flag_refs": len(reader.refs), "type_refs": reader.type_refs,
+        "max_depth": reader.max_depth, "tags": dict(sorted(reader.tags.items()))})
+
+
+def _child_label(tag: str, path: str, index: int) -> str:
+    if tag == "c":
+        return f"{path}.{CODE_CHILDREN[index]}"
+    if tag == ":":
+        return f"{path}.{('start', 'stop', 'step')[index]}"
+    return f"{path}{{{index}}}" if tag == ">" else f"{path}[{index}]"
+
+
+def _summary(node: Node) -> dict:
+    tag, scalars, children = node
+    shown: list[Any] = []
+    for value in scalars:
+        if isinstance(value, bytes):
+            text = value.decode("utf-8", "replace") if tag in STRING_TAGS else value.hex()
+            shown.append(text[:80] + ("..." if len(text) > 80 else ""))
+        else:
+            shown.append(value)
+    return {"tag": tag, "scalars": shown, "children": len(children)}
+
+
+def diff_nodes(table: NodeTable, a: int, b: int, limit: int = 20,
+               max_pairs: int = 200_000) -> list[dict]:
+    """Where two resolved trees differ (diagnostics only). Pairs are visited once, and at
+    most `max_pairs` of them: two hostile DAGs could align into exponentially many."""
+    found: list[dict] = []
+    seen: set[tuple[int, int]] = set()
+
+    def walk(x: int, y: int, path: str) -> None:
+        if x == y or (x, y) in seen or len(found) >= limit:
+            return
+        if len(seen) >= max_pairs:
+            found.append({"path": path, "kind": "truncated",
+                          "note": f"stopped after {max_pairs} node pairs"})
+            return
+        seen.add((x, y))
+        (tx, sx, cx), (ty, sy, cy) = table.nodes[x], table.nodes[y]
+        if tx != ty or len(cx) != len(cy):
+            kind = "tag" if len(cx) == len(cy) and sx == sy else "structure"
+            found.append({"path": path, "kind": kind, "installed": _summary(table.nodes[x]),
+                          "recompiled": _summary(table.nodes[y])})
+            return
+        if sx != sy:
+            fields = ([name for name, p, q in zip(CODE_SCALARS, sx, sy) if p != q]
+                      if tx == "c" else ["value"])
+            found.append({"path": path, "kind": "value", "fields": fields,
+                          "installed": _summary(table.nodes[x]),
+                          "recompiled": _summary(table.nodes[y])})
+        for index, (p, q) in enumerate(zip(cx, cy)):
+            walk(p, q, _child_label(tx, path, index))
+
+    walk(a, b, "<module>")
+    return found
+
+
+def without_interned_flag(table: NodeTable, root: int, into: NodeTable,
+                          memo: dict[int, int]) -> int:
+    """Diagnostics only: the tree with interned and non-interned string tags merged."""
+    if root in memo:
+        return memo[root]
+    tag, scalars, children = table.nodes[root]
+    mapped = tuple(without_interned_flag(table, child, into, memo) for child in children)
+    memo[root] = into.intern({"Z": "z", "A": "a", "t": "u"}.get(tag, tag), scalars, mapped, 0)
+    return memo[root]
+
+
+def compare_structure(installed: bytes, recompiled: bytes,
+                      limits: MarshalLimits = MARSHAL_LIMITS) -> dict:
+    """Parse both .pyc independently and compare their resolved trees."""
+    table = NodeTable(limits)
+    parsed = {}
+    for side, data in (("installed", installed), ("recompiled", recompiled)):
+        try:
+            parsed[side] = parse_pyc(data, table)
+        except MarshalRejected as exc:
+            return {"parsed": False, "rejected": side, "reason": exc.reason,
+                    "offset": exc.offset}
+        except RecursionError:
+            return {"parsed": False, "rejected": side, "reason": "recursion limit reached",
+                    "offset": None}
+    a, b = parsed["installed"], parsed["recompiled"]
+    result: dict[str, Any] = {
+        "parsed": True, "header_identical": a.header == b.header,
+        "equivalent": a.header == b.header and a.root == b.root,
+        "installed": a.stats, "recompiled": b.stats}
+    if a.root != b.root:  # diagnostics only: the classification is already decided
+        try:
+            result["differences"] = diff_nodes(table, a.root, b.root)
+            merged, memo = NodeTable(limits), {}  # type: NodeTable, dict[int, int]
+            result["equal_without_interned_flag"] = (
+                without_interned_flag(table, a.root, merged, memo)
+                == without_interned_flag(table, b.root, merged, memo))
+        except RecursionError:
+            result["differences"] = "recursion limit reached while describing the difference"
+    return result
+
+
+def classify_pyc(name: str, installed: bytes, recompiled: bytes, approved: dict[str, str],
+                 reader_verified: bool | None) -> dict:
+    """Decision 03: BYTE_IDENTICAL, MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF, STRUCTURAL_MISMATCH
+    or REJECTED. `reader_verified` is the reader conformance result (None: not run)."""
+    if installed == recompiled:
+        return {"classification": BYTE_IDENTICAL}
+    structure = compare_structure(installed, recompiled)
+    if not structure["parsed"]:
+        return {"classification": REJECTED, "reason": "not parsable", "structure": structure}
+    if not structure["equivalent"]:
+        reason = "header differs" if not structure["header_identical"] else "code differs"
+        return {"classification": STRUCTURAL_MISMATCH, "reason": reason, "structure": structure}
+    if approved.get(name) != hashlib.sha256(installed).hexdigest():
+        return {"classification": REJECTED, "reason": "equivalent, but not approved by Decision 03",
+                "structure": structure}
+    if reader_verified is not True:
+        return {"classification": REJECTED, "reason": "reader conformance not established",
+                "structure": structure}
+    return {"classification": REF_LAYOUT_EQUIVALENT,
+            "reason": "header identical; resolved trees identical; only FLAG_REF / TYPE_REF differ",
+            "structure": structure}
+
+
+# The reader is checked against the 3.14.10 writer itself: the isolated interpreter
+# compiles this synthetic module (it is not run), marshals it, then marshals it
+# again while holding extra references to its constants, which changes FLAG_REF
+# and the TYPE_REF indices only. The reader must recover every code field from
+# both, find them equivalent, and find a different file name or constant different.
+ORACLE_SOURCE = '''\
+"""Oracle module: compiled, never run."""
+import os as _os
+SHARED = "shared constant, not an identifier!"
+WIDE = "été 中"
+LONG = """%s"""
+BIG = 1 << 100
+NEG = -(1 << 70)
+VALUES = (1, 2.5, -0.0, 3j, b"\\x00\\xff", None, True, False, ..., (1, (2, "z")))
+def function(a, b=SHARED, /, c=1, *args, d, e=2, **kwargs):
+    total = a + c
+    def inner(x):
+        nonlocal total
+        total += x
+        return total, SHARED
+    try:
+        return inner(d)[0:2:1], a in {1, 2, 3}, "shared constant, not an identifier!"
+    except (KeyError, ValueError) as exc:
+        raise RuntimeError(exc) from None
+    finally:
+        del total
+class Klass(dict):
+    attribute: int = 3
+    def method(self, *, flag=False):
+        return [n * 2 for n in range(4) if n] + [lambda: self]
+''' % ("y" * 300)
+ORACLE_VARIANT = ORACLE_SOURCE.replace("e=2", "e=3")
+#: Marshal types ORACLE_SOURCE produces: code, small tuple, interned / plain short and
+#: long ASCII, non-ASCII str, int, long, float, complex, bytes, frozenset ({1, 2, 3}),
+#: slice ([0:2:1], folded since 3.14), the singletons and TYPE_REF.
+ORACLE_TAGS = frozenset("c)Zzauilgys>:NTF.r")
+
+
+def describe_live(obj: Any) -> Any:
+    """Run by the isolated interpreter: a JSON description of a compiled constant."""
+    import types
+
+    if obj is None or obj is True or obj is False or obj is Ellipsis:
+        return ["const", repr(obj)]
+    if isinstance(obj, types.CodeType):
+        return ["code", {
+            "argcount": obj.co_argcount, "posonlyargcount": obj.co_posonlyargcount,
+            "kwonlyargcount": obj.co_kwonlyargcount, "stacksize": obj.co_stacksize,
+            "flags": obj.co_flags, "code": obj.co_code.hex(),
+            "consts": [describe_live(item) for item in obj.co_consts],
+            "names": list(obj.co_names), "varnames": list(obj.co_varnames),
+            "cellvars": list(obj.co_cellvars), "freevars": list(obj.co_freevars),
+            "filename": obj.co_filename, "name": obj.co_name, "qualname": obj.co_qualname,
+            "firstlineno": obj.co_firstlineno, "linetable": obj.co_linetable.hex(),
+            "exceptiontable": obj.co_exceptiontable.hex()}]
+    if type(obj) is int:
+        return ["int", str(obj)]
+    if type(obj) is float:
+        return ["float", struct.pack("<d", obj).hex()]
+    if type(obj) is complex:
+        return ["complex", struct.pack("<dd", obj.real, obj.imag).hex()]
+    if type(obj) is bytes:
+        return ["bytes", obj.hex()]
+    if type(obj) is str:
+        return ["str", obj]
+    if type(obj) is tuple:
+        return ["tuple", [describe_live(item) for item in obj]]
+    if type(obj) is frozenset:
+        return ["frozenset", sorted((describe_live(item) for item in obj), key=json.dumps)]
+    if type(obj) is slice:
+        return ["slice", [describe_live(obj.start), describe_live(obj.stop),
+                          describe_live(obj.step)]]
+    raise TypeError(f"unexpected constant type {type(obj).__name__}")
+
+
+def describe_node(table: NodeTable, node: int) -> Any:
+    """The same description, from the reader's tree."""
+    tag, scalars, children = table.nodes[node]
+    if tag in _SINGLETONS:
+        return ["const", {"N": "None", "T": "True", "F": "False", ".": "Ellipsis"}[tag]]
+    if tag in "il":
+        return ["int", str(scalars[0])]
+    if tag == "g":
+        return ["float", scalars[0].hex()]
+    if tag == "y":
+        return ["complex", scalars[0].hex()]
+    if tag == "s":
+        return ["bytes", scalars[0].hex()]
+    if tag in STRING_TAGS:
+        return ["str", scalars[0].decode("utf-8", "surrogatepass")]
+    if tag in _TUPLE_TAGS:
+        return ["tuple", [describe_node(table, child) for child in children]]
+    if tag == ">":
+        return ["frozenset", sorted((describe_node(table, child) for child in children),
+                                    key=json.dumps)]
+    if tag == ":":
+        return ["slice", [describe_node(table, child) for child in children]]
+    field = dict(zip(CODE_CHILDREN, children))
+
+    def strings(name: str) -> list[str]:
+        return [describe_node(table, child)[1] for child in table.nodes[field[name]][2]]
+
+    names = strings("co_localsplusnames")
+    kinds = table.nodes[field["co_localspluskinds"]][1][0]
+
+    def text(name: str) -> str:
+        return describe_node(table, field[name])[1]
+
+    def raw(name: str) -> str:
+        return table.nodes[field[name]][1][0].hex()
+
+    argcount, posonly, kwonly, stacksize, flags, firstlineno = scalars
+    return ["code", {
+        "argcount": argcount, "posonlyargcount": posonly, "kwonlyargcount": kwonly,
+        "stacksize": stacksize, "flags": flags, "code": raw("co_code"),
+        "consts": describe_node(table, field["co_consts"])[1],
+        "names": strings("co_names"),
+        "varnames": [n for n, k in zip(names, kinds) if k & CO_FAST_LOCAL],
+        "cellvars": [n for n, k in zip(names, kinds) if k & CO_FAST_CELL],
+        "freevars": [n for n, k in zip(names, kinds) if k & CO_FAST_FREE],
+        "filename": text("co_filename"), "name": text("co_name"), "qualname": text("co_qualname"),
+        "firstlineno": firstlineno, "linetable": raw("co_linetable"),
+        "exceptiontable": raw("co_exceptiontable")}]
+
+
+def oracle_worker(out_dir: str) -> int:
+    """Run by the isolated interpreter: marshal the synthetic module (never run) into out_dir."""
+    import importlib.util
+    import marshal
+    import types
+
+    out = Path(os.path.realpath(out_dir))
+    header = importlib.util.MAGIC_NUMBER + bytes(12)
+    base = compile(ORACLE_SOURCE, "/oracle/module.py", "exec", dont_inherit=True, optimize=0)
+    renamed = compile(ORACLE_SOURCE, "/oracle/other.py", "exec", dont_inherit=True, optimize=0)
+    variant = compile(ORACLE_VARIANT, "/oracle/module.py", "exec", dont_inherit=True, optimize=0)
+    streams = {"base": marshal.dumps(base), "renamed": marshal.dumps(renamed),
+               "variant": marshal.dumps(variant)}
+    held = []  # extra references: FLAG_REF on every constant that had a single one
+
+    def hold(code: types.CodeType) -> None:
+        for item in code.co_consts:
+            held.append(item)
+            if isinstance(item, types.CodeType):
+                hold(item)
+            elif isinstance(item, tuple):
+                held.extend(item)
+
+    hold(base)
+    streams["base_extra_refs"] = marshal.dumps(base)
+    for name, data in streams.items():
+        (out / f"oracle-{name}.pyc").write_bytes(header + data)
+    descriptions = {"base": describe_live(base), "renamed": describe_live(renamed),
+                    "variant": describe_live(variant)}
+    (out / "oracle.json").write_text(json.dumps(descriptions), encoding="utf-8")
+    return 0
+
+
+def verify_reader(out_dir: Path) -> dict:
+    """Check the reader on the oracle output of the 3.14.10 writer (see ORACLE_SOURCE)."""
+    expected = json.loads((out_dir / "oracle.json").read_text(encoding="utf-8"))
+    data = {name: (out_dir / f"oracle-{name}.pyc").read_bytes()
+            for name in ("base", "base_extra_refs", "renamed", "variant")}
+    table = NodeTable()
+    try:
+        parsed = {name: parse_pyc(value, table) for name, value in data.items()}
+    except MarshalRejected as exc:
+        return {"status": FAIL, "reason": f"oracle stream rejected: {exc}"}
+    checks = {
+        "fields_base": describe_node(table, parsed["base"].root) == expected["base"],
+        "fields_extra_refs": describe_node(table, parsed["base_extra_refs"].root)
+        == expected["base"],
+        "fields_renamed": describe_node(table, parsed["renamed"].root) == expected["renamed"],
+        "fields_variant": describe_node(table, parsed["variant"].root) == expected["variant"],
+        "layout_differs": data["base"] != data["base_extra_refs"]
+        and parsed["base"].stats["flag_refs"] < parsed["base_extra_refs"].stats["flag_refs"],
+        "type_refs_present": parsed["base"].stats["type_refs"] > 0,
+        # Not vacuous: the oracle streams must contain every type the source is written
+        # to produce (independent review finding).
+        "types_covered": ORACLE_TAGS <= set(parsed["base"].stats["tags"]),
+        "extra_refs_equivalent": parsed["base"].root == parsed["base_extra_refs"].root,
+        "renamed_different": parsed["base"].root != parsed["renamed"].root,
+        "variant_different": parsed["base"].root != parsed["variant"].root,
+    }
+    return {"status": PASS if all(checks.values()) else FAIL, "checks": checks,
+            "stats": {name: value.stats for name, value in parsed.items()},
+            "sha256": {name: hashlib.sha256(value).hexdigest() for name, value in data.items()}}
+
+
 def recompile_and_compare(ctx: Context, comparison: Comparison, manifest: Manifest) -> dict:
     settings = ctx.settings
     work = Path(tempfile.mkdtemp(prefix="r6-gate4-", dir=settings.work_parent))
@@ -607,26 +1245,59 @@ def recompile_and_compare(ctx: Context, comparison: Comparison, manifest: Manife
         if not result_file.is_file():
             raise GateError(f"compile worker failed ({done.returncode}): {done.stderr[-300:]}")
         report = json.loads(result_file.read_text(encoding="utf-8"))
-        mismatches = []
         identical = 0
+        pairs = []
         for job in jobs:
             installed = (settings.runtime_root / job.installed[len(ARCHIVE_ROOT) + 1:]).read_bytes()
             produced = Path(job.cfile).read_bytes() if Path(job.cfile).is_file() else b""
             if installed == produced:
                 identical += 1
-                continue
-            mismatches.append({
+            else:
+                pairs.append((job, installed, produced))
+        # The reader is only needed, and only checked, when a .pyc is not byte-identical.
+        oracle = {"status": NOT_RUN, "reason": "every .pyc is byte-identical"}
+        if pairs:
+            oracle = (ctx.oracle or run_oracle)(ctx, isolation, python, work)
+        verified = None if oracle["status"] == NOT_RUN else oracle["status"] == PASS
+        mismatches = []
+        for job, installed, produced in pairs:
+            row = {
                 "pyc": job.installed, "installed_sha256": hashlib.sha256(installed).hexdigest(),
                 "recompiled_sha256": hashlib.sha256(produced).hexdigest(),
                 "difference": first_difference(installed, produced),
                 "conditions": {"optimize": job.optimize, "dfile": job.dfile,
                                "invalidation_mode": "TIMESTAMP"},
                 "flags": struct.unpack("<I", installed[4:8])[0] if len(installed) >= 8 else None,
-            })
+            }
+            row.update(classify_pyc(job.installed, installed, produced,
+                                    settings.ref_layout_approved, verified))
+            mismatches.append(row)
+        counts = {"total": len(jobs), BYTE_IDENTICAL: identical, REF_LAYOUT_EQUIVALENT: 0,
+                  STRUCTURAL_MISMATCH: 0, REJECTED: 0}
+        for row in mismatches:
+            counts[row["classification"]] += 1
         return {"probe": probe, "interpreter": report, "jobs": len(jobs), "identical": identical,
-                "mismatches": mismatches}
+                "classification": counts, "mismatches": mismatches,
+                "reader": {"format": MARSHAL_FORMAT, "limits": dataclasses.asdict(MARSHAL_LIMITS),
+                           "conformance": oracle}}
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+def run_oracle(ctx: Context, isolation: Isolation, python: Path, work: Path) -> dict:
+    """Run oracle_worker in the isolated interpreter and check the reader on its output."""
+    out = work / "oracle"
+    out.mkdir()
+    done = isolation.run(ctx.run, [str(python), "-I", "-B", "-S",
+                                   str(work / "verify_cutover_gate.py"), "--oracle-worker",
+                                   str(out)])
+    if done.returncode != 0 or not (out / "oracle.json").is_file():
+        return {"status": FAIL,
+                "reason": f"oracle worker failed ({done.returncode}): {(done.stderr or '')[-300:]}"}
+    try:
+        return verify_reader(out)
+    except Exception as exc:  # noqa: BLE001 - any failure of the check is a FAIL, never a PASS
+        return {"status": FAIL, "reason": f"{type(exc).__name__}: {exc}"}
 
 
 @requires("step0", "1", "2", "3")
@@ -664,8 +1335,10 @@ def gate4_runtime(ctx: Context) -> GateResult:
                 and interpreter["cache_tag"] == settings.cache_tag
                 and installed_magic <= {interpreter["magic"]})
     evidence["identity"] = identity
-    ok = identity and not interpreter["errors"] and not recompiled["mismatches"] \
-        and recompiled["identical"] == recompiled["jobs"]
+    counts = recompiled["classification"]
+    accepted = counts[BYTE_IDENTICAL] + counts[REF_LAYOUT_EQUIVALENT]
+    ok = identity and not interpreter["errors"] and counts[STRUCTURAL_MISMATCH] == 0 \
+        and counts[REJECTED] == 0 and accepted == counts["total"] == recompiled["jobs"]
     return GateResult("4", "local Python runtime", PASS if ok else FAIL, evidence)
 
 
@@ -839,6 +1512,8 @@ def exit_status(results: list[GateResult]) -> int:
 def main(argv: list[str]) -> int:
     if argv[:1] == ["--compile-worker"] and len(argv) == 4:
         return compile_worker(*argv[1:])
+    if argv[:1] == ["--oracle-worker"] and len(argv) == 2:
+        return oracle_worker(argv[1])
     if argv[:1] == ["--legacy-cli-worker"] and len(argv) == 2:
         return legacy_cli_worker(argv[1])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
