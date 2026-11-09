@@ -77,8 +77,15 @@ def _build_archive(tmp: Path, extra: list[tarfile.TarInfo] | None = None) -> Pat
     archive_dir = tmp / "dl"
     archive_dir.mkdir()
     archive = archive_dir / gate.ARCHIVE_NAME
+    def like_the_real_archive(info: tarfile.TarInfo) -> tarfile.TarInfo:
+        # The symlinks of the real archive are 0o775. A symlink created here takes the
+        # host's mode: 0o755 on macOS, but 0o777 (world-writable, rejected) on Linux CI.
+        if info.issym():
+            info.mode = 0o775
+        return info
+
     with tarfile.open(archive, "w:gz") as tar:
-        tar.add(build / "python", arcname="python")
+        tar.add(build / "python", arcname="python", filter=like_the_real_archive)
         for info in extra or []:
             tar.addfile(info, io.BytesIO(b"x" * info.size) if info.isreg() else None)
     return archive
