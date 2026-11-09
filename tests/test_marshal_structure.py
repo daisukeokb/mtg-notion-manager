@@ -283,7 +283,8 @@ def test_gate4_counts_every_row(tmp_path: Path, installed: tuple[Path, Path]) ->
     counts = result.evidence["recompilation"]["classification"]
     assert result.status == gate.FAIL
     assert counts == {"total": 2, gate.BYTE_IDENTICAL: 0, gate.REF_LAYOUT_EQUIVALENT: 0,
-                      gate.STRUCTURAL_MISMATCH: 1, gate.REJECTED: 1}
+                      gate.INTERNING_EQUIVALENT: 0, gate.STRUCTURAL_MISMATCH: 1,
+                      gate.REJECTED: 1}
 
 
 # --- rejected: not parsable -----------------------------------------------------------------
@@ -572,7 +573,8 @@ def test_gate4_accepts_an_approved_reference_layout_difference(
     assert result.status == gate.PASS, result.evidence
     counts = result.evidence["recompilation"]["classification"]
     assert counts == {"total": 2, gate.BYTE_IDENTICAL: 1, gate.REF_LAYOUT_EQUIVALENT: 1,
-                      gate.STRUCTURAL_MISMATCH: 0, gate.REJECTED: 0}
+                      gate.INTERNING_EQUIVALENT: 0, gate.STRUCTURAL_MISMATCH: 0,
+                      gate.REJECTED: 0}
 
 
 @pytest.mark.parametrize("approved_sha, oracle_status, recompiled, expected", [

@@ -107,6 +107,8 @@ class Settings:
     archive_sha256: str = ARCHIVE_SHA256
     ref_layout_approved: dict[str, str] = dataclasses.field(
         default_factory=lambda: dict(REF_LAYOUT_APPROVED))
+    interning_approved: dict[str, dict] = dataclasses.field(
+        default_factory=lambda: dict(INTERNING_APPROVED))
 
     @property
     def runtime_root(self) -> Path:
@@ -613,6 +615,10 @@ MARSHAL_FORMAT = {"python": PYTHON_VERSION, "pyc_magic_number": 3627, "magic": "
 
 BYTE_IDENTICAL = "BYTE_IDENTICAL"
 REF_LAYOUT_EQUIVALENT = "MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF"
+#: Decision 04. Not byte identity, and not identity of the objects at run time: the
+#: installed copy of each approved string is loaded interned (immortal), the
+#: recompiled one is not; their values are equal.
+INTERNING_EQUIVALENT = "MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF"
 STRUCTURAL_MISMATCH = "STRUCTURAL_MISMATCH"
 REJECTED = "REJECTED"
 
@@ -628,6 +634,27 @@ REF_LAYOUT_APPROVED: dict[str, str] = {
         "83aba4fe3e19880f888a057b72c1bcb3da75b0ad9ff3d657daa76fe157e63573",
     "python/lib/python3.14/__pycache__/weakref.cpython-314.pyc":
         "209a12ba13956f14df6f1935608f01439a464b202acd6a6bf5720a26dc7e1a33",
+}
+
+#: The only interned-flag differences MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF may
+#: accept (Decision 04): the file with the content the decision was taken on, and each
+#: string at its position (constant 0 of a class body, its __qualname__).
+INTERNING_APPROVED: dict[str, dict] = {
+    name: {"sha256": REF_LAYOUT_APPROVED[name], "strings": strings}
+    for name, strings in (
+        ("python/lib/python3.14/__pycache__/argparse.cpython-314.pyc", [
+            ("<module>.co_consts[27].co_consts[7].co_consts[0]", "HelpFormatter._Section"),
+            ("<module>.co_consts[55].co_consts[2].co_consts[0]",
+             "_SubParsersAction._ChoicesPseudoAction")]),
+        ("python/lib/python3.14/__pycache__/inspect.cpython-314.pyc", [
+            ("<module>.co_consts[228].co_consts[9].co_consts[0]",
+             "_signature_fromstr.<locals>.RewriteSymbolics")]),
+        ("python/lib/python3.14/__pycache__/typing.cpython-314.pyc", [
+            ("<module>.co_consts[295].co_consts[4].co_consts[0].co_consts[0]",
+             "NewType.__mro_entries__.<locals>.Dummy")]),
+        ("python/lib/python3.14/__pycache__/weakref.cpython-314.pyc", [
+            ("<module>.co_consts[13].co_consts[4].co_consts[0]", "finalize._Info")]),
+    )
 }
 
 
@@ -967,9 +994,109 @@ def without_interned_flag(table: NodeTable, root: int, into: NodeTable,
     return memo[root]
 
 
+_PATH_STEP = re.compile(r"\.(co_[a-z]+)|\[(\d+)\]")
+
+
+def parse_path(path: str) -> list[tuple[str, Any]]:
+    """'<module>.co_consts[27].co_consts[0]' -> [('field', 'co_consts'), ('index', 27), ...]."""
+    if not path.startswith("<module>"):
+        raise ValueError(f"path must start at <module>: {path}")
+    rest, steps, position = path[len("<module>"):], [], 0
+    while position < len(rest):
+        match = _PATH_STEP.match(rest, position)
+        if not match:
+            raise ValueError(f"malformed path: {path}")
+        steps.append(("field", match[1]) if match[1] else ("index", int(match[2])))
+        position = match.end()
+    return steps
+
+
+def resolve_path(table: NodeTable, root: int, steps: list[tuple[str, Any]]) -> list[int] | None:
+    """The nodes along the path (root first), or None if the tree does not have it."""
+    nodes, node = [root], root
+    for kind, value in steps:
+        tag, _, children = table.nodes[node]
+        if kind == "field":
+            if tag != "c" or value not in CODE_CHILDREN:
+                return None
+            node = children[CODE_CHILDREN.index(value)]
+        else:
+            if tag not in _TUPLE_TAGS or value >= len(children):
+                return None
+            node = children[value]
+        nodes.append(node)
+    return nodes
+
+
+def replace_at_path(table: NodeTable, root: int, steps: list[tuple[str, Any]],
+                    leaf: int) -> int:
+    """The tree with the node at `steps` replaced by `leaf` (only that position)."""
+    if not steps:
+        return leaf
+    tag, scalars, children = table.nodes[root]
+    kind, value = steps[0]
+    index = CODE_CHILDREN.index(value) if kind == "field" else value
+    child = replace_at_path(table, children[index], steps[1:], leaf)
+    return table.intern(tag, scalars, children[:index] + (child,) + children[index + 1:], 0)
+
+
+def check_approved_interning(table: NodeTable, installed: int, recompiled: int,
+                             targets: list[tuple[str, str]]) -> dict:
+    """Decision 04: the trees may differ only in the interned flag of the approved strings.
+
+    Each target (path, value) must be, in both trees, constant 0 of a code object whose
+    co_qualname is that value and whose co_names stores __qualname__ (codegen_class_body
+    in Python/codegen.c loads QUALNAME as the first constant and stores it there); the
+    installed node must be TYPE_SHORT_ASCII_INTERNED ('Z') and the recompiled one
+    TYPE_SHORT_ASCII ('z') with the same bytes. With 'z' put at exactly those positions
+    of the installed tree (other positions sharing the node are left alone), the two
+    trees must then be identical.
+    """
+    rows, rewritten = [], installed
+    for path, value in targets:
+        steps = parse_path(path)
+        data = value.encode("ascii")
+        row: dict[str, Any] = {"path": path, "value": value}
+        rows.append(row)
+        if len(steps) < 2 or steps[-2] != ("field", "co_consts") or steps[-1] != ("index", 0):
+            row["problem"] = "not constant 0 of a code object"
+            continue
+        sides = {}
+        for side, root in (("installed", installed), ("recompiled", recompiled)):
+            nodes = resolve_path(table, root, steps)
+            if nodes is None:
+                row["problem"] = f"path not present in the {side} tree"
+                break
+            owner = dict(zip(CODE_CHILDREN, table.nodes[nodes[-3]][2]))
+            qualname = table.nodes[owner["co_qualname"]]
+            names = [table.nodes[item] for item in table.nodes[owner["co_names"]][2]]
+            if qualname[0] not in STRING_TAGS or qualname[1] != (data,):
+                row["problem"] = f"co_qualname of the owning code differs ({side})"
+                break
+            if not any(name[1] == (b"__qualname__",) for name in names):
+                row["problem"] = f"the owning code does not store __qualname__ ({side})"
+                break
+            sides[side] = table.nodes[nodes[-1]]
+        else:
+            row["installed_tag"], row["recompiled_tag"] = sides["installed"][0], \
+                sides["recompiled"][0]
+            if sides["installed"] != ("Z", (data,), ()) \
+                    or sides["recompiled"] != ("z", (data,), ()):
+                row["problem"] = "not an interned (Z) / plain (z) pair of the approved value"
+                continue
+            rewritten = replace_at_path(table, rewritten, steps,
+                                        table.intern("z", (data,), (), 0))
+    problems = [row for row in rows if "problem" in row]
+    identical = not problems and rewritten == recompiled
+    return {"ok": identical, "targets": rows,
+            "rest_identical": None if problems else rewritten == recompiled}
+
+
 def compare_structure(installed: bytes, recompiled: bytes,
-                      limits: MarshalLimits = MARSHAL_LIMITS) -> dict:
-    """Parse both .pyc independently and compare their resolved trees."""
+                      limits: MarshalLimits = MARSHAL_LIMITS,
+                      interning: list[tuple[str, str]] | None = None) -> dict:
+    """Parse both .pyc independently and compare their resolved trees. With `interning`
+    (Decision 04 targets), also check whether only those interned flags differ."""
     table = NodeTable(limits)
     parsed = {}
     for side, data in (("installed", installed), ("recompiled", recompiled)):
@@ -986,6 +1113,13 @@ def compare_structure(installed: bytes, recompiled: bytes,
         "parsed": True, "header_identical": a.header == b.header,
         "equivalent": a.header == b.header and a.root == b.root,
         "installed": a.stats, "recompiled": b.stats}
+    if a.root != b.root and interning is not None and a.header == b.header:
+        try:
+            result["approved_interning"] = check_approved_interning(
+                table, a.root, b.root, interning)
+        except (RecursionError, ValueError) as exc:  # incl. malformed approvals, non-ASCII
+            result["approved_interning"] = {"ok": False,
+                                            "problem": f"{type(exc).__name__}: {exc}"}
     if a.root != b.root:  # diagnostics only: the classification is already decided
         try:
             result["differences"] = diff_nodes(table, a.root, b.root)
@@ -999,16 +1133,32 @@ def compare_structure(installed: bytes, recompiled: bytes,
 
 
 def classify_pyc(name: str, installed: bytes, recompiled: bytes, approved: dict[str, str],
-                 reader_verified: bool | None) -> dict:
-    """Decision 03: BYTE_IDENTICAL, MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF, STRUCTURAL_MISMATCH
-    or REJECTED. `reader_verified` is the reader conformance result (None: not run)."""
+                 reader_verified: bool | None,
+                 interning_approved: dict[str, dict] | None = None) -> dict:
+    """Decisions 03 and 04: BYTE_IDENTICAL, MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF,
+    MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF, STRUCTURAL_MISMATCH or REJECTED.
+    `reader_verified` is the reader conformance result (None: not run)."""
     if installed == recompiled:
         return {"classification": BYTE_IDENTICAL}
-    structure = compare_structure(installed, recompiled)
+    digest = hashlib.sha256(installed).hexdigest()
+    entry = (interning_approved or {}).get(name)
+    targets = entry["strings"] if entry is not None and entry["sha256"] == digest else None
+    structure = compare_structure(installed, recompiled, interning=targets)
     if not structure["parsed"]:
         return {"classification": REJECTED, "reason": "not parsable", "structure": structure}
     if not structure["equivalent"]:
+        interning = structure.get("approved_interning")
+        if interning is not None and interning["ok"]:
+            if reader_verified is not True:
+                return {"classification": REJECTED, "reason": "reader conformance not established",
+                        "structure": structure}
+            return {"classification": INTERNING_EQUIVALENT,
+                    "reason": "header identical; the trees differ only in the interned flag "
+                              "(Z / z) of the strings approved by Decision 04",
+                    "structure": structure}
         reason = "header differs" if not structure["header_identical"] else "code differs"
+        if interning is not None:
+            reason += "; the Decision 04 interning rule is not met"
         return {"classification": STRUCTURAL_MISMATCH, "reason": reason, "structure": structure}
     if approved.get(name) != hashlib.sha256(installed).hexdigest():
         return {"classification": REJECTED, "reason": "equivalent, but not approved by Decision 03",
@@ -1031,7 +1181,8 @@ ORACLE_SOURCE = '''\
 import os as _os
 SHARED = "shared constant, not an identifier!"
 WIDE = "été 中"
-LONG = """%s"""
+LONG = """@LONG@"""
+LONG_PLAIN = """@LONG_PLAIN@"""
 BIG = 1 << 100
 NEG = -(1 << 70)
 VALUES = (1, 2.5, -0.0, 3j, b"\\x00\\xff", None, True, False, ..., (1, (2, "z")))
@@ -1051,12 +1202,15 @@ class Klass(dict):
     attribute: int = 3
     def method(self, *, flag=False):
         return [n * 2 for n in range(4) if n] + [lambda: self]
-''' % ("y" * 300)
+'''.replace("@LONG@", "y" * 300).replace("@LONG_PLAIN@", "y " * 150)
 ORACLE_VARIANT = ORACLE_SOURCE.replace("e=2", "e=3")
 #: Marshal types ORACLE_SOURCE produces: code, small tuple, interned / plain short and
 #: long ASCII, non-ASCII str, int, long, float, complex, bytes, frozenset ({1, 2, 3}),
-#: slice ([0:2:1], folded since 3.14), the singletons and TYPE_REF.
-ORACLE_TAGS = frozenset("c)Zzauilgys>:NTF.r")
+#: slice ([0:2:1], folded since 3.14), the singletons and TYPE_REF. Long ASCII: LONG is
+#: identifier-like, so the compiler interns it (should_intern_string in
+#: Objects/codeobject.c) and the writer emits TYPE_ASCII_INTERNED ('A'); LONG_PLAIN has
+#: spaces, is not interned, and is emitted as TYPE_ASCII ('a').
+ORACLE_TAGS = frozenset("c)ZzAauilgys>:NTF.r")
 
 
 def describe_live(obj: Any) -> Any:
@@ -1270,10 +1424,11 @@ def recompile_and_compare(ctx: Context, comparison: Comparison, manifest: Manife
                 "flags": struct.unpack("<I", installed[4:8])[0] if len(installed) >= 8 else None,
             }
             row.update(classify_pyc(job.installed, installed, produced,
-                                    settings.ref_layout_approved, verified))
+                                    settings.ref_layout_approved, verified,
+                                    settings.interning_approved))
             mismatches.append(row)
         counts = {"total": len(jobs), BYTE_IDENTICAL: identical, REF_LAYOUT_EQUIVALENT: 0,
-                  STRUCTURAL_MISMATCH: 0, REJECTED: 0}
+                  INTERNING_EQUIVALENT: 0, STRUCTURAL_MISMATCH: 0, REJECTED: 0}
         for row in mismatches:
             counts[row["classification"]] += 1
         return {"probe": probe, "interpreter": report, "jobs": len(jobs), "identical": identical,
@@ -1336,7 +1491,7 @@ def gate4_runtime(ctx: Context) -> GateResult:
                 and installed_magic <= {interpreter["magic"]})
     evidence["identity"] = identity
     counts = recompiled["classification"]
-    accepted = counts[BYTE_IDENTICAL] + counts[REF_LAYOUT_EQUIVALENT]
+    accepted = counts[BYTE_IDENTICAL] + counts[REF_LAYOUT_EQUIVALENT] + counts[INTERNING_EQUIVALENT]
     ok = identity and not interpreter["errors"] and counts[STRUCTURAL_MISMATCH] == 0 \
         and counts[REJECTED] == 0 and accepted == counts["total"] == recompiled["jobs"]
     return GateResult("4", "local Python runtime", PASS if ok else FAIL, evidence)
