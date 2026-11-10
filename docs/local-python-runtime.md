@@ -53,6 +53,13 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 各項目は、それより前の項目がこの実行の中ですべて合格していなければ実行されない(script内で強制し、呼び出されても `GateOrderError` で止まる)。最初の不合格(FAIL・BLOCKED)で止まり、残りは `NOT_RUN` になる。以前の実行結果は再利用しない。終了コードは、全項目合格なら0、FAILがあれば1、BLOCKED等なら2。scriptはインストール済みのCPython 3.14以外のinterpreter(macOSのsystem Python等)で実行する。インストール済みのPython本体を最初に実行するのは項目5で、項目1〜4がすべて合格した後である。`<archive名>` は上記「構成」のarchiveのfile名、`<archive>` は取得したfileのpath、`$PY314` は上記「作成と確認」のPython本体。
 
+scriptが追加で行うこと(Phase 3H-R6 Decision 05):
+
+- 手順0のうちscriptが確認するのは、使用する外部tool(`git`・`gh`・`find`・`sort`・`xargs`・`shasum`)の解決と、上記pathに未commitの変更がないことだけ。「mainに変更が含まれていること・意図したbranchとcommitであること」は実行する人が確認する(reportにcommitを記録する)。
+- 外部toolは継承した `PATH` では探さない。信頼するdirectory(macOS: `/usr/bin`・`/bin`・`/usr/sbin`・`/sbin`・`/opt/homebrew/bin`、Linux: `/usr/bin`・`/bin`・`/usr/local/bin`)から順に探し、実体(symlinkを解決したpath)が信頼するroot(Homebrewは `/opt/homebrew/Cellar` を含む)の中にあり、通常の実行fileで、group・他人が書き込めず、所有者がrootか実行者で、そのdirectoryが他人に書き込めず所有者がrootか実行者であることを確認する。満たさなければBLOCKED。実行時の `PATH` も信頼するdirectoryだけにする。各toolのpath・実体・sha256・mode、`git`・`gh` のversion、継承した `PATH` なら別のものが実行されていたtoolをreportに記録する(Homebrewの `/opt/homebrew/bin` はadmin groupが書き込めることも記録される)。
+- 項目1はarchiveをsymlinkを追わずに一度だけ読み、そのbyte列のsha256を確認する。以後の項目はそのbyte列だけを使う(項目3の `gh attestation verify` は、そのbyte列を書いた一時directoryの読み取り専用の複製に対して行い、前後でsha256を確認する。項目4の検査・展開もそのbyte列から行う)。元のpathのfileは、項目2・3・4の開始時と項目4の終了時に、device・inode・大きさ・更新時刻・内容が項目1と同じかを確認し、違えばFAIL。展開した全fileは、archiveの内容(sha256)・種類・symlinkの参照先と照合し、再compile・検査のprocessの実行後にも再度照合する。
+- reportの `metadata` に、commit・scriptのsha256・開始と終了の時刻・archiveのpath・sha256・大きさ・device・inodeを記録する。
+
 | # | 確認項目 | 確認方法 | 合格条件 | 実行方法 |
 |---|---|---|---|---|
 | 1 | Python配布archiveのSHA-256 | 同じarchiveを、リポジトリ外の新しい空directoryへ取得し直す(`gh release download 20261026 -R astral-sh/python-build-standalone -p '<archive名>' -D <dir>`)。`shasum -a 256 <archive>` | 上記「構成」のsha256と一致。`~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/ARCHIVE_SHA256` もこの値と一致(このfileは本体と同じくユーザーが書き込めるため、基準にしない) | script(archiveの取得は手動) |
@@ -66,7 +73,7 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 
 **項目4の判定**(Phase 3H-R6で定義を修正。理由は下記「既知の差異・残課題」):
 
-1. archiveの全memberの検査: 絶対path・`..`・`python/` 以外の場所・重複member・symlinkのmemberの下のmember・archive外を指すsymlink・hardlink・通常file/directory/symlink以外の種類・setuid/setgid/sticky・誰でも書き込めるmodeが1件でもあればFAIL。
+1. archiveの全memberの検査: 絶対path・`..`・`python/` 以外の場所・重複member・file/symlinkのmemberの下のmember(memberの順序によらない)・hardlink・通常file/directory/symlink以外の種類・setuid/setgid/sticky・誰でも書き込めるmodeが1件でもあればFAIL。symlinkは、host側のfilesystemを参照せず、archiveのmemberから作った仮想のtreeの上で1段ずつ解決する(相対pathの `..`、symlinkの連鎖を最大40段まで)。絶対pathの参照先(連鎖の途中を含む)・`python/` の外へ出る参照・循環・archiveに無い名前への参照・fileを途中に含むpathが1件でもあればFAIL。展開先でも、すべてのentry(symlinkを含む)の実体が展開先の中にあることを確認する。
 2. `.pyc` 以外の全member(1,698件)について、インストール済みの対応entryと、種類・内容のsha256・symlinkの参照先・実行bitが一致すること。symlinkは追わない(`lstat`)。不足があればFAIL。
 3. archiveに無いentryは、archiveのdirectoryの下の `__pycache__` directory(`__pycache__` の中の `__pycache__` は不可)と、`<名前>.cpython-314[.opt-1|.opt-2].pyc`(対応する `.py` がarchiveにあり、実行bitの無い通常file)だけを許す。それ以外(symlink、拡張module、別versionのcache等)はFAIL。生成された `.pyc` は件数を記録する。
 4. すべての `.pyc`(archive同梱の3件と、実行時に生成されたもの)を再compileして比較する: 検査済みのarchiveを一時directoryへ安全に展開し(上書き・link追従なし)、その展開先のCPython 3.14.10を、macOSのsandbox(`sandbox-exec`。network・home directoryの読み取り・一時directory外への書き込みを拒否)の中で `-I -B -S`・最小限の環境変数で実行する。sandboxが使えない、または使う前の検査(networkへの接続・home directoryの読み取り・外への書き込みが拒否され、一時directoryへの書き込みはできること)で確認できなければBLOCKED。再compileは `py_compile`(timestamp方式、file名の `opt-N` に対応する最適化level、`dfile` はインストール済みのsourceのpath、出力は一時directoryの中だけ)で行い、sourceの更新時刻はインストール済みのsourceに合わせる(一時directoryの複製だけを変更する)。
@@ -78,6 +85,8 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
    - `REJECTED`: 解析できない(未対応の型・未知のtag・不正な参照・途中で終わる・余分なbyte・上限超過等)、または同等だが承認の対象外・readerの検査が不合格。
 
    readerが受け付ける型は、compileされたmoduleに現れるものだけ(None・True・False・Ellipsis・int・float・complex・bytes・str・tuple・frozenset・slice・code)。list・dict・set・`TYPE_NULL`・version 0の表現・未知のtagや、読み込み途中のobjectへの参照はREJECTED。上限: 入力8 MiB、object数100万、入れ子の深さ100(参照を解決した後は150)、tuple・frozensetの要素数100万、str・bytesの長さ8 MiB、参照数100万、整数の桁数2,000(15 bit単位)。4件の大きさは27,707〜171,917 byte。frozensetは要素の順序も比較する(CPythonのwriterは要素を各要素のmarshal出力の順に並べるため、参照配置の違いで順序が変わり、同等でも `STRUCTURAL_MISMATCH` になる可能性がある。安全側の誤判定)。
+
+インストール済みのfileのmodeは、実行bit以外はarchiveと比較しない。誰でも書き込めるfileがあればFAILとし、groupが書き込めるfileは件数を記録する。項目5は、`.venv-py314-r5/bin/python` の実体がインストール済みのPython本体の `bin` の中にあることを、実行する前に確認する。項目6・7は、実行前に仮想環境の `.pth` file(interpreterの起動時に実行される)の名前とsha256を記録する(判定には使わない。残課題)。
 
 インストール済みのPython本体・`.pyc`・2つの仮想環境は読むだけで、変更・削除しない。一時directoryは最後に削除する。再compileの一致は、archiveの真正性(項目1〜3)と組み合わせて意味を持つ(展開先のinterpreterも、比較元のsourceも、検証済みのarchiveのもの)。第三者buildそのものの安全性を示すものではない。
 
@@ -126,4 +135,5 @@ PY314="$HOME/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/p
 - Python本体に同梱されているpip(26.2.2)は、`setup_local_venv.py` からは実行しない。ただし環境の棚卸し時に一度だけ `python3.14 -I -m pip --version` で実行した(何もinstallしていない)。
 - 項目4の定義の修正(Phase 3H-R6): 以前の定義は、archive同梱の `.pyc` 3件を他のfileと同様に内容で比較し、それ以外の `.pyc` を比較前に削除するものだった。しかしarchiveの `.pyc` は、build時のsourceの更新時刻(1793023270)を記録している一方、archive内のsourceの更新時刻は1704067200に正規化されているため、初回の実行でCPythonが作り直す。作り直した `.pyc` はsourceのpath(`co_filename`。archiveではbuild machineの一時path)も異なる。このため以前の定義は一度でも実行したruntimeでは必ずFAILし、削除も読み取り専用の確認と両立しない。修正後は、`.pyc` をすべて検証済みのsourceから隔離環境で作り直し、byte単位で比較する。
 - marshalの出力の非決定性(Phase 3H-R6、Decision 03): 修正後の定義で、365件のうち4件(`argparse`・`inspect`・`typing`・`weakref`)がbyte単位で一致しなかった。CPythonのmarshalは、参照が1つだけのobjectには `FLAG_REF` を付けず、interned文字列には常に付けるため、出力がcompileしたprocessの参照数や文字列のinterned状態に依存する(`Python/marshal.c` の `w_ref`)。このためDecision 03で、上記の4件に限り、構造の比較(`MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF`)を認めた。その比較の結果、4件の違いは参照の配置だけでなく、入れ子のclassの `__qualname__` 定数の文字列(計5つ)のinternedの印だった(Decision 03の規則ではFAIL)。Decision 04で、その5つに限り `MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF` を認めた。この許容は、D-1(bootstrapの信頼境界)の解消を意味しない。readerはCPython 3.14.10のmarshal形式(`PYC_MAGIC_NUMBER` 3627、marshal version 5)に依存するため、Pythonのversionを上げる場合はreaderとその検査を見直す必要がある(保守上の残リスク)。
+- 仮想環境へのcacheの書き込み(Phase 3H-R6 F01): Phase 3H-R6の検証中、`.venv-py314-r5` でtest全体を実行した際、`tests/test_network_isolation_guard.py` が `pytester.runpytest_subprocess` で起動する子のpytest(`-B` なし)が、自動で読み込まれるplugin(`anyio`・`pytest_httpx`)と `_pytest` のassertion rewriteのcache 38件(`*.cpython-314-pytest-8.4.2.pyc`)を `.venv-py314-r5` のsite-packagesへ書き込んだ(無承認の変更。既存fileの変更・削除はなし)。Human Acceptance Decision 05の承認を得て、その38件だけを、生成前のsnapshotとの差分・内容・header・`lstat` の再確認のうえで削除し、`.venv-py314-r5` がPhase 3H-R6開始時のsnapshotと一致することを確認した(`__pycache__` directoryの更新時刻は変わっている)。再発防止: その子のpytestには `PYTHONDONTWRITEBYTECODE=1` を渡す(pytestのassertion rewriteは `sys.dont_write_bytecode` のときcacheを書かない)。合成のplugin・testで、子のpytestがcacheを書かないことを確認するtestがある(`tests/test_bytecode_cache_isolation.py`)。ローカルで既存の仮想環境を使ってtest全体を実行するときは、`.env` の無いclone(または `git ls-files` による複製)で、`PYTHONDONTWRITEBYTECODE=1`・`PYTHONPYCACHEPREFIX=<リポジトリ外の一時directory>` を設定し、`-I -B -p no:cacheprovider` を付けて実行し、前後で仮想環境のsnapshotを比較する。
 - 環境変数(C-2・C-3): `load_dotenv()` は既に設定されている環境変数を上書きしないため、CLIを起動するshellに `NOTION_*` があれば `.env` より優先される(空の値でも `.env` の値は使われない)。console script(`.venv-py314-r5/bin/mtg-notion-manager` 等)はinterpreterを `-I` なしで起動するため、`PYTHONPATH` 等の `PYTHON*` 環境変数もCLIに影響する。どちらも合成値のテストで確認した(`tests/test_config_env_precedence.py`)。提案(未実施・未承認): 切り替え後の起動は、許可した環境変数だけを渡す形(例: `env -i HOME="$HOME" PATH=/usr/bin:/bin .venv-py314-r5/bin/mtg-notion-manager ...`)にする。

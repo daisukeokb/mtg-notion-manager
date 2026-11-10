@@ -398,7 +398,22 @@ _NUMERIC_LOOKUP = "socket.getaddrinfo('192.0.2.1', 80, flags=socket.AI_NUMERICHO
 def _run_inner_pytest(pytester: Any, test_source: str) -> Any:
     shutil.copy(REPO_ROOT / "conftest.py", pytester.path / "conftest.py")
     pytester.makepyfile(test_inner=test_source)
-    return pytester.runpytest_subprocess("-q", "-p", "no:cacheprovider")
+    # The child pytest is started without -B: without this, it writes bytecode and
+    # assertion-rewrite caches of the autoloaded plugins (anyio, pytest_httpx) into the
+    # virtual environment running the tests (Phase 3H-R6 F01).
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("PYTHONDONTWRITEBYTECODE", "1")
+        return pytester.runpytest_subprocess("-q", "-p", "no:cacheprovider")
+
+
+def test_inner_pytest_writes_no_bytecode(network_guard: Any, pytester: Any) -> None:
+    result = _run_inner_pytest(
+        pytester,
+        "import os, sys\n\ndef test_env():\n"
+        "    assert os.environ['PYTHONDONTWRITEBYTECODE'] == '1'\n"
+        "    assert sys.dont_write_bytecode\n",
+    )
+    result.assert_outcomes(passed=1)
 
 
 def test_guard_active_during_collection(network_guard: Any, pytester: Any) -> None:

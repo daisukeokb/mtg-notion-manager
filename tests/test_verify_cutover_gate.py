@@ -123,7 +123,11 @@ def _context(tmp: Path, archive: Path, runtime_dir: Path, *, passed: list[str] |
         gate.Settings(**options), run or gate.default_run,
         isolation or (lambda work: _LocalIsolation(work, [], {**environment, "HOME": str(work)})),
         interpreter=lambda fresh: Path(sys.executable),
-        passed=["step0", "1", "2", "3"] if passed is None else passed)
+        passed=["step0", "1", "2", "3"] if passed is None else passed,
+        # Bare names: the answers of _FakeRun; resolution has its own tests.
+        tools={name: name for name in gate.TOOLS},
+        # As item 1 leaves it (item 1 reads it again when it runs).
+        artifact=gate.read_artifact(archive) if archive.is_file() else None)
 
 
 @pytest.fixture
@@ -562,6 +566,11 @@ def test_invalid_provenance_fails(tmp_path: Path, installed: tuple[Path, Path],
 
 def _after_gate4(tmp: Path, installed: tuple[Path, Path], run: Any, upto: str) -> Any:
     ids = list(gate.GATE_IDS[:gate.GATE_IDS.index(upto)])
+    # Like a real venv, bin/python links into the (synthetic) runtime's bin.
+    venv_python = tmp / "venv" / "bin" / "python"
+    venv_python.parent.mkdir(parents=True, exist_ok=True)
+    if not venv_python.is_symlink():
+        venv_python.symlink_to(installed[1] / "python" / "bin" / "tool")
     return _context(tmp, *installed, passed=ids, run=run, new_venv=tmp / "venv",
                     legacy_venv=tmp / "legacy")
 

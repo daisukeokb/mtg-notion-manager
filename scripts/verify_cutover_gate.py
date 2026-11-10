@@ -27,10 +27,21 @@ MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF only if the headers are identical, both
 streams parse completely, their trees are identical once TYPE_REF is resolved,
 the reader has just been checked against the isolated interpreter's own marshal
 output, and the file is one of the four of REF_LAYOUT_APPROVED with the content
-the decision was taken on. Anything else is STRUCTURAL_MISMATCH or REJECTED,
-and FAIL. The installed runtime, its .pyc files and
+the decision was taken on. MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF (Decision
+04) additionally allows exactly the five interned-flag differences of
+INTERNING_APPROVED, at their positions. Anything else is STRUCTURAL_MISMATCH or
+REJECTED, and FAIL. The installed runtime, its .pyc files and
 both virtual environments are only read. If the sandbox is not available or the
 probe does not show it working, item 4 is BLOCKED.
+
+Archive members are checked once all are known (order-independent), and every
+symlink is resolved, hop by hop, inside the archive's own tree (R6-F02). Item 1
+reads the archive once into memory; items 3 and 4 use those bytes only, and a
+change of the file at the path during the run is a FAIL; every extracted file is
+hashed again against the archive (R6-F03). git, gh, find, sort, xargs and
+shasum are resolved in trusted directories only, never through the inherited
+PATH (R6-F04). The report records the commit, this script's sha256, the archive
+and the time.
 
 The script reads no .env file and no credentials and does not contact Notion.
 It uses the network only through `gh` (items 2 and 3). It is a check, not an
@@ -45,7 +56,9 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import hashlib
+import io
 import json
 import os
 import platform
@@ -109,6 +122,11 @@ class Settings:
         default_factory=lambda: dict(REF_LAYOUT_APPROVED))
     interning_approved: dict[str, dict] = dataclasses.field(
         default_factory=lambda: dict(INTERNING_APPROVED))
+    #: Where git, gh, find, sort, xargs and shasum may be taken from (R6-F04).
+    tool_dirs: tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: TRUSTED_TOOL_DIRS.get(sys.platform, ()))
+    tool_roots: tuple[str, ...] = dataclasses.field(
+        default_factory=lambda: TRUSTED_TOOL_ROOTS.get(sys.platform, ()))
 
     @property
     def runtime_root(self) -> Path:
@@ -126,6 +144,23 @@ class Context:
     manifest: Manifest | None = None
     #: The reader conformance check (run_oracle when None).
     oracle: Callable[..., dict] | None = None
+    #: name -> absolute path of the external tools; resolved by Step 0 when None.
+    tools: dict[str, str] | None = None
+    #: The environment the tools run with (PATH limited to the trusted directories).
+    tool_environment: dict[str, str] | None = None
+    #: The archive as read once by item 1 (R6-F03); every later use reads these bytes.
+    artifact: Artifact | None = None
+
+    def tool(self, name: str) -> str:
+        if self.tools is None or name not in self.tools:
+            raise GateError(f"{name} has not been resolved")
+        return self.tools[name]
+
+    def run_tool(self, name: str, args: list[str], **kwargs: Any
+                 ) -> subprocess.CompletedProcess:
+        if self.tool_environment is not None:
+            kwargs.setdefault("env", self.tool_environment)
+        return self.run([self.tool(name), *args], **kwargs)
 
 
 @dataclasses.dataclass
@@ -170,39 +205,193 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+# --- trusted external tools (R6-F04) ---------------------------------------------------------
+#
+# The tools are not looked up through the inherited PATH: each is taken from the first
+# trusted directory holding it, must resolve (symlinks followed) into a trusted root,
+# be a regular executable file not writable by group or others and owned by root or
+# the user running the gate, in directories owned by root or that user and not
+# writable by others. Anything else stops the run (BLOCKED). The tools run with PATH
+# limited to the trusted directories. Homebrew's bin directory is group-writable by
+# admin on macOS; that is recorded, not refused.
+
+TOOLS = ("git", "gh", "find", "sort", "xargs", "shasum")
+TRUSTED_TOOL_DIRS: dict[str, tuple[str, ...]] = {
+    "darwin": ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/bin"),
+    "linux": ("/usr/bin", "/bin", "/usr/local/bin"),
+}
+TRUSTED_TOOL_ROOTS: dict[str, tuple[str, ...]] = {
+    "darwin": ("/usr/bin", "/bin", "/usr/sbin", "/sbin", "/opt/homebrew/bin",
+               "/opt/homebrew/Cellar"),
+    "linux": ("/usr/bin", "/bin", "/usr/local/bin"),
+}
+
+
+class ToolUntrusted(Exception):
+    """An external tool could not be resolved to a trusted executable (BLOCKED)."""
+
+
+def _within(path: str, roots: tuple[str, ...]) -> bool:
+    return any(path == root or path.startswith(root.rstrip("/") + "/")
+               for root in (os.path.realpath(r) for r in roots))
+
+
+def resolve_tool(name: str, dirs: tuple[str, ...], roots: tuple[str, ...]) -> dict[str, Any]:
+    owners = (0, os.getuid())
+    for directory in dirs:
+        candidate = os.path.join(directory, name)
+        if not os.path.lexists(candidate):
+            continue
+        real = os.path.realpath(candidate)
+        if not _within(real, roots):
+            raise ToolUntrusted(f"{candidate} resolves outside the trusted roots: {real}")
+        info = os.stat(real)
+        if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
+            raise ToolUntrusted(f"{real} is not an executable regular file")
+        if info.st_mode & 0o022 or info.st_uid not in owners:
+            raise ToolUntrusted(f"{real} is writable by others or owned by another user")
+        folders = {}
+        for folder in sorted({os.path.dirname(real), os.path.realpath(directory)}):
+            folder_info = os.stat(folder)
+            if folder_info.st_mode & 0o002 or folder_info.st_uid not in owners:
+                raise ToolUntrusted(f"{folder} is world-writable or owned by another user")
+            folders[folder] = oct(folder_info.st_mode & 0o7777)
+        return {"path": candidate, "realpath": real, "sha256": sha256_file(Path(real)),
+                "mode": oct(info.st_mode & 0o7777), "owner_uid": info.st_uid,
+                "directories": folders}
+    raise ToolUntrusted(f"{name} is not in any trusted directory {list(dirs)}")
+
+
+def resolve_tools(ctx: Context) -> dict[str, Any]:
+    """Step 0: resolve every tool (or raise ToolUntrusted) and record what was resolved."""
+    settings = ctx.settings
+    records = {name: resolve_tool(name, settings.tool_dirs, settings.tool_roots)
+               for name in TOOLS}
+    ctx.tools = {name: record["path"] for name, record in records.items()}
+    ctx.tool_environment = {**os.environ, "PATH": os.pathsep.join(settings.tool_dirs)}
+    for name in ("git", "gh"):
+        version = ctx.run_tool(name, ["--version"])
+        records[name]["version"] = (version.stdout or "").splitlines()[:1]
+    shadowed = {}
+    for name in TOOLS:  # what the inherited PATH would have run (recorded, never used)
+        found = shutil.which(name)
+        if found is not None and os.path.realpath(found) != records[name]["realpath"]:
+            shadowed[name] = found
+    return {"tools": records, "inherited_path_would_differ": shadowed}
+
+
+# --- the verified archive (R6-F03) ------------------------------------------------------------
+#
+# Item 1 reads the archive once, without following a symlink, into memory, and hashes
+# those bytes. Every later use (the provenance check on a private read-only copy, the
+# archive validation, the extraction) works on these bytes, never on the path again.
+# The file at the path is checked to be unchanged (same device, inode, size, mtime and
+# content) at the start of items 2, 3 and 4 and at the end of item 4: a change is a
+# FAIL. Every extracted file is hashed again against the manifest.
+
+ARCHIVE_SIZE_LIMIT = 1 << 30
+
+
+@dataclasses.dataclass
+class Artifact:
+    path: str
+    sha256: str
+    size: int
+    identity: tuple[int, int, int, int]  # st_dev, st_ino, st_size, st_mtime_ns
+    data: bytes = dataclasses.field(repr=False)
+
+    def evidence(self) -> dict[str, Any]:
+        return {"path": self.path, "sha256": self.sha256, "size": self.size,
+                "device": self.identity[0], "inode": self.identity[1],
+                "mtime_ns": self.identity[3]}
+
+
+def _identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
+def read_artifact(path: Path) -> Artifact:
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise GateError(f"archive not readable (or a symlink): {path}: {exc}") from exc
+    with os.fdopen(descriptor, "rb") as handle:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise GateError(f"archive is not a regular file: {path}")
+        if before.st_size > ARCHIVE_SIZE_LIMIT:
+            raise GateError(f"archive larger than {ARCHIVE_SIZE_LIMIT} bytes: {path}")
+        data = handle.read(ARCHIVE_SIZE_LIMIT + 1)
+        after = os.fstat(handle.fileno())
+    if _identity(before) != _identity(after) or len(data) != before.st_size:
+        raise GateError(f"archive changed while it was read: {path}")
+    return Artifact(str(path), hashlib.sha256(data).hexdigest(), len(data), _identity(before),
+                    data)
+
+
+def artifact_source_changed(ctx: Context) -> str | None:
+    """None if the file at the archive path is still the one item 1 read; else why not."""
+    artifact = ctx.artifact
+    if artifact is None:
+        raise GateError("the archive has not been read by item 1")
+    try:
+        info = os.lstat(artifact.path)
+    except OSError as exc:
+        return f"archive no longer readable: {exc}"
+    if _identity(info) != artifact.identity:
+        return "archive file replaced or modified (device, inode, size or mtime differ)"
+    if sha256_file(Path(artifact.path)) != artifact.sha256:
+        return "archive content differs from the bytes verified by item 1"
+    return None
+
+
 # --- Step 0, items 1-3 ----------------------------------------------------------------
 
 
 @requires()
 def step0_clean_tree(ctx: Context) -> GateResult:
-    result = ctx.run(["git", "status", "--short", "--", *STEP0_PATHS], cwd=str(ctx.settings.repo))
+    """Step 0 as far as the script can check it: the trusted tools, and no uncommitted
+    change under the paths the cutover uses. That main contains the change and that the
+    intended branch and commit are checked out stays with the person running the gate
+    (the report records the commit)."""
+    tools = resolve_tools(ctx) if ctx.tools is None else {"tools": "provided by the caller"}
+    result = ctx.run_tool("git", ["status", "--short", "--", *STEP0_PATHS],
+                          cwd=str(ctx.settings.repo))
     if result.returncode != 0:
         raise GateError(f"git status failed ({result.returncode})")
     changed = [line for line in result.stdout.splitlines() if line.strip()]
     return GateResult("step0", "clean tree", FAIL if changed else PASS,
-                      {"paths": list(STEP0_PATHS), "changed": changed})
+                      {"paths": list(STEP0_PATHS), "changed": changed, **tools})
+
+
+def _changed_result(gate: str, name: str, ctx: Context) -> GateResult | None:
+    problem = artifact_source_changed(ctx)
+    return None if problem is None else GateResult(gate, name, FAIL, {"archive": problem})
 
 
 @requires("step0")
 def gate1_archive_sha256(ctx: Context) -> GateResult:
     archive = ctx.settings.archive
-    if not archive.is_file() or archive.is_symlink():
-        raise GateError(f"archive not found (or not a regular file): {archive}")
-    actual = sha256_file(archive)
+    ctx.artifact = read_artifact(archive)
+    actual = ctx.artifact.sha256
     record = ctx.settings.runtime_dir / "ARCHIVE_SHA256"
     recorded = record.read_text(encoding="utf-8").strip() if record.is_file() else None
     ok = archive.name == ARCHIVE_NAME and actual == ctx.settings.archive_sha256 \
         and recorded == ctx.settings.archive_sha256
     return GateResult("1", "archive SHA-256", PASS if ok else FAIL,
                       {"name": archive.name, "sha256": actual,
-                       "expected": ctx.settings.archive_sha256, "ARCHIVE_SHA256": recorded})
+                       "expected": ctx.settings.archive_sha256, "ARCHIVE_SHA256": recorded,
+                       "artifact": ctx.artifact.evidence()})
 
 
 @requires("step0", "1")
 def gate2_release_digest(ctx: Context) -> GateResult:
+    changed = _changed_result("2", "release asset digest", ctx)
+    if changed is not None:
+        return changed
     query = f'.assets[] | select(.name=="{ARCHIVE_NAME}") | .digest'
-    result = ctx.run(["gh", "api", f"repos/{RELEASE_REPO}/releases/tags/{RELEASE_TAG}",
-                      "--jq", query])
+    result = ctx.run_tool("gh", ["api", f"repos/{RELEASE_REPO}/releases/tags/{RELEASE_TAG}",
+                                 "--jq", query])
     if result.returncode != 0:
         raise GateError(f"gh api failed ({result.returncode})")
     digest = result.stdout.strip()
@@ -213,10 +402,30 @@ def gate2_release_digest(ctx: Context) -> GateResult:
 
 @requires("step0", "1", "2")
 def gate3_provenance(ctx: Context) -> GateResult:
-    result = ctx.run(["gh", "attestation", "verify", str(ctx.settings.archive), "-R",
-                      RELEASE_REPO, "--signer-workflow", SIGNER_WORKFLOW, "--format", "json"])
+    changed = _changed_result("3", "provenance", ctx)
+    if changed is not None:
+        return changed
+    assert ctx.artifact is not None
+    # gh reads a private read-only copy of the verified bytes, never the original path.
+    private = Path(tempfile.mkdtemp(prefix="r6-artifact-", dir=ctx.settings.work_parent))
+    try:
+        snapshot = private / ARCHIVE_NAME
+        descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o400)
+        with os.fdopen(descriptor, "wb") as out:
+            out.write(ctx.artifact.data)
+        before = sha256_file(snapshot)
+        result = ctx.run_tool("gh", ["attestation", "verify", str(snapshot), "-R",
+                                     RELEASE_REPO, "--signer-workflow", SIGNER_WORKFLOW,
+                                     "--format", "json"])
+        after = sha256_file(snapshot)
+    finally:
+        shutil.rmtree(private, ignore_errors=True)
+    copy = {"verified_copy_sha256_before": before, "verified_copy_sha256_after": after}
+    if not before == after == ctx.artifact.sha256:
+        return GateResult("3", "provenance", FAIL, {"archive": "verified copy changed", **copy})
     if result.returncode != 0:
-        return GateResult("3", "provenance", FAIL, {"exit": result.returncode})
+        return GateResult("3", "provenance", FAIL, {"exit": result.returncode, **copy})
     try:
         verified = json.loads(result.stdout)
         subjects = {s["digest"]["sha256"] for entry in verified
@@ -228,7 +437,7 @@ def gate3_provenance(ctx: Context) -> GateResult:
     ok = bool(verified) and ctx.settings.archive_sha256 in subjects and signers == {SIGNER_URI}
     return GateResult("3", "provenance", PASS if ok else FAIL,
                       {"attestations": len(verified), "signers": sorted(signers),
-                       "subject_matches": ctx.settings.archive_sha256 in subjects})
+                       "subject_matches": ctx.settings.archive_sha256 in subjects, **copy})
 
 
 # --- item 4: archive validation and tree comparison -------------------------------------
@@ -248,12 +457,74 @@ class Entry:
 Manifest = dict  # archive path -> Entry
 
 
-def validate_archive(archive: Path) -> Manifest:
-    """Every member of the archive, after the safety checks; raises GateError otherwise."""
+MAX_SYMLINK_HOPS = 40
+
+
+def _open_archive(source: bytes | Path) -> tarfile.TarFile:
+    if isinstance(source, bytes):
+        return tarfile.open(fileobj=io.BytesIO(source), mode="r:gz")
+    return tarfile.open(source, "r:gz")
+
+
+def resolve_member_link(manifest: Manifest, name: str, implied: set[str] | None = None
+                        ) -> str | None:
+    """Resolve the symlink `name` inside the archive's own tree (the host filesystem is
+    never consulted). Returns the problem, or None if it ends on an existing member of
+    the archive below python/. Every hop is followed: relative components, '..', chains
+    of symlinks; an absolute target, a step above python/, a cycle, more than
+    MAX_SYMLINK_HOPS hops, a missing name or a path through a file is a problem."""
+    if implied is None:
+        implied = implied_directories(manifest)
+
+    def kind_of(path: str) -> str | None:
+        if path in manifest:
+            return manifest[path].kind
+        return "dir" if path in implied else None
+
+    stack = name.split("/")[:-1]
+    pending = list(reversed(manifest[name].target.split("/")))
+    if manifest[name].target.startswith("/"):
+        return "absolute symlink target"
+    seen, hops = {name}, 0
+    while pending:
+        part = pending.pop()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if len(stack) <= 1:  # would leave python/
+                return "symlink escapes the archive"
+            stack.pop()
+            continue
+        stack.append(part)
+        current = "/".join(stack)
+        kind = kind_of(current)
+        if kind == "link":
+            if current in seen:
+                return "symlink cycle"
+            seen.add(current)
+            hops += 1
+            if hops > MAX_SYMLINK_HOPS:
+                return "too many levels of symlinks"
+            target = manifest[current].target
+            if target.startswith("/"):
+                return "absolute symlink target in the chain"
+            stack.pop()
+            pending.extend(reversed(target.split("/")))
+        elif kind is None:
+            return "symlink to a name that is not in the archive"
+        elif kind == "file" and any(p not in ("", ".") for p in pending):
+            return "symlink path through a file"
+    return None if stack and stack[0] == ARCHIVE_ROOT else "symlink escapes the archive"
+
+
+def validate_archive(archive: bytes | Path) -> Manifest:
+    """Every member of the archive, after the safety checks; raises ArchiveRejected otherwise.
+    The checks of the tree (members below a non-directory, symlinks) run once every member
+    is known, so they do not depend on the order of the members."""
     manifest: dict[str, Entry] = {}
     problems: list[str] = []
     try:
-        tar = tarfile.open(archive, "r:gz")
+        tar = _open_archive(archive)
     except (tarfile.TarError, OSError) as exc:
         raise ArchiveRejected([f"unreadable archive: {exc}"]) from exc
     with tar:
@@ -268,10 +539,6 @@ def validate_archive(archive: Path) -> Manifest:
             if normalized in manifest:
                 problems.append(f"duplicate member: {normalized}")
                 continue
-            for i in range(1, len(parts)):
-                parent = manifest.get("/".join(parts[:i]))
-                if parent is not None and parent.kind != "dir":
-                    problems.append(f"member below a non-directory: {normalized}")
             if member.mode & 0o7002:
                 problems.append(f"special or world-writable mode {oct(member.mode)}: {normalized}")
             if member.isreg():
@@ -283,14 +550,23 @@ def validate_archive(archive: Path) -> Manifest:
             elif member.isdir():
                 manifest[normalized] = Entry("dir", mode=member.mode & 0o777)
             elif member.issym():
-                target = os.path.normpath(
-                    os.path.join(os.path.dirname(normalized), member.linkname))
-                if member.linkname.startswith("/") or not (
-                        target == ARCHIVE_ROOT or target.startswith(ARCHIVE_ROOT + "/")):
-                    problems.append(f"symlink escapes the archive: {normalized}")
                 manifest[normalized] = Entry("link", target=member.linkname)
             else:
                 problems.append(f"unexpected member type {member.type!r}: {normalized}")
+    names = sorted(manifest)
+    for name in names:
+        parts = name.split("/")
+        for i in range(1, len(parts)):
+            prefix = manifest.get("/".join(parts[:i]))
+            if prefix is not None and prefix.kind != "dir":
+                problems.append(f"member below a non-directory: {name}")
+                break
+    implied = implied_directories(manifest)
+    for name in names:
+        if manifest[name].kind == "link":
+            problem = resolve_member_link(manifest, name, implied)
+            if problem is not None:
+                problems.append(f"{problem}: {name}")
     if problems:
         raise ArchiveRejected(problems)
     return manifest
@@ -392,10 +668,44 @@ def compare_tree(manifest: Manifest, installed: dict[str, Entry], cache_tag: str
 # --- item 4: isolated recompilation --------------------------------------------------------
 
 
-def safe_extract(archive: Path, manifest: Manifest, destination: Path) -> None:
-    """Extract the validated archive into an empty directory (no overwrite, no link following)."""
+class ExtractionMismatch(Exception):
+    """The extracted tree is not what the verified archive contains (FAIL)."""
+
+
+def verify_extraction(manifest: Manifest, destination: Path) -> int:
+    """Every extracted entry against the manifest: type, content sha256, symlink target,
+    and every symlink resolving inside the destination. Returns the number of files."""
+    root = os.path.realpath(destination)
+    problems, files = [], 0
+    for name, entry in sorted(manifest.items()):
+        path = destination / name
+        try:
+            found = installed_entry(path)
+        except OSError as exc:
+            problems.append(f"{name}: {exc}")
+            continue
+        if found.kind != entry.kind:
+            problems.append(f"{name}: {found.kind} instead of {entry.kind}")
+        elif entry.kind == "file":
+            files += 1
+            if found.sha256 != entry.sha256:
+                problems.append(f"{name}: content differs from the verified archive")
+        elif entry.kind == "link":
+            real = os.path.realpath(path)
+            if found.target != entry.target:
+                problems.append(f"{name}: symlink target differs")
+            elif not real.startswith(root + os.sep):
+                problems.append(f"{name}: symlink resolves outside the extraction: {real}")
+    if problems:
+        raise ExtractionMismatch(problems[:20])
+    return files
+
+
+def safe_extract(archive: bytes | Path, manifest: Manifest, destination: Path) -> None:
+    """Extract the validated archive into an empty directory (no overwrite, no link following),
+    then check the result against the manifest (verify_extraction)."""
     destination.mkdir()
-    with tarfile.open(archive, "r:gz") as tar:
+    with _open_archive(archive) as tar:
         members = {member.name.rstrip("/"): member for member in tar}
         for name in sorted(manifest, key=lambda n: (n.count("/"), n)):
             entry = manifest[name]
@@ -418,12 +728,13 @@ def safe_extract(archive: Path, manifest: Manifest, destination: Path) -> None:
             if entry.kind == "link":
                 (destination / name).parent.mkdir(parents=True, exist_ok=True)
                 os.symlink(entry.target, destination / name)
+    root = os.path.realpath(destination)
     for directory, dirnames, filenames in os.walk(destination, followlinks=False):
-        for name in dirnames + filenames:
-            path = Path(directory) / name
-            if not str(path.resolve()).startswith(str(destination.resolve()) + os.sep) \
-                    and not path.is_symlink():
-                raise GateError(f"extraction left the destination: {path}")
+        for name in dirnames + filenames:  # symlinks included: no exemption
+            path = os.path.realpath(os.path.join(directory, name))
+            if not path.startswith(root + os.sep):
+                raise ExtractionMismatch([f"extraction leaves the destination: {path}"])
+    verify_extraction(manifest, destination)
 
 
 @dataclasses.dataclass
@@ -566,7 +877,7 @@ def compile_worker(jobs_file: str, result_file: str, out_dir: str) -> int:
 
 
 def first_difference(a: bytes, b: bytes) -> dict:
-    """Where two .pyc files differ (diagnostics only; any difference is a FAIL).
+    """Where two .pyc files differ (diagnostics only; classify_pyc decides).
 
     `flag_ref_bit_only` is true when the lengths are equal and every differing
     byte differs only in 0x80, marshal's FLAG_REF bit, which depends on the
@@ -1372,7 +1683,8 @@ def recompile_and_compare(ctx: Context, comparison: Comparison, manifest: Manife
         out_dir = work / "out"
         out_dir.mkdir()
         fresh = work / "fresh"
-        safe_extract(settings.archive, manifest, fresh)
+        assert ctx.artifact is not None
+        safe_extract(ctx.artifact.data, manifest, fresh)
         python = ctx.interpreter(fresh)
         isolation = ctx.isolation(work)
         probe = isolation.verify(ctx, python, settings.repo / "pyproject.toml")
@@ -1413,6 +1725,9 @@ def recompile_and_compare(ctx: Context, comparison: Comparison, manifest: Manife
         if pairs:
             oracle = (ctx.oracle or run_oracle)(ctx, isolation, python, work)
         verified = None if oracle["status"] == NOT_RUN else oracle["status"] == PASS
+        # The workers could write inside the work directory: the interpreter and the
+        # sources they used must still be the verified ones.
+        extracted_files = verify_extraction(manifest, fresh)
         mismatches = []
         for job, installed, produced in pairs:
             row = {
@@ -1432,6 +1747,7 @@ def recompile_and_compare(ctx: Context, comparison: Comparison, manifest: Manife
         for row in mismatches:
             counts[row["classification"]] += 1
         return {"probe": probe, "interpreter": report, "jobs": len(jobs), "identical": identical,
+                "extracted_files_verified": extracted_files,
                 "classification": counts, "mismatches": mismatches,
                 "reader": {"format": MARSHAL_FORMAT, "limits": dataclasses.asdict(MARSHAL_LIMITS),
                            "conformance": oracle}}
@@ -1458,29 +1774,50 @@ def run_oracle(ctx: Context, isolation: Isolation, python: Path, work: Path) -> 
 @requires("step0", "1", "2", "3")
 def gate4_runtime(ctx: Context) -> GateResult:
     settings = ctx.settings
+    name = "local Python runtime"
+    changed = _changed_result("4", name, ctx)
+    if changed is not None:
+        return changed
+    assert ctx.artifact is not None
     try:
-        manifest = validate_archive(settings.archive)
+        manifest = validate_archive(ctx.artifact.data)
     except ArchiveRejected as exc:
-        return GateResult("4", "local Python runtime", FAIL, {"archive": exc.problems})
+        return GateResult("4", name, FAIL, {"archive": exc.problems})
     ctx.manifest = manifest
     if not settings.runtime_root.is_dir() or settings.runtime_root.is_symlink():
         raise GateError(f"installed runtime not found: {settings.runtime_root}")
-    comparison = compare_tree(manifest, scan_installed(settings.runtime_root), settings.cache_tag)
+    installed = scan_installed(settings.runtime_root)
+    comparison = compare_tree(manifest, installed, settings.cache_tag)
+    world_writable = sorted(n for n, e in installed.items() if e.kind == "file" and e.mode & 0o002)
     evidence: dict[str, Any] = {
+        "artifact": ctx.artifact.evidence(),
         "archive_members": len(manifest),
         "regular_entries": sum(1 for name in manifest if not name.endswith(".pyc")),
         "missing": comparison.missing, "different": comparison.different,
         "unexpected": comparison.unexpected, "archived_pyc": len(comparison.archived_pyc),
         "generated_pyc": len(comparison.generated_pyc), "cache_dirs": len(comparison.cache_dirs),
+        # Permission bits other than the executable bit are not compared with the
+        # archive; group-writable files are recorded, world-writable ones fail.
+        "installed_group_writable_files": sum(
+            1 for e in installed.values() if e.kind == "file" and e.mode & 0o020),
+        "installed_world_writable_files": world_writable,
     }
-    if not comparison.ok:
-        return GateResult("4", "local Python runtime", FAIL, evidence)
+    if not comparison.ok or world_writable:
+        return GateResult("4", name, FAIL, evidence)
     try:
         recompiled = recompile_and_compare(ctx, comparison, manifest)
     except IsolationUnavailable as exc:
         evidence["isolation"] = str(exc)
-        return GateResult("4", "local Python runtime", BLOCKED, evidence)
+        return GateResult("4", name, BLOCKED, evidence)
+    except ExtractionMismatch as exc:
+        evidence["extraction"] = exc.args[0]
+        return GateResult("4", name, FAIL, evidence)
     evidence["recompilation"] = recompiled
+    changed = _changed_result("4", name, ctx)
+    if changed is not None:  # the archive must still be the verified one at the end
+        changed.evidence.update(evidence)
+        return changed
+    evidence["archive_unchanged_at_end"] = True
     interpreter = recompiled["interpreter"]
     installed_magic = {
         (settings.runtime_root / name[len(ARCHIVE_ROOT) + 1:]).read_bytes()[:4].hex()
@@ -1509,10 +1846,16 @@ def _venv(ctx: Context, name: str) -> Path:
 @requires("step0", "1", "2", "3", "4")
 def gate5_venv_resolution(ctx: Context) -> GateResult:
     runtime_python = ctx.settings.runtime_root / "bin" / "python3.14"
+    venv = _venv(ctx, "new_venv")
+    # Before running it: the venv's python must be a link into the verified runtime.
+    linked = os.path.realpath(venv / "bin" / "python")
+    runtime_bin = os.path.realpath(ctx.settings.runtime_root / "bin")
+    if not linked.startswith(runtime_bin + os.sep):
+        return GateResult("5", "venv resolution", FAIL,
+                          {"venv_python_resolves_to": linked, "expected_under": runtime_bin})
     identity = ctx.run([str(runtime_python), "-I", "-B", "-c",
                         "import platform; print(platform.python_implementation(), "
                         "platform.python_version(), platform.machine())"])
-    venv = _venv(ctx, "new_venv")
     resolved = ctx.run([str(venv / "bin" / "python"), "-I", "-B", "-c",
                         "import sys; print(sys.executable); print(sys.prefix); "
                         "print(sys.base_prefix)"])
@@ -1525,29 +1868,44 @@ def gate5_venv_resolution(ctx: Context) -> GateResult:
           and os.path.realpath(lines[1]) == expected_venv
           and os.path.realpath(lines[2]) == os.path.realpath(ctx.settings.runtime_root))
     return GateResult("5", "venv resolution", PASS if ok else FAIL,
-                      {"runtime": identity.stdout.strip(), "executable_prefix_base": lines})
+                      {"runtime": identity.stdout.strip(), "executable_prefix_base": lines,
+                       "venv_python_resolves_to": linked})
+
+
+def pth_files(venv: Path) -> dict[str, str]:
+    """The .pth files of the venv (they run at interpreter start): name -> sha256."""
+    return {str(path.relative_to(venv)): sha256_file(path)
+            for path in sorted(venv.glob("lib/python*/site-packages/*.pth"))}
 
 
 @requires("step0", "1", "2", "3", "4", "5")
 def gate6_7_lock_and_pip_check(ctx: Context) -> GateResult:
     venv = _venv(ctx, "new_venv")
+    executed = pth_files(venv)  # recorded before they run; not judged (residual risk)
     result = ctx.run([str(venv / "bin" / "python"), "-I", "-B",
                       str(ctx.settings.repo / "scripts" / "check_local_runtime.py")],
                      cwd=str(ctx.settings.repo))
     return GateResult("6-7", "lock consistency and pip check",
                       PASS if result.returncode == 0 else FAIL,
-                      {"exit": result.returncode, "output": result.stdout.strip().splitlines()})
+                      {"exit": result.returncode, "output": result.stdout.strip().splitlines(),
+                       "pth_files": executed})
 
 
-def legacy_fingerprint(run: Callable[..., subprocess.CompletedProcess], venv: Path) -> str:
-    """The documented pipeline, run with the same tools (find | sort -z | xargs shasum)."""
-    found = run(["find", ".", "-path", "./lib/python3.9/site-packages/__pycache__", "-prune",
-                 "-o", "-name", "*.pyc", "-prune", "-o", "-type", "f", "-print0"],
-                cwd=str(venv), text=False)
-    ordered = subprocess.run(["sort", "-z"], input=found.stdout, stdout=subprocess.PIPE,
-                             check=True)
-    listed = subprocess.run(["xargs", "-0", "shasum", "-a", "256"], input=ordered.stdout,
-                            stdout=subprocess.PIPE, cwd=str(venv), check=True)
+def legacy_fingerprint(ctx: Context, venv: Path) -> str:
+    """The documented pipeline (find | sort -z | xargs shasum) with the resolved tools; every
+    step's exit status is checked and every step has the run's timeout."""
+    found = ctx.run_tool("find", [".", "-path", "./lib/python3.9/site-packages/__pycache__",
+                                  "-prune", "-o", "-name", "*.pyc", "-prune", "-o", "-type", "f",
+                                  "-print0"], cwd=str(venv), text=False)
+    if found.returncode != 0:
+        raise GateError(f"find failed ({found.returncode})")
+    ordered = ctx.run_tool("sort", ["-z"], input=found.stdout, text=False)
+    if ordered.returncode != 0:
+        raise GateError(f"sort failed ({ordered.returncode})")
+    listed = ctx.run_tool("xargs", ["-0", ctx.tool("shasum"), "-a", "256"],
+                          input=ordered.stdout, cwd=str(venv), text=False)
+    if listed.returncode != 0:
+        raise GateError(f"xargs shasum failed ({listed.returncode})")
     return hashlib.sha256(listed.stdout).hexdigest()
 
 
@@ -1564,7 +1922,7 @@ def gate8_legacy(ctx: Context) -> GateResult:
         return GateResult("8", "legacy environment", FAIL, {"error": f"{python} not found"})
     version = ctx.run([str(python), "--version"])
     freeze = ctx.run([str(python), "-I", "-B", "-m", "pip", "freeze", "--all"])
-    fingerprint = legacy_fingerprint(ctx.run, venv)
+    fingerprint = legacy_fingerprint(ctx, venv)
     observed = {"version": (version.stdout or version.stderr).strip(),
                 "fingerprint": fingerprint,
                 "freeze": freeze_hash(freeze.stdout) if freeze.returncode == 0 else None}
@@ -1622,7 +1980,16 @@ def legacy_cli_worker(check_script: str) -> int:
 
 def rollback_readiness(settings: Settings, run: Callable[..., subprocess.CompletedProcess]
                        ) -> dict[str, Any]:
-    """Read-only: can the CLI be started from the legacy environment again?"""
+    """Read-only: can the CLI be started from the legacy environment again? An error in
+    the check is BLOCKED, never PASS."""
+    try:
+        return _rollback_readiness(settings, run)
+    except Exception as exc:  # noqa: BLE001 - fail closed
+        return {"status": BLOCKED, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _rollback_readiness(settings: Settings, run: Callable[..., subprocess.CompletedProcess]
+                        ) -> dict[str, Any]:
     legacy = settings.legacy_venv or settings.repo / ".venv"
     launcher = legacy / "bin" / "mtg-notion-manager"
     checks: dict[str, Any] = {"launcher": launcher.is_file() and not launcher.is_symlink()}
@@ -1657,6 +2024,22 @@ def environment_notice(environ: dict[str, str]) -> dict[str, list[str]]:
             "notion": sorted(k for k in environ if k.startswith("NOTION_"))}
 
 
+def utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def run_metadata(ctx: Context, started: str) -> dict[str, Any]:
+    """What was verified, with what: the commit, this script, the archive bytes, the time."""
+    commit = None
+    if ctx.tools is not None:
+        head = ctx.run_tool("git", ["rev-parse", "HEAD"], cwd=str(ctx.settings.repo))
+        commit = head.stdout.strip() if head.returncode == 0 else None
+    return {"commit": commit, "script_sha256": sha256_file(Path(__file__).resolve()),
+            "started_at": started, "finished_at": utc_now(),
+            "verifier_python": platform.python_version(),
+            "archive": ctx.artifact.evidence() if ctx.artifact is not None else None}
+
+
 def exit_status(results: list[GateResult]) -> int:
     statuses = {result.status for result in results}
     if statuses == {PASS}:
@@ -1678,13 +2061,15 @@ def main(argv: list[str]) -> int:
     if args.report is not None and (args.report.exists() or args.report.is_symlink()):
         print(f"refusing to overwrite {args.report}", file=sys.stderr)
         return 2
+    started = utc_now()
     ctx = Context(Settings(archive=args.archive.absolute()), default_run, macos_sandbox)
     results = run_gates(ctx)
     status = exit_status(results)
     rollback = rollback_readiness(ctx.settings, ctx.run) if status == 0 else {"status": NOT_RUN}
     if status == 0 and rollback["status"] != PASS:
-        status = 1
-    report = json.dumps({"gates": [dataclasses.asdict(result) for result in results],
+        status = 1 if rollback["status"] == FAIL else 2
+    report = json.dumps({"metadata": run_metadata(ctx, started),
+                         "gates": [dataclasses.asdict(result) for result in results],
                          "rollback_readiness": rollback,
                          "environment_notice": environment_notice(dict(os.environ))},
                         indent=2, ensure_ascii=False)
