@@ -571,6 +571,8 @@ def _after_gate4(tmp: Path, installed: tuple[Path, Path], run: Any, upto: str) -
     venv_python.parent.mkdir(parents=True, exist_ok=True)
     if not venv_python.is_symlink():
         venv_python.symlink_to(installed[1] / "python" / "bin" / "tool")
+        (tmp / "venv" / "pyvenv.cfg").write_text(
+            f"home = {installed[1] / 'python' / 'bin'}\n", encoding="utf-8")
     return _context(tmp, *installed, passed=ids, run=run, new_venv=tmp / "venv",
                     legacy_venv=tmp / "legacy")
 

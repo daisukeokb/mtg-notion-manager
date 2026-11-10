@@ -1843,16 +1843,51 @@ def _venv(ctx: Context, name: str) -> Path:
         "new_venv": ".venv-py314-r5", "legacy_venv": ".venv"}[name]
 
 
+def venv_python_origin(venv: Path, runtime_root: Path) -> dict[str, Any]:
+    """Without running it: is the venv's bin/python the verified runtime's interpreter?
+    A venv made with symlinks links into the runtime's bin; one made with --copies (as
+    .venv-py314-r5 is) holds a byte-identical copy of bin/python3.14. Either way,
+    pyvenv.cfg's home must be the runtime's bin."""
+    python = venv / "bin" / "python"
+    runtime_bin = os.path.realpath(runtime_root / "bin")
+    record: dict[str, Any] = {"ok": False}
+    try:
+        info = os.lstat(python)
+    except OSError as exc:
+        record["problem"] = f"{python}: {exc}"
+        return record
+    if stat.S_ISLNK(info.st_mode):
+        real = os.path.realpath(python)
+        record.update(kind="symlink", resolves_to=real)
+        matches = real.startswith(runtime_bin + os.sep)
+    elif stat.S_ISREG(info.st_mode):
+        digest = sha256_file(python)
+        expected = sha256_file(runtime_root / "bin" / "python3.14")
+        record.update(kind="copy", sha256=digest, runtime_python3_14_sha256=expected)
+        matches = digest == expected
+    else:
+        record["problem"] = "bin/python is neither a symlink nor a regular file"
+        return record
+    home = None
+    config = venv / "pyvenv.cfg"
+    if config.is_file() and not config.is_symlink():
+        for line in config.read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "home":
+                home = value.strip()
+    record["pyvenv_home"] = home
+    record["ok"] = matches and home is not None and os.path.realpath(home) == runtime_bin
+    return record
+
+
 @requires("step0", "1", "2", "3", "4")
 def gate5_venv_resolution(ctx: Context) -> GateResult:
     runtime_python = ctx.settings.runtime_root / "bin" / "python3.14"
     venv = _venv(ctx, "new_venv")
-    # Before running it: the venv's python must be a link into the verified runtime.
-    linked = os.path.realpath(venv / "bin" / "python")
-    runtime_bin = os.path.realpath(ctx.settings.runtime_root / "bin")
-    if not linked.startswith(runtime_bin + os.sep):
-        return GateResult("5", "venv resolution", FAIL,
-                          {"venv_python_resolves_to": linked, "expected_under": runtime_bin})
+    # Before running it: the venv's python must be the verified runtime's interpreter.
+    origin = venv_python_origin(venv, ctx.settings.runtime_root)
+    if not origin["ok"]:
+        return GateResult("5", "venv resolution", FAIL, {"venv_python": origin})
     identity = ctx.run([str(runtime_python), "-I", "-B", "-c",
                         "import platform; print(platform.python_implementation(), "
                         "platform.python_version(), platform.machine())"])
@@ -1869,7 +1904,7 @@ def gate5_venv_resolution(ctx: Context) -> GateResult:
           and os.path.realpath(lines[2]) == os.path.realpath(ctx.settings.runtime_root))
     return GateResult("5", "venv resolution", PASS if ok else FAIL,
                       {"runtime": identity.stdout.strip(), "executable_prefix_base": lines,
-                       "venv_python_resolves_to": linked})
+                       "venv_python": origin})
 
 
 def pth_files(venv: Path) -> dict[str, str]:

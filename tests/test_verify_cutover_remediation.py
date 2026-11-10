@@ -381,6 +381,37 @@ def test_gate5_checks_the_venv_python_before_running_it(
     assert result.status == gate.FAIL and run.commands == []
 
 
+def _venv_with(tmp_path: Path, runtime: Path, python: str, home: Path) -> Path:
+    """A venv whose bin/python is a 'copy' of the runtime's python3.14, a 'bad-copy', or a
+    'symlink' into the runtime's bin, with pyvenv.cfg's home set to `home`."""
+    (runtime / "bin").mkdir(parents=True, exist_ok=True)
+    (runtime / "bin" / "python3.14").write_bytes(b"interpreter")
+    venv = tmp_path / f"venv-{python}"
+    (venv / "bin").mkdir(parents=True)
+    target = venv / "bin" / "python"
+    if python == "symlink":
+        target.symlink_to(runtime / "bin" / "python3.14")
+    else:
+        target.write_bytes(b"interpreter" if python == "copy" else b"something else")
+    (venv / "pyvenv.cfg").write_text(f"home = {home}\nversion = 3.14.10\n", encoding="utf-8")
+    return venv
+
+
+@pytest.mark.parametrize("python, home_ok, expected", [
+    ("copy", True, True),  # venv --copies, as .venv-py314-r5 was made
+    ("symlink", True, True),
+    ("bad-copy", True, False),
+    ("copy", False, False),
+    ("symlink", False, False),
+])
+def test_venv_python_origin(tmp_path: Path, python: str, home_ok: bool, expected: bool) -> None:
+    runtime = tmp_path / "runtime"
+    home = runtime / "bin" if home_ok else tmp_path / "elsewhere"
+    venv = _venv_with(tmp_path, runtime, python, home)
+    origin = gate.venv_python_origin(venv, runtime)
+    assert origin["ok"] is expected, origin
+
+
 def test_pth_files_are_recorded(tmp_path: Path) -> None:
     site = tmp_path / "lib" / "python3.14" / "site-packages"
     site.mkdir(parents=True)
