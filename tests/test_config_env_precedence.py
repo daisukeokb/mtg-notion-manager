@@ -57,7 +57,7 @@ def _import_probe(tmp_path: Path, isolated: bool) -> int:
     module_dir = tmp_path / "shadow"
     module_dir.mkdir(exist_ok=True)
     (module_dir / "r6_shadow_probe.py").write_text("VALUE = 'shadowed'\n", encoding="utf-8")
-    flags = ["-I"] if isolated else []
+    flags = ["-I", "-B"] if isolated else ["-B"]  # -B: no bytecode cache (Phase 3H-R6 F01)
     env = {"PATH": "/usr/bin:/bin", "PYTHONPATH": str(module_dir)}
     return subprocess.run([sys.executable, *flags, "-c", "import r6_shadow_probe"], env=env,
                           capture_output=True, check=False, timeout=60).returncode

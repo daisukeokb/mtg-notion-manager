@@ -65,7 +65,8 @@ class Fixture:
 
     def run(self, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         result = subprocess.run(
-            [sys.executable, "-I", str(CHECKER)], cwd=cwd or self.repo, env=self.env,
+            # -B: no bytecode cache from the child (Phase 3H-R6 F01; -I ignores the env var)
+            [sys.executable, "-I", "-B", str(CHECKER)], cwd=cwd or self.repo, env=self.env,
             capture_output=True, text=True, timeout=60, check=False,
         )
         assert SECRET not in result.stdout + result.stderr, "the dummy secret was printed"

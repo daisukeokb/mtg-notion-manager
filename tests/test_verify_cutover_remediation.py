@@ -305,17 +305,34 @@ def test_tools_come_from_trusted_directories_not_from_path(
     trusted = _toolbox(tmp_path)
     evil = _tool(tmp_path / "evil", "git")
     monkeypatch.setenv("PATH", f"{evil.parent}{os.pathsep}{os.environ.get('PATH', '')}")
+    for planted in ("PERL5OPT", "PERL5LIB", "GIT_DIR", "GIT_CONFIG_PARAMETERS",
+                    "DYLD_INSERT_LIBRARIES", "DEVELOPER_DIR", "PYTHONPATH"):
+        monkeypatch.setenv(planted, "planted")
     run = _FakeRun(**{"--version": (0, "tool 1.0\n"), "git status": (0, "")})
     ctx = _context(tmp_path, *installed, passed=[], run=run,
                    tool_dirs=(str(trusted),), tool_roots=(str(trusted),))
     ctx.tools = None
     result = gate.step0_clean_tree(ctx)
     assert result.status == gate.PASS, result.evidence
-    assert ctx.tools["git"] == str(trusted / "git")
+    real_trusted = os.path.realpath(trusted)
+    assert ctx.tools["git"] == os.path.join(real_trusted, "git")  # the checked real path
     assert result.evidence["inherited_path_would_differ"]["git"] == str(evil)
     assert result.evidence["tools"]["git"]["sha256"] == gate.sha256_file(trusted / "git")
-    assert all(c[0].startswith(str(trusted)) for c in run.commands)
+    assert all(c[0].startswith(real_trusted) for c in run.commands)
     assert ctx.tool_environment["PATH"] == str(trusted)
+    assert set(ctx.tool_environment) <= {*gate.TOOL_ENVIRONMENT_KEEP, "PATH"}
+    for planted in ("PERL5OPT", "PERL5LIB", "GIT_DIR", "GIT_CONFIG_PARAMETERS",
+                    "DYLD_INSERT_LIBRARIES", "DEVELOPER_DIR", "PYTHONPATH"):
+        assert planted not in ctx.tool_environment
+        assert planted in result.evidence["dropped_variables"]
+
+
+def test_tool_environment_keeps_only_the_allowlist() -> None:
+    environment = gate.tool_environment(
+        {"HOME": "/h", "LANG": "C", "GH_TOKEN": "t", "PERL5OPT": "-MX", "GIT_DIR": "/g",
+         "PATH": "/evil"}, ("/usr/bin", "/bin"))
+    assert environment == {"HOME": "/h", "LANG": "C", "GH_TOKEN": "t",
+                           "PATH": f"/usr/bin{os.pathsep}/bin"}
 
 
 @pytest.mark.parametrize("problem", ["outside", "group-writable", "world-writable",
@@ -410,6 +427,17 @@ def test_venv_python_origin(tmp_path: Path, python: str, home_ok: bool, expected
     venv = _venv_with(tmp_path, runtime, python, home)
     origin = gate.venv_python_origin(venv, runtime)
     assert origin["ok"] is expected, origin
+
+
+def test_venv_copy_is_compared_with_the_verified_hash(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    venv = _venv_with(tmp_path, runtime, "copy", runtime / "bin")
+    verified = gate.sha256_file(runtime / "bin" / "python3.14")
+    assert gate.venv_python_origin(venv, runtime, verified)["ok"] is True
+    # The runtime file changed after item 4: the verified hash, not the file, decides.
+    (runtime / "bin" / "python3.14").write_bytes(b"swapped after item 4")
+    (venv / "bin" / "python").write_bytes(b"swapped after item 4")
+    assert gate.venv_python_origin(venv, runtime, verified)["ok"] is False
 
 
 def test_pth_files_are_recorded(tmp_path: Path) -> None:

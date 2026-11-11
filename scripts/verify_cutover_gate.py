@@ -262,13 +262,31 @@ def resolve_tool(name: str, dirs: tuple[str, ...], roots: tuple[str, ...]) -> di
     raise ToolUntrusted(f"{name} is not in any trusted directory {list(dirs)}")
 
 
+#: The only variables the tools get (plus PATH): what gh needs to authenticate and reach
+#: GitHub, and the locale (sort -z collates by it, as the documented pipeline did).
+#: Anything else - PERL5*, GIT_*, DYLD_*, DEVELOPER_DIR, PYTHON* ... - is dropped.
+TOOL_ENVIRONMENT_KEEP = (
+    "HOME", "USER", "LOGNAME", "TMPDIR", "TZ", "LANG", "LC_ALL", "LC_COLLATE", "LC_CTYPE",
+    "LC_MESSAGES", "GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "XDG_CONFIG_HOME",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy",
+    "http_proxy", "no_proxy",
+)
+
+
+def tool_environment(environ: dict[str, str], dirs: tuple[str, ...]) -> dict[str, str]:
+    kept = {key: value for key, value in environ.items() if key in TOOL_ENVIRONMENT_KEEP}
+    return {**kept, "PATH": os.pathsep.join(dirs)}
+
+
 def resolve_tools(ctx: Context) -> dict[str, Any]:
-    """Step 0: resolve every tool (or raise ToolUntrusted) and record what was resolved."""
+    """Step 0: resolve every tool (or raise ToolUntrusted) and record what was resolved.
+    The tools are run by the resolved real path (not through the link that was checked)
+    with an allowlisted environment."""
     settings = ctx.settings
     records = {name: resolve_tool(name, settings.tool_dirs, settings.tool_roots)
                for name in TOOLS}
-    ctx.tools = {name: record["path"] for name, record in records.items()}
-    ctx.tool_environment = {**os.environ, "PATH": os.pathsep.join(settings.tool_dirs)}
+    ctx.tools = {name: record["realpath"] for name, record in records.items()}
+    ctx.tool_environment = tool_environment(dict(os.environ), settings.tool_dirs)
     for name in ("git", "gh"):
         version = ctx.run_tool(name, ["--version"])
         records[name]["version"] = (version.stdout or "").splitlines()[:1]
@@ -277,7 +295,9 @@ def resolve_tools(ctx: Context) -> dict[str, Any]:
         found = shutil.which(name)
         if found is not None and os.path.realpath(found) != records[name]["realpath"]:
             shadowed[name] = found
-    return {"tools": records, "inherited_path_would_differ": shadowed}
+    dropped = sorted(k for k in os.environ if k not in TOOL_ENVIRONMENT_KEEP and k != "PATH")
+    return {"tools": records, "inherited_path_would_differ": shadowed,
+            "tool_environment": sorted(ctx.tool_environment), "dropped_variables": dropped}
 
 
 # --- the verified archive (R6-F03) ------------------------------------------------------------
@@ -1843,11 +1863,14 @@ def _venv(ctx: Context, name: str) -> Path:
         "new_venv": ".venv-py314-r5", "legacy_venv": ".venv"}[name]
 
 
-def venv_python_origin(venv: Path, runtime_root: Path) -> dict[str, Any]:
+def venv_python_origin(venv: Path, runtime_root: Path, verified_sha256: str | None = None
+                       ) -> dict[str, Any]:
     """Without running it: is the venv's bin/python the verified runtime's interpreter?
     A venv made with symlinks links into the runtime's bin; one made with --copies (as
     .venv-py314-r5 is) holds a byte-identical copy of bin/python3.14. Either way,
-    pyvenv.cfg's home must be the runtime's bin."""
+    pyvenv.cfg's home must be the runtime's bin. `verified_sha256` is the archive's hash of
+    python/bin/python3.14 as item 4 verified it; the copy is compared with it (the runtime
+    file is hashed only when it is not given)."""
     python = venv / "bin" / "python"
     runtime_bin = os.path.realpath(runtime_root / "bin")
     record: dict[str, Any] = {"ok": False}
@@ -1862,7 +1885,7 @@ def venv_python_origin(venv: Path, runtime_root: Path) -> dict[str, Any]:
         matches = real.startswith(runtime_bin + os.sep)
     elif stat.S_ISREG(info.st_mode):
         digest = sha256_file(python)
-        expected = sha256_file(runtime_root / "bin" / "python3.14")
+        expected = verified_sha256 or sha256_file(runtime_root / "bin" / "python3.14")
         record.update(kind="copy", sha256=digest, runtime_python3_14_sha256=expected)
         matches = digest == expected
     else:
@@ -1885,7 +1908,9 @@ def gate5_venv_resolution(ctx: Context) -> GateResult:
     runtime_python = ctx.settings.runtime_root / "bin" / "python3.14"
     venv = _venv(ctx, "new_venv")
     # Before running it: the venv's python must be the verified runtime's interpreter.
-    origin = venv_python_origin(venv, ctx.settings.runtime_root)
+    verified = ctx.manifest.get(f"{ARCHIVE_ROOT}/bin/python3.14") if ctx.manifest else None
+    origin = venv_python_origin(venv, ctx.settings.runtime_root,
+                                verified.sha256 if verified is not None else None)
     if not origin["ok"]:
         return GateResult("5", "venv resolution", FAIL, {"venv_python": origin})
     identity = ctx.run([str(runtime_python), "-I", "-B", "-c",
@@ -1916,7 +1941,9 @@ def pth_files(venv: Path) -> dict[str, str]:
 @requires("step0", "1", "2", "3", "4", "5")
 def gate6_7_lock_and_pip_check(ctx: Context) -> GateResult:
     venv = _venv(ctx, "new_venv")
-    executed = pth_files(venv)  # recorded before they run; not judged (residual risk)
+    # Recorded, not judged (residual risk). They have already run once: item 5 starts the
+    # venv's python (without -S).
+    executed = pth_files(venv)
     result = ctx.run([str(venv / "bin" / "python"), "-I", "-B",
                       str(ctx.settings.repo / "scripts" / "check_local_runtime.py")],
                      cwd=str(ctx.settings.repo))

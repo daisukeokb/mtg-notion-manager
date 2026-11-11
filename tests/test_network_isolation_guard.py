@@ -406,7 +406,10 @@ def _run_inner_pytest(pytester: Any, test_source: str) -> Any:
         return pytester.runpytest_subprocess("-q", "-p", "no:cacheprovider")
 
 
-def test_inner_pytest_writes_no_bytecode(network_guard: Any, pytester: Any) -> None:
+def test_inner_pytest_writes_no_bytecode(network_guard: Any, pytester: Any,
+                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    # Absent from the parent, so only _run_inner_pytest can have set it for the child.
+    monkeypatch.delenv("PYTHONDONTWRITEBYTECODE", raising=False)
     result = _run_inner_pytest(
         pytester,
         "import os, sys\n\ndef test_env():\n"
