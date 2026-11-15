@@ -299,6 +299,8 @@ def python_environment(environ: dict[str, str], dirs: tuple[str, ...]) -> dict[s
     missing = [key for key in PYTHON_ENVIRONMENT_REQUIRED if not environ.get(key)]
     if missing:
         raise GateError(f"required environment variables missing: {missing}")
+    if not os.path.isabs(environ["HOME"]):
+        raise GateError("HOME is not an absolute path")
     if not dirs or any(not os.path.isabs(d) or os.pathsep in d for d in dirs):
         raise GateError(f"trusted directories are not usable as PATH: {list(dirs)}")
     kept = {key: value for key, value in environ.items() if key in PYTHON_ENVIRONMENT_KEEP}
@@ -2141,7 +2143,7 @@ def run_metadata(ctx: Context, started: str) -> dict[str, Any]:
             "archive": ctx.artifact.evidence() if ctx.artifact is not None else None}
 
 
-_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
 def evidence_replacements(repo: Path, home: Path) -> list[tuple[str, str]]:
@@ -2183,9 +2185,13 @@ def export_evidence(report_file: str, out_file: str, repo: Path = REPO_ROOT,
     replacements = evidence_replacements(repo, home)
     archive = ((report.get("metadata") or {}).get("archive") or {}).get("path")
     if archive:  # the download directory can name the user too (e.g. a scratch path)
-        replacements = sorted({*replacements, *((variant, "<archive-dir>") for variant in {
-            os.path.dirname(archive), os.path.dirname(os.path.realpath(archive))})},
-            key=lambda pair: -len(pair[0]))
+        # Only a directory at least two levels deep: replacing "/" or "/tmp" everywhere
+        # would garble every other path (the leak checks below still apply).
+        directories = {d for d in (os.path.dirname(archive),
+                                   os.path.dirname(os.path.realpath(archive)))
+                       if len(Path(d).parts) > 2}
+        replacements = sorted({*replacements, *((d, "<archive-dir>") for d in directories)},
+                              key=lambda pair: -len(pair[0]))
     clean = sanitize_evidence(report, replacements)
     text = json.dumps(clean, indent=2, ensure_ascii=False, sort_keys=True)
     flat = unicodedata.normalize("NFC", text)

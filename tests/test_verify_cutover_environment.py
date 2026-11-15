@@ -225,10 +225,47 @@ def test_the_archive_directory_is_anonymized(tmp_path: Path) -> None:
     assert text.count("<archive-dir>/a.tar.gz") == 2 and "someone" not in text
 
 
-def test_export_refuses_when_personal_data_remains(tmp_path: Path) -> None:
+@pytest.mark.parametrize("address", ["a.b@gmail.com", "x@example.org", "first-last@sub.ex.jp"])
+def test_the_email_pattern_matches_addresses(address: str) -> None:
+    assert gate._EMAIL.search(f"/path/GoogleDrive-{address}/folder")
+
+
+@pytest.mark.parametrize("report", [
+    {"note": "contact unrelated.person@example.com"},  # shares nothing with the home name
+    # A path under home but outside the repository, through a folder named by the account
+    # (the shape of the auditor's probe): "~/..." keeps the address, so it must be refused.
+    {"path": "HOME/Library/CloudStorage/GoogleDrive-other.person@gmail.com/x"},
+])
+def test_export_refuses_when_an_email_address_remains(tmp_path: Path,
+                                                     report: dict[str, str]) -> None:
     home = tmp_path / "home" / "someone"
     source = tmp_path / "report.json"
-    source.write_text(json.dumps({"note": "contact someone@example.com"}), encoding="utf-8")
+    text = json.dumps(report).replace("HOME", str(home))
+    source.write_text(text, encoding="utf-8")
     assert gate.export_evidence(str(source), str(tmp_path / "out.json"), repo=home / "r",
                                 home=home) == 2
     assert not (tmp_path / "out.json").exists()
+
+
+def test_export_refuses_when_the_home_name_remains(tmp_path: Path) -> None:
+    home = tmp_path / "home" / "someone"
+    source = tmp_path / "report.json"
+    source.write_text(json.dumps({"note": "/elsewhere/someone/file"}), encoding="utf-8")
+    assert gate.export_evidence(str(source), str(tmp_path / "out.json"), repo=home / "r",
+                                home=home) == 2
+
+
+def test_a_shallow_archive_directory_is_not_used_as_a_replacement(tmp_path: Path) -> None:
+    home = tmp_path / "home" / "someone"
+    report = {"metadata": {"archive": {"path": "/tmp/a.tar.gz"}},
+              "gates": [{"evidence": {"other": "/tmp/unrelated/file"}}]}
+    source, out = tmp_path / "report.json", tmp_path / "evidence.json"
+    source.write_text(json.dumps(report), encoding="utf-8")
+    assert gate.export_evidence(str(source), str(out), repo=home / "r", home=home) == 0
+    text = out.read_text(encoding="utf-8")
+    assert "<archive-dir>" not in text and "/tmp/unrelated/file" in text
+
+
+def test_a_relative_home_blocks() -> None:
+    with pytest.raises(gate.GateError, match="absolute"):
+        gate.python_environment({"HOME": "relative/home"}, TRUSTED)
