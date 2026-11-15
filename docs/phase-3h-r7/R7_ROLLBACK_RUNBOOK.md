@@ -63,4 +63,6 @@ CLIは常駐processではない(commandごとに起動・終了する)。「停�
 | rollback後のhealth check失敗 | FAIL、停止 | `test_health_check_failure_after_rollback`、`test_new_runtime_failure_and_legacy_failure` |
 | 非可逆データ変更の検出 | 書き込みの可能性があるcommandがjournalにあれば `unconditional = false`(ローカルの切戻しは可能) | `test_irreversible_mutation_makes_rollback_conditional`、`test_read_only_journal_is_unconditional` |
 
-書き込みの可能性の判定(`command_may_mutate`)は、CLIの実際のoptionと照合している(読み取り専用commandに `--apply*` optionが無いことをtestで確認)。未知のcommandは書き込みの可能性ありとして扱う。
+書き込みの可能性の判定(`command_may_mutate`)は、引数をClickと同じ規則で解析する: 値を取るoptionは次のtokenを値として取る(`--` で始まっていても。`import <url> --deck-name --dry-run` は `--dry-run` がdeck名になり、**書き込む**)、`--` 以降はoptionではない、未知のcommand・未知のoption・短いoption・値の欠落は書き込みの可能性ありとする。各commandの「値を取るoption」と「flag」の表は、testでClickのcommand定義と完全に一致することを確認し、上記の解析規則は実際の `import` commandで観測している(`test_click_gives_the_next_token_to_a_value_option`)。読み取り専用commandに `--apply*` optionが無いこともtestで確認している。
+
+(独立監査の指摘M-2: 当初の実装は `--dry-run` という文字列が引数のどこかにあれば書き込みなしと判定しており、上記の例を誤判定していた。修正済み。)

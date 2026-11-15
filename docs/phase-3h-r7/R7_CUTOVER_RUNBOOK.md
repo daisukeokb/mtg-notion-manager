@@ -27,11 +27,13 @@
 ## 4. Trusted runtime confirmation
 
 1. `docs/local-python-runtime.md` のCutover Safety Gate(`scripts/verify_cutover_gate.py`、Step 0と項目1〜8)を最初から実行し、全項目PASSであること。以前の実行結果は再利用しない。
-2. Runtime manifest(`scripts/cutover_readiness.py` の `MANIFEST_SCHEMA`)を用意し、**そのsha256を、manifestとは別の場所(承認記録)に人間が記録する**。manifestを作った同じ環境で、同時にhashを記録しただけでは独立した根拠にならない(trust on first use)。
+2. Runtime manifest(`scripts/cutover_readiness.py` の `MANIFEST_SCHEMA`)を用意し、**そのsha256を、manifestとは別の場所(承認記録)に人間が記録する**。manifestを作った同じ環境で、同時にhashを記録しただけでは独立した根拠にならない(trust on first use)。manifestは、Python本体・venv・アプリケーションのsource(editable installの `src/`)の3つのtreeの**完全な一覧**(全fileのsha256、全symlinkの参照先)で、一覧に無いentryがあればFAILになる。作成は、Cutover Safety Gateが全項目PASSした直後に行う。manifestを作るcommandはR7では提供していない(`walk_tree()` が一覧の形式を定める。作成手順は承認とあわせて決める)。
 3. `/usr/bin/python3 -I -B scripts/cutover_readiness.py bootstrap --manifest <M> --manifest-sha256 <記録したhash> --python <venv>/bin/python3.14` がPASSであること。UNVERIFIEDはPASSではない。
 - 止める条件: どちらかがPASS以外。
 
-検査はすべて、検査対象のPython本体を起動する前に、別のinterpreter(macOSのsystem Python)で行う。検査器自身の信頼は、system Python(Apple署名)と、mainにcommitされた検査scriptのsha256に依存する(循環しない)。
+検査はすべて、検査対象のPython本体を起動する前に、別のinterpreter(macOSのsystem Python)で行う。検査対象のinterpreterで自分自身を検査する循環は無い。ただし検査器自身の信頼は、system Python(Apple署名)と、mainにcommitされた検査scriptに依存し、**mainはreviewの強制なしに変更できる(G-1、Blocker B-G1)**。したがって検査器の信頼はB-G1の解消(または受け入れ)に依存する。実行前に、使う検査scriptのsha256を承認記録の値と照合する。
+
+起動時のcodeの検査範囲: `-I` は `sitecustomize`・`usercustomize` を無効にしない(無効にするのは `-S`)。検査は、計画した `sys.path` の全directory(標準library、`lib-dynload`、site-packages、各 `.pth` のpath行)に起動hookが無いことを確認し(manifestに載っていてもFAIL)、`.pth` のpathが3つのtreeの外を指せばFAIL、標準libraryのzip(`python314.zip`)があればFAILにする。`sys.path` はsite.pyの規則から算出したもので、interpreterを起動して観測したものではない。
 
 ## 5. Backup readiness
 
@@ -49,7 +51,7 @@
 | interpreter_explicit | 明示した絶対pathが、manifestのinterpreterと完全に一致(PATHから探さない) |
 | inherited_environment | shellに `NOTION_*`・`PYTHON*`・`DYLD_*`・`LD_*`・`PIP_*` が無い(落とすのではなく拒否する) |
 | config | 設定fileが通常file(symlink不可)、実行者の所有、group・otherの権限なし、`KEY=VALUE` 形式、既知の項目だけ、必須項目あり、data source idの形式 |
-| dotenv_disabled | venvのpython-dotenvが `PYTHON_DOTENV_DISABLED` に対応した版(1.2.1) |
+| dotenv_disabled | venvのpython-dotenvが1.2.1で、`dotenv/main.py` がmanifestで固定されたfileと同じで、構文解析(import・実行はしない)の結果、`load_dotenv()` が `PYTHON_DOTENV_DISABLED` を読む関数を呼んでいる |
 | command | 既知の12 commandのいずれか |
 
 すべてがPASSでなければ計画は作られない(未実施の検査がある場合は `incomplete preflight` でFAIL)。出力には値が含まれない(`credentials: <redacted>`、環境変数は名前だけ)。

@@ -142,6 +142,8 @@ def test_unknown_selector_value(root: Path) -> None:
     [["doctor"], ["import", "u"]],
     [["apply-price-link-dedupe", "--scope", "canary", "--apply"]],
     [["something-new"]],
+    # Click gives "--dry-run" to --deck-name as its value: this import writes
+    [["import", "u", "--deck-name", "--dry-run"]],
 ])
 def test_irreversible_mutation_makes_rollback_conditional(root: Path,
                                                           journal: list[list[str]]) -> None:
@@ -189,6 +191,37 @@ def test_cli_commands_match_the_cli() -> None:
     group = typer.main.get_command(app)
     assert sorted(getattr(group, "commands", {})) == sorted(cr.CLI_COMMANDS)
     assert set(cr.READ_ONLY_COMMANDS) < set(cr.CLI_COMMANDS)
+
+
+def test_option_tables_match_the_click_commands() -> None:
+    """VALUE_OPTIONS / FLAG_OPTIONS are exactly the options of each Click command (the help
+    option excepted, which the tables deliberately leave out: it is refused)."""
+    import click
+    import typer
+
+    from mtg_notion_manager.cli import app
+
+    commands = getattr(typer.main.get_command(app), "commands", {})
+    for name, command in commands.items():
+        options = [p for p in command.params if isinstance(p, click.Option)]
+        values = {o for p in options if not p.is_flag and not p.count
+                  for o in [*p.opts, *p.secondary_opts]}
+        flags = {o for p in options if p.is_flag for o in [*p.opts, *p.secondary_opts]}
+        assert values == cr.VALUE_OPTIONS[name], name
+        assert flags == cr.FLAG_OPTIONS[name], name
+        assert all(o.startswith("--") for o in values | flags), name
+
+
+def test_click_gives_the_next_token_to_a_value_option() -> None:
+    """The parsing rule command_may_mutate relies on, observed on the real import command."""
+    import typer
+
+    from mtg_notion_manager.cli import app
+
+    command = getattr(typer.main.get_command(app), "commands", {})["import"]
+    context = command.make_context("import", ["u", "--deck-name", "--dry-run"],
+                                   resilient_parsing=True)
+    assert context.params["deck_name"] == "--dry-run" and context.params["dry_run"] is False
 
 
 def test_read_only_commands_have_no_write_option() -> None:

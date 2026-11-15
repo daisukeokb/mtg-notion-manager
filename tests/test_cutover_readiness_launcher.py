@@ -185,14 +185,34 @@ def test_incomplete_preflight(fx: Fixture, tmp_path: Path, monkeypatch: pytest.M
     assert cr.complete([cr.Check("bootstrap", cr.PASS)]) is False
 
 
-def test_dotenv_without_disable_support(fx: Fixture, tmp_path: Path) -> None:
-    (fx.site / "dotenv" / "main.py").write_bytes(b"def load_dotenv(): pass\n")
+@pytest.mark.parametrize("source", [
+    b"def load_dotenv(): pass\n",
+    # the variable name only in a comment and an unused function
+    b'# "PYTHON_DOTENV_DISABLED"\ndef _load_dotenv_disabled():\n    return False\n'
+    b"def load_dotenv():\n    return True\n",
+    # read, but never called by load_dotenv
+    b'def _load_dotenv_disabled():\n    return "PYTHON_DOTENV_DISABLED"\n'
+    b"def load_dotenv():\n    return True\n",
+    b"not python (\n",
+])
+def test_dotenv_without_disable_support(fx: Fixture, tmp_path: Path, source: bytes) -> None:
+    (fx.site / "dotenv" / "main.py").write_bytes(source)
+    fx.rebuild()
     plan = _plan(fx, _config(tmp_path))
     assert plan.status == cr.FAIL and plan.checks[-1].name == "dotenv_disabled"
+    assert "does not honour" in plan.checks[-1].detail
+
+
+def test_dotenv_main_must_be_pinned(fx: Fixture, tmp_path: Path) -> None:
+    bootstrap = fx.verify()
+    del bootstrap.manifest["trees"]["venv"]["lib/python3.14/site-packages/dotenv/main.py"]
+    plan = cr.plan_launch(bootstrap, fx.python, _config(tmp_path), CLEAN_ENV, ["doctor"])
+    assert plan.status == cr.FAIL and "not the file pinned" in plan.checks[-1].detail
 
 
 def test_dotenv_unknown_version(fx: Fixture, tmp_path: Path) -> None:
     (fx.site / "python_dotenv-1.2.1.dist-info").rename(fx.site / "python_dotenv-1.0.0.dist-info")
+    fx.rebuild()
     plan = _plan(fx, _config(tmp_path))
     assert plan.status == cr.FAIL and "1.0.0" in plan.checks[-1].detail
 
@@ -215,9 +235,27 @@ def test_home_must_be_absolute(fx: Fixture, tmp_path: Path) -> None:
     (["apply-single-title-update", "--apply"], True),
     (["unknown"], True),
     ([], True),
+    # an option that takes a value consumes the next token, even "--dry-run" (Click does)
+    (["import", "u", "--deck-name", "--dry-run"], True),
+    (["import", "u", "--deck-name", "d", "--dry-run"], False),
+    (["import", "u", "--deck-name=--dry-run"], True),
+    (["import", "u", "--deck-name=d", "--dry-run"], False),
+    (["import", "u", "--", "--dry-run"], True),
+    (["import", "u", "--dry-run=1"], True),
+    (["import", "u", "--dry", "--dry-run"], True),
+    (["import", "u", "-n", "--dry-run"], True),
+    (["import", "u", "--deck-name"], True),
+    (["import-cards", "u", "--deck-name", "--apply"], False),
+    (["verify-import", "u", "--bogus"], True),
+    (["doctor", "--help"], True),
 ])
 def test_command_may_mutate(argv: list[str], mutates: bool) -> None:
     assert cr.command_may_mutate(argv) is mutates
+
+
+def test_plan_refuses_an_unparseable_invocation(fx: Fixture, tmp_path: Path) -> None:
+    plan = _plan(fx, _config(tmp_path), args=["import", "u", "--bogus"])
+    assert plan.status == cr.FAIL and plan.checks[-1].name == "command"
 
 
 # --- the component cannot launch anything or touch the network ---------------------------
@@ -231,15 +269,29 @@ def test_module_has_no_execution_or_network_code() -> None:
             imported |= {alias.name.split(".")[0] for alias in node.names}
         elif isinstance(node, ast.ImportFrom):
             imported.add((node.module or "").split(".")[0])
-    assert imported <= {"__future__", "argparse", "hashlib", "json", "os", "re", "stat", "sys",
-                        "dataclasses", "pathlib", "typing"}, imported
+    assert imported <= {"__future__", "argparse", "ast", "hashlib", "json", "os", "re", "stat",
+                        "sys", "dataclasses", "pathlib", "typing"}, imported
     forbidden = {"system", "popen", "posix_spawn", "posix_spawnp", "fork", "forkpty",
                  "startfile", "kill", "killpg"}
+    dynamic = {"getattr", "__import__", "eval", "exec", "compile", "globals", "locals", "vars",
+               "importlib", "builtins", "ctypes", "subprocess", "socket", "__builtins__"}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
-                and node.value.id == "os":
-            assert node.attr not in forbidden and not node.attr.startswith(("exec", "spawn")), \
-                node.attr
+        if isinstance(node, ast.Attribute):
+            # os.execl* / os.execv* / os.spawn* (not e.g. LaunchPlan.executable)
+            assert node.attr not in forbidden and not node.attr.startswith(
+                ("execl", "execv", "spawn")), node.attr
+            assert node.attr not in dynamic - {"compile"}, node.attr  # re.compile is fine
+        if isinstance(node, ast.Name):
+            assert node.id not in dynamic, node.id
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            assert node.value not in dynamic | forbidden, node.value
+
+
+def test_every_plan_is_not_executable(fx: Fixture, tmp_path: Path) -> None:
+    for config in (_config(tmp_path), None):
+        plan = _plan(fx, config)
+        assert plan.executable is cr.EXECUTION_ENABLED is False
+        assert plan.as_dict()["executable"] is False
 
 
 AUDIT_RUNNER = r"""
@@ -260,18 +312,26 @@ sys.exit(status)
 """
 
 
-def test_no_network_or_process_at_runtime(fx: Fixture, tmp_path: Path) -> None:
+@pytest.mark.parametrize("action, environ, status", [
+    (["launch-plan"], CLEAN_ENV, 0),
+    (["launch-plan"], {**CLEAN_ENV, "NOTION_TOKEN": SECRET}, 1),
+    (["bootstrap"], CLEAN_ENV, 0),
+    (["bootstrap"], {**CLEAN_ENV, "PYTHONPATH": "/planted"}, 1),
+])
+def test_no_network_or_process_at_runtime(fx: Fixture, tmp_path: Path, action: list[str],
+                                          environ: dict[str, str], status: int) -> None:
     """In a fresh interpreter with an audit hook (the conftest guard does not apply there),
-    the whole launch-plan run starts no process and opens no socket."""
+    the whole run - passing or failing - starts no process and opens no socket."""
     config = _config(tmp_path)
+    extra = ["--config", str(config), "--", "doctor"] if action == ["launch-plan"] else []
     result = subprocess.run(
-        [sys.executable, "-I", "-B", "-c", AUDIT_RUNNER, str(SCRIPT), "launch-plan",
+        [sys.executable, "-I", "-B", "-c", AUDIT_RUNNER, str(SCRIPT), *action,
          "--manifest", str(fx.manifest_path), "--manifest-sha256", fx.manifest_sha,
-         "--python", fx.python, "--config", str(config), "--", "doctor"],
-        input=json.dumps(CLEAN_ENV), capture_output=True, text=True, timeout=60,
+         "--python", fx.python, *extra],
+        input=json.dumps(environ), capture_output=True, text=True, timeout=60,
         env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "PYTHONDONTWRITEBYTECODE": "1"},
         cwd=tmp_path, check=False)
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == status, result.stdout + result.stderr
     assert "EVENTS=[]" in result.stderr, result.stderr
     assert SECRET not in result.stdout + result.stderr
 

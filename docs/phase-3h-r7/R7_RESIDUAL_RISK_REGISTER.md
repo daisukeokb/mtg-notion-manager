@@ -31,14 +31,16 @@
 | N-1 | export時のe-mail検査が `%40`・全角・非ASCIIのaddress、実名を検出しない | not fixed | 変更なし。R7の証跡は同じ規則で作成し、別のpatternでも走査する | 低 | 証跡への個人情報の混入 | 人による走査 | minor | No | 検査の拡張 |
 | N-2 | macOSで `/tmp` のarchiveの実path `/private/tmp` が過剰に匿名化される | not fixed | 変更なし | — | pathの判読性のみ。漏洩なし | — | info | No | なし |
 | m-A | gate 8の `pip freeze` がpip.confを読む | not fixed | 変更なし | 低 | 偽PASSは実用上困難(fingerprintとfreeze hashの固定) | 固定hash | minor | No | R5基準hashを変えない形での修正を検討 |
-| F01 | R6の検証中に `.venv-py314-r5` へpytestのcache 38件が書かれた | REMEDIATED / HISTORICAL EVIDENCE PARTIALLY LOST | R7の前後snapshotで `.venv-py314-r5`(5409 entries)・`.venv`(3607)・Python本体(2278)が不変(下記証跡)。消失した記録は再構成していない | — | — | 再発防止(`PYTHONDONTWRITEBYTECODE` 等)をR7の全実行で適用 | info(historical) | No | なし |
+| F01 | R6の検証中に `.venv-py314-r5` へpytestのcache 38件が書かれた | REMEDIATED / HISTORICAL EVIDENCE PARTIALLY LOST | R7の前後snapshotで `.venv-py314-r5`(5409 entries)・`.venv`(3607)・Python本体(2278)が不変(`docs/evidence/phase-3h-r7/EVIDENCE.json` の `preservation`)。消失した記録は再構成していない | — | — | 再発防止(`PYTHONDONTWRITEBYTECODE` 等)をR7の全実行で適用 | info(historical) | No | なし |
 
 ## R7で新たに記録するもの
 
 | Risk ID | Description | Evidence | Residual severity | Cutover blocker | Required next action |
 |---|---|---|---|---|---|
 | R7-1 | `generation-workspace` jobが必須status checkではない | live ruleset | minor | No(製品機能と無関係) | 必須化するか人間が判断(GitHub設定の変更は別承認) |
-| R7-2 | 起動hookの検査対象はsite-packagesのdirectoryだけ。`.pth` が追加するpath(editable installの `src/`)・標準libraryのdirectoryの `sitecustomize` は見ない | `startup_hooks()` | minor | No(B-D1の一部) | manifestの `files` で該当pathを固定する |
+| R7-2 | 起動時に実行されうるcodeの検査範囲。**独立監査M-1(major)**: 当初の実装はsite-packagesだけを走査し、標準library・`lib-dynload`・`.pth` が追加するpath(editable installの `src/`)の `sitecustomize`、manifestに無いfileを見逃していた(`-I` は `sitecustomize` を無効にしない)。修正: 3つのtreeの完全な一覧(一覧外のentryはFAIL)、計画した `sys.path` の全directoryの走査、treeの外を指す `.pth` のFAIL、終了時の再走査 | `verify_bootstrap()`、`tests/test_cutover_readiness_bootstrap.py` | 修正後の残余: minor(`sys.path` はsite.pyの規則から算出したもので、起動して観測したものではない。frozen module・interpreterの組み込み設定は対象外) | Yes(B-D1の一部) | B-D1の解消時に、実runtimeで算出した `sys.path` と起動後の `sys.path` を隔離環境で比較する |
 | R7-3 | 検査と実際の起動の間のTOCTOU。計画は実行しないため、検査後にfileが変わりうる | 設計上 | minor | No(B-C23の一部) | 実行可能にする場合は、検査の直後に同じprocessから起動し、再検査する |
 | R7-4 | launcherの設定fileは `KEY=VALUE` の厳格な形式で、dotenvの引用符・`export` を受け付けない | `load_config()` | info | No | 運用者が専用fileを作る(`.env` を複製しない) |
 | R7-5 | 独立監査は実装と同じAIモデル・同じ運用主体による別context | 監査記録 | — | No | 人間によるreviewが最終的な独立性を担う |
+| R7-6 | provenanceのPASSは「人が記録したattestationの証跡(commit済みのEVIDENCE.json、sha256固定)が、このarchiveと全gateのPASSを記録している」ことの確認で、attestationをこの検査で再検証するものではない。archiveと実runtimeの対応はgate 4が示す | `check_provenance()` | minor | No(B-D1の一部) | provenanceの受け入れは人間が判断する |
+| R7-7 | `Secret` をpickle・copyすると値が保持される(出力経路ではない) | 監査info | info | No | なし |
