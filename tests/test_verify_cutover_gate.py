@@ -126,6 +126,8 @@ def _context(tmp: Path, archive: Path, runtime_dir: Path, *, passed: list[str] |
         passed=["step0", "1", "2", "3"] if passed is None else passed,
         # Bare names: the answers of _FakeRun; resolution has its own tests.
         tools={name: name for name in gate.TOOLS},
+        # As Step 0 leaves it (synthetic; the allowlist has its own tests).
+        python_environment={"HOME": str(tmp), "PATH": "/usr/bin:/bin"},
         # As item 1 leaves it (item 1 reads it again when it runs).
         artifact=gate.read_artifact(archive) if archive.is_file() else None)
 
@@ -632,7 +634,7 @@ def test_rollback_readiness_rehearsal(tmp_path: Path) -> None:
     legacy = _legacy(tmp_path)
     run = _FakeRun(**{"--legacy-cli-worker": (0, ""), "--version": (0, gate.LEGACY_VERSION)})
     settings = gate.Settings(archive=tmp_path, repo=REPO_ROOT, legacy_venv=legacy)
-    ready = gate.rollback_readiness(settings, run)
+    ready = gate.rollback_readiness(settings, run, {"HOME": "/h", "PATH": "/usr/bin"})
     assert ready["status"] == gate.PASS, ready
     assert any("--legacy-cli-worker" in command for command in run.commands)
 
@@ -649,7 +651,8 @@ def test_rollback_prerequisite_missing_fails(tmp_path: Path, broken: str) -> Non
                       "--version": (0, "Python 3.14.10" if broken == "version"
                                     else gate.LEGACY_VERSION)})
     settings = gate.Settings(archive=tmp_path, repo=REPO_ROOT, legacy_venv=legacy)
-    assert gate.rollback_readiness(settings, run)["status"] == gate.FAIL
+    environment = {"HOME": "/h", "PATH": "/usr/bin"}
+    assert gate.rollback_readiness(settings, run, environment)["status"] == gate.FAIL
 
 
 def test_environment_notice_lists_names_only() -> None:

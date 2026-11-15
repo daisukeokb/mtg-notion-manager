@@ -465,7 +465,7 @@ def test_rollback_check_error_is_blocked(tmp_path: Path) -> None:
     python.write_text("", encoding="utf-8")
     (legacy / "bin" / "mtg-notion-manager").write_text(f"#!{python}\n", encoding="utf-8")
     settings = gate.Settings(archive=tmp_path / "a", repo=tmp_path, legacy_venv=legacy)
-    result = gate.rollback_readiness(settings, broken)
+    result = gate.rollback_readiness(settings, broken, {"HOME": "/h", "PATH": "/usr/bin"})
     assert result["status"] == gate.BLOCKED and "OSError" in result["error"]
 
 

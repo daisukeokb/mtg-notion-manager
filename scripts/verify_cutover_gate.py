@@ -150,6 +150,8 @@ class Context:
     tool_environment: dict[str, str] | None = None
     #: The archive as read once by item 1 (R6-F03); every later use reads these bytes.
     artifact: Artifact | None = None
+    #: The environment of the Python processes of items 5-8 (R6-F05); set by Step 0.
+    python_environment: dict[str, str] | None = None
 
     def tool(self, name: str) -> str:
         if self.tools is None or name not in self.tools:
@@ -161,6 +163,13 @@ class Context:
         if self.tool_environment is not None:
             kwargs.setdefault("env", self.tool_environment)
         return self.run([self.tool(name), *args], **kwargs)
+
+    def run_python(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+        """Start a Python of items 5-8 with the allowlisted environment (R6-F05); never with
+        the inherited one."""
+        if self.python_environment is None:
+            raise GateError("the Python environment has not been prepared by Step 0")
+        return self.run(argv, env=dict(self.python_environment), **kwargs)
 
 
 @dataclasses.dataclass
@@ -273,6 +282,29 @@ TOOL_ENVIRONMENT_KEEP = (
 )
 
 
+#: The only variables the Python processes of items 5-8 and of the rollback check get
+#: (R6-F05), each for a stated use: HOME (where Python and pip look for the user's
+#: files; required), USER / LOGNAME (the user's identity for getpass and tools), TMPDIR
+#: (temporary files), TZ and the locale (text encoding and dates). PATH is the trusted
+#: tool directories. Anything else - DYLD_*, PYTHON*, NOTION_*, PIP_*, ... - is not
+#: passed. This does not make a third-party build or its .pth files trustworthy.
+PYTHON_ENVIRONMENT_KEEP = ("HOME", "USER", "LOGNAME", "TMPDIR", "TZ", "LANG", "LC_ALL",
+                           "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES")
+PYTHON_ENVIRONMENT_REQUIRED = ("HOME",)
+
+
+def python_environment(environ: dict[str, str], dirs: tuple[str, ...]) -> dict[str, str]:
+    """The environment of the gates' Python processes; GateError (BLOCKED) if a required
+    variable is missing or the trusted directories are not absolute paths."""
+    missing = [key for key in PYTHON_ENVIRONMENT_REQUIRED if not environ.get(key)]
+    if missing:
+        raise GateError(f"required environment variables missing: {missing}")
+    if not dirs or any(not os.path.isabs(d) or os.pathsep in d for d in dirs):
+        raise GateError(f"trusted directories are not usable as PATH: {list(dirs)}")
+    kept = {key: value for key, value in environ.items() if key in PYTHON_ENVIRONMENT_KEEP}
+    return {**kept, "PATH": os.pathsep.join(dirs)}
+
+
 def tool_environment(environ: dict[str, str], dirs: tuple[str, ...]) -> dict[str, str]:
     kept = {key: value for key, value in environ.items() if key in TOOL_ENVIRONMENT_KEEP}
     return {**kept, "PATH": os.pathsep.join(dirs)}
@@ -375,13 +407,17 @@ def step0_clean_tree(ctx: Context) -> GateResult:
     intended branch and commit are checked out stays with the person running the gate
     (the report records the commit)."""
     tools = resolve_tools(ctx) if ctx.tools is None else {"tools": "provided by the caller"}
+    ctx.python_environment = python_environment(dict(os.environ), ctx.settings.tool_dirs)
+    python_env = {"python_environment": sorted(ctx.python_environment),  # names only
+                  "python_environment_dropped": sorted(
+                      k for k in os.environ if k not in ctx.python_environment)}
     result = ctx.run_tool("git", ["status", "--short", "--", *STEP0_PATHS],
                           cwd=str(ctx.settings.repo))
     if result.returncode != 0:
         raise GateError(f"git status failed ({result.returncode})")
     changed = [line for line in result.stdout.splitlines() if line.strip()]
     return GateResult("step0", "clean tree", FAIL if changed else PASS,
-                      {"paths": list(STEP0_PATHS), "changed": changed, **tools})
+                      {"paths": list(STEP0_PATHS), "changed": changed, **tools, **python_env})
 
 
 def _changed_result(gate: str, name: str, ctx: Context) -> GateResult | None:
@@ -1913,10 +1949,10 @@ def gate5_venv_resolution(ctx: Context) -> GateResult:
                                 verified.sha256 if verified is not None else None)
     if not origin["ok"]:
         return GateResult("5", "venv resolution", FAIL, {"venv_python": origin})
-    identity = ctx.run([str(runtime_python), "-I", "-B", "-c",
+    identity = ctx.run_python([str(runtime_python), "-I", "-B", "-c",
                         "import platform; print(platform.python_implementation(), "
                         "platform.python_version(), platform.machine())"])
-    resolved = ctx.run([str(venv / "bin" / "python"), "-I", "-B", "-c",
+    resolved = ctx.run_python([str(venv / "bin" / "python"), "-I", "-B", "-c",
                         "import sys; print(sys.executable); print(sys.prefix); "
                         "print(sys.base_prefix)"])
     lines = resolved.stdout.splitlines()
@@ -1944,9 +1980,9 @@ def gate6_7_lock_and_pip_check(ctx: Context) -> GateResult:
     # Recorded, not judged (residual risk). They have already run once: item 5 starts the
     # venv's python (without -S).
     executed = pth_files(venv)
-    result = ctx.run([str(venv / "bin" / "python"), "-I", "-B",
-                      str(ctx.settings.repo / "scripts" / "check_local_runtime.py")],
-                     cwd=str(ctx.settings.repo))
+    result = ctx.run_python([str(venv / "bin" / "python"), "-I", "-B",
+                             str(ctx.settings.repo / "scripts" / "check_local_runtime.py")],
+                            cwd=str(ctx.settings.repo))
     return GateResult("6-7", "lock consistency and pip check",
                       PASS if result.returncode == 0 else FAIL,
                       {"exit": result.returncode, "output": result.stdout.strip().splitlines(),
@@ -1982,8 +2018,8 @@ def gate8_legacy(ctx: Context) -> GateResult:
     python = venv / "bin" / "python"
     if not python.exists():
         return GateResult("8", "legacy environment", FAIL, {"error": f"{python} not found"})
-    version = ctx.run([str(python), "--version"])
-    freeze = ctx.run([str(python), "-I", "-B", "-m", "pip", "freeze", "--all"])
+    version = ctx.run_python([str(python), "--version"])
+    freeze = ctx.run_python([str(python), "-I", "-B", "-m", "pip", "freeze", "--all"])
     fingerprint = legacy_fingerprint(ctx, venv)
     observed = {"version": (version.stdout or version.stderr).strip(),
                 "fingerprint": fingerprint,
@@ -2040,18 +2076,21 @@ def legacy_cli_worker(check_script: str) -> int:
     return 1 if problems else 0
 
 
-def rollback_readiness(settings: Settings, run: Callable[..., subprocess.CompletedProcess]
-                       ) -> dict[str, Any]:
-    """Read-only: can the CLI be started from the legacy environment again? An error in
-    the check is BLOCKED, never PASS."""
+def rollback_readiness(settings: Settings, run: Callable[..., subprocess.CompletedProcess],
+                       environment: dict[str, str] | None) -> dict[str, Any]:
+    """Read-only: can the CLI be started from the legacy environment again? The legacy
+    Python runs with `environment` (the allowlisted one of Step 0, R6-F05), never the
+    inherited one. An error in the check is BLOCKED, never PASS."""
+    if environment is None:
+        return {"status": BLOCKED, "error": "no prepared Python environment"}
     try:
-        return _rollback_readiness(settings, run)
+        return _rollback_readiness(settings, run, environment)
     except Exception as exc:  # noqa: BLE001 - fail closed
         return {"status": BLOCKED, "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _rollback_readiness(settings: Settings, run: Callable[..., subprocess.CompletedProcess]
-                        ) -> dict[str, Any]:
+def _rollback_readiness(settings: Settings, run: Callable[..., subprocess.CompletedProcess],
+                        environment: dict[str, str]) -> dict[str, Any]:
     legacy = settings.legacy_venv or settings.repo / ".venv"
     launcher = legacy / "bin" / "mtg-notion-manager"
     checks: dict[str, Any] = {"launcher": launcher.is_file() and not launcher.is_symlink()}
@@ -2067,12 +2106,12 @@ def _rollback_readiness(settings: Settings, run: Callable[..., subprocess.Comple
             interpreter = candidate
     checks["interpreter"] = interpreter is not None
     if interpreter is not None:
-        version = run([str(interpreter), "--version"])
+        version = run([str(interpreter), "--version"], env=dict(environment))
         checks["version"] = (version.stdout or version.stderr).strip()
         helped = run([str(interpreter), "-I", "-B", str(Path(__file__).resolve()),
                       "--legacy-cli-worker",
                       str(settings.repo / "scripts" / "check_local_runtime.py")],
-                     cwd=str(settings.repo))
+                     cwd=str(settings.repo), env=dict(environment))
         checks["cli_help_under_audit_hook"] = helped.returncode == 0
     ready = checks["launcher"] and checks.get("shebang_is_legacy_python") is True \
         and checks["interpreter"] and checks.get("version") == LEGACY_VERSION \
@@ -2102,6 +2141,61 @@ def run_metadata(ctx: Context, started: str) -> dict[str, Any]:
             "archive": ctx.artifact.evidence() if ctx.artifact is not None else None}
 
 
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+
+
+def evidence_replacements(repo: Path, home: Path) -> list[tuple[str, str]]:
+    """Path prefixes to anonymize in persisted evidence, longest first, in both Unicode
+    normal forms (macOS reports some paths decomposed)."""
+    import unicodedata
+
+    pairs = []
+    for path, label in ((repo, "<repo>"), (home, "~")):
+        for variant in {str(path), os.path.realpath(path)}:
+            for form in ("NFC", "NFD"):
+                pairs.append((unicodedata.normalize(form, variant), label))
+    return sorted(set(pairs), key=lambda pair: -len(pair[0]))
+
+
+def sanitize_evidence(value: Any, replacements: list[tuple[str, str]]) -> Any:
+    if isinstance(value, dict):
+        return {sanitize_evidence(k, replacements): sanitize_evidence(v, replacements)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [sanitize_evidence(item, replacements) for item in value]
+    if isinstance(value, str):
+        for prefix, label in replacements:
+            value = value.replace(prefix, label)
+        return value
+    return value
+
+
+def export_evidence(report_file: str, out_file: str, repo: Path = REPO_ROOT,
+                    home: Path | None = None) -> int:
+    """R6-F06: write the report with the user's paths anonymized, for persisted evidence.
+    Refuses (exit 2) if the user name, home directory or an e-mail address remains; the
+    report holds no environment values to begin with (names only)."""
+    import getpass
+    import unicodedata
+
+    home = home or Path.home()
+    report = json.loads(Path(report_file).read_text(encoding="utf-8"))
+    clean = sanitize_evidence(report, evidence_replacements(repo, home))
+    text = json.dumps(clean, indent=2, ensure_ascii=False, sort_keys=True)
+    flat = unicodedata.normalize("NFC", text)
+    leaks = [label for label, needle in (("home", str(home)), ("user", getpass.getuser()),
+                                          ("home name", home.name))
+             if needle and needle in flat]
+    if _EMAIL.search(flat):
+        leaks.append("e-mail address")
+    if leaks:
+        print(f"refusing to export: {leaks} still present", file=sys.stderr)
+        return 2
+    with open(out_file, "x", encoding="utf-8") as handle:
+        handle.write(text + "\n")
+    return 0
+
+
 def exit_status(results: list[GateResult]) -> int:
     statuses = {result.status for result in results}
     if statuses == {PASS}:
@@ -2114,6 +2208,8 @@ def main(argv: list[str]) -> int:
         return compile_worker(*argv[1:])
     if argv[:1] == ["--oracle-worker"] and len(argv) == 2:
         return oracle_worker(argv[1])
+    if argv[:1] == ["--export-evidence"] and len(argv) == 3:
+        return export_evidence(argv[1], argv[2])
     if argv[:1] == ["--legacy-cli-worker"] and len(argv) == 2:
         return legacy_cli_worker(argv[1])
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -2127,7 +2223,8 @@ def main(argv: list[str]) -> int:
     ctx = Context(Settings(archive=args.archive.absolute()), default_run, macos_sandbox)
     results = run_gates(ctx)
     status = exit_status(results)
-    rollback = rollback_readiness(ctx.settings, ctx.run) if status == 0 else {"status": NOT_RUN}
+    rollback = rollback_readiness(ctx.settings, ctx.run, ctx.python_environment) \
+        if status == 0 else {"status": NOT_RUN}
     if status == 0 and rollback["status"] != PASS:
         status = 1 if rollback["status"] == FAIL else 2
     report = json.dumps({"metadata": run_metadata(ctx, started),
