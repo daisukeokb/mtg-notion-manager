@@ -9,11 +9,18 @@
     "Decision 06"
   ],
   "status_at_recording": "PASS / READY_FOR_FINAL_HUMAN_ACCEPTANCE (merge and production cutover NOT AUTHORIZED)",
-  "verified_commit": "b3d9f26011b4d301de1c6feb315340efee3ea592",
-  "recorded_in": "the commit that adds this file; it changes docs/evidence/ only, so the verified scripts and Step 0 paths are those of verified_commit",
+  "verified_commit": "0474bbbf8d5d3b564517e31443aa04012d4bc869",
+  "recorded_in": "the commit that updates this file; it changes docs/evidence/ only, so the verified scripts and Step 0 paths are those of verified_commit",
+  "earlier_records": [
+    {
+      "file": "gate-report-b3d9f26.json",
+      "verified_commit": "b3d9f26011b4d301de1c6feb315340efee3ea592",
+      "note": "kept as recorded; exported while the export e-mail check was defective (audit M-1, fixed in 0474bbb); re-scanned with the fixed pattern: no e-mail address"
+    }
+  ],
   "verifier": {
     "path": "scripts/verify_cutover_gate.py",
-    "sha256": "d77a1745152d84bf8d405c7aa9bc21195c76b06e4f5c402208f1618725545d93"
+    "sha256": "43aa71d695d1677e83f0ec56039468705b5045dec4ff03e906e25614224d49d8"
   },
   "archive": {
     "name": "cpython-3.14.10+20261026-aarch64-apple-darwin-install_only.tar.gz",
@@ -21,11 +28,11 @@
     "size": 26891793
   },
   "formal_gate_run": {
-    "started_at": "2026-11-15T02:16:40.713459Z",
-    "finished_at": "2026-11-15T02:16:56.241088Z",
+    "started_at": "2026-11-15T02:36:56.745003Z",
+    "finished_at": "2026-11-15T02:37:11.095807Z",
     "exit_status": 0,
-    "report_file": "gate-report-b3d9f26.json",
-    "report_sha256": "fe5cd47b7ef43a672e010462039419d0c0a7ffd92602920947e1956f6c893a6d",
+    "report_file": "gate-report-0474bbb.json",
+    "report_sha256": "3d36d7f1ef66d614d551dc06f6d286c46f59b2b8f58f4a7aa5386b7a38d0ed05",
     "report_note": "exported with `verify_cutover_gate.py --export-evidence`: home, repository and archive directories anonymized (~, <repo>, <archive-dir>); environment variables appear as names only",
     "gates": {
       "step0": "PASS",
@@ -55,6 +62,18 @@
   },
   "ci": [
     {
+      "commit": "0474bbbf8d5d3b564517e31443aa04012d4bc869",
+      "run_id": 43671067071,
+      "conclusion": "success",
+      "jobs": "test, lint, type-check, generation-workspace: 4/4"
+    },
+    {
+      "commit": "4d0abb0b6b3b768e995840f93ab310539d5c505c",
+      "run_id": 43667874591,
+      "conclusion": "success",
+      "jobs": "4/4"
+    },
+    {
       "commit": "b3d9f26011b4d301de1c6feb315340efee3ea592",
       "run_id": 43667486186,
       "conclusion": "success",
@@ -76,8 +95,8 @@
   ],
   "ci_note": "the run for the commit that adds this file is recorded on PR #51",
   "local_regression_at_verified_commit": {
-    "python_3_14": "1850 passed, 2 skipped (no repo-root .env; no local manifest)",
-    "python_3_9": "1848 passed, 4 skipped (the same 2, and 2 tests needing 3.14)",
+    "python_3_14": "1857 passed, 2 skipped (no repo-root .env; no local manifest)",
+    "python_3_9": "1855 passed, 4 skipped (the same 2, and 2 tests needing 3.14)",
     "generation_workspace": "261 passed",
     "ruff_mypy_static_guard": "clean",
     "credential_guard_local": "FAIL on a host setting: credential.helper in Apple Command Line Tools' built-in gitconfig (not in the repository; the clone's local config has none)",
@@ -129,7 +148,12 @@
       "note": "minor n1-n8 in the PR risk ledger"
     },
     {
-      "scope": "Decision 06 final head",
+      "scope": "Decision 06 final audit (4d0abb0)",
+      "verdict": "FAIL: 1 major (M-1)",
+      "note": "M-1: the export e-mail check never matched (doubled escape) and its test hid it; fixed with direct tests in 0474bbb, together with minor m-B (HOME must be absolute) and m-C (no shallow archive-directory replacement); m-A (pip freeze reads pip.conf) remains an accepted residual"
+    },
+    {
+      "scope": "Decision 06 re-audit of the final head",
       "verdict": "recorded on PR #51"
     }
   ],
