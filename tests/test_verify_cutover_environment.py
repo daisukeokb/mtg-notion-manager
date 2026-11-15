@@ -193,6 +193,7 @@ def _report(home: Path, repo: Path) -> dict[str, Any]:
     decomposed = unicodedata.normalize("NFD", str(repo))
     return {"metadata": {"archive": {"path": f"{home}/work/archive.tar.gz"}},
             "gates": [{"evidence": {"venv": f"{repo}/.venv-py314-r5/bin/python",
+                                    "config": f"{home}/.config/gh/hosts.yml",
                                     "nfd": f"{decomposed}/.venv/bin/python",
                                     "names": ["HOME", "PATH"]}}]}
 
@@ -204,11 +205,24 @@ def test_exported_evidence_has_no_user_paths(tmp_path: Path) -> None:
     source.write_text(json.dumps(_report(home, repo), ensure_ascii=False), encoding="utf-8")
     assert gate.export_evidence(str(source), str(out), repo=repo, home=home) == 0
     text = out.read_text(encoding="utf-8")
-    assert "<repo>/.venv-py314-r5/bin/python" in text and "~/work/archive.tar.gz" in text
+    assert "<repo>/.venv-py314-r5/bin/python" in text and "~/.config/gh/hosts.yml" in text
+    assert "<archive-dir>/archive.tar.gz" in text  # the more specific replacement wins
     assert "<repo>/.venv/bin/python" in text  # the decomposed spelling too
     assert str(home) not in text and "someone" not in text
     with pytest.raises(FileExistsError):  # never overwrites
         gate.export_evidence(str(source), str(out), repo=repo, home=home)
+
+
+def test_the_archive_directory_is_anonymized(tmp_path: Path) -> None:
+    home = tmp_path / "home" / "someone"
+    download = tmp_path / "tmp" / "-Users-someone-scratch" / "archive"
+    report = {"metadata": {"archive": {"path": f"{download}/a.tar.gz"}},
+              "gates": [{"evidence": {"artifact": {"path": f"{download}/a.tar.gz"}}}]}
+    source, out = tmp_path / "report.json", tmp_path / "evidence.json"
+    source.write_text(json.dumps(report), encoding="utf-8")
+    assert gate.export_evidence(str(source), str(out), repo=home / "r", home=home) == 0
+    text = out.read_text(encoding="utf-8")
+    assert text.count("<archive-dir>/a.tar.gz") == 2 and "someone" not in text
 
 
 def test_export_refuses_when_personal_data_remains(tmp_path: Path) -> None:

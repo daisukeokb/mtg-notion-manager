@@ -2180,7 +2180,13 @@ def export_evidence(report_file: str, out_file: str, repo: Path = REPO_ROOT,
 
     home = home or Path.home()
     report = json.loads(Path(report_file).read_text(encoding="utf-8"))
-    clean = sanitize_evidence(report, evidence_replacements(repo, home))
+    replacements = evidence_replacements(repo, home)
+    archive = ((report.get("metadata") or {}).get("archive") or {}).get("path")
+    if archive:  # the download directory can name the user too (e.g. a scratch path)
+        replacements = sorted({*replacements, *((variant, "<archive-dir>") for variant in {
+            os.path.dirname(archive), os.path.dirname(os.path.realpath(archive))})},
+            key=lambda pair: -len(pair[0]))
+    clean = sanitize_evidence(report, replacements)
     text = json.dumps(clean, indent=2, ensure_ascii=False, sort_keys=True)
     flat = unicodedata.normalize("NFC", text)
     leaks = [label for label, needle in (("home", str(home)), ("user", getpass.getuser()),
