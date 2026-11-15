@@ -86,7 +86,7 @@ scriptが追加で行うこと(Phase 3H-R6 Decision 05):
 
    readerが受け付ける型は、compileされたmoduleに現れるものだけ(None・True・False・Ellipsis・int・float・complex・bytes・str・tuple・frozenset・slice・code)。list・dict・set・`TYPE_NULL`・version 0の表現・未知のtagや、読み込み途中のobjectへの参照はREJECTED。上限: 入力8 MiB、object数100万、入れ子の深さ100(参照を解決した後は150)、tuple・frozensetの要素数100万、str・bytesの長さ8 MiB、参照数100万、整数の桁数2,000(15 bit単位)。4件の大きさは27,707〜171,917 byte。frozensetは要素の順序も比較する(CPythonのwriterは要素を各要素のmarshal出力の順に並べるため、参照配置の違いで順序が変わり、同等でも `STRUCTURAL_MISMATCH` になる可能性がある。安全側の誤判定)。
 
-インストール済みのfileのmodeは、実行bit以外はarchiveと比較しない。誰でも書き込めるfileがあればFAILとし、groupが書き込めるfileは件数を記録する。項目5は、実行する前に、`.venv-py314-r5/bin/python` がインストール済みのPython本体のinterpreterであることを確認する(`.venv-py314-r5` は `venv --copies` で作られているため、`bin/python3.14` とsha256が同じ複製であること。symlinkで作られた仮想環境なら、実体がPython本体の `bin` の中にあること)。あわせて `pyvenv.cfg` の `home` がPython本体の `bin` であること。項目6・7は、仮想環境の `.pth` file(interpreterの起動時に実行される)の名前とsha256を記録する(判定には使わない。項目5で仮想環境のpythonを起動した時点で一度実行されている。残課題)。比較には、項目4で検証したarchiveの `python/bin/python3.14` のsha256を使う。
+インストール済みのfileのmodeは、実行bit以外はarchiveと比較しない。誰でも書き込めるfileがあればFAILとし、groupが書き込めるfileは件数を記録する。項目5は、実行する前に、`.venv-py314-r5/bin/python` がインストール済みのPython本体のinterpreterであることを確認する(`.venv-py314-r5` は `venv --copies` で作られているため、項目4で検証したarchiveの `python/bin/python3.14` とsha256が同じ複製であること。symlinkで作られた仮想環境なら、実体がPython本体の `bin` の中にあること)。あわせて `pyvenv.cfg` の `home` がPython本体の `bin` であること。項目6・7は、仮想環境の `.pth` file(interpreterの起動時に実行される)の名前とsha256を記録する(判定には使わない。項目5で仮想環境のpythonを起動した時点で一度実行されている。残課題)。
 
 インストール済みのPython本体・`.pyc`・2つの仮想環境は読むだけで、変更・削除しない。一時directoryは最後に削除する。再compileの一致は、archiveの真正性(項目1〜3)と組み合わせて意味を持つ(展開先のinterpreterも、比較元のsourceも、検証済みのarchiveのもの)。第三者buildそのものの安全性を示すものではない。
 
