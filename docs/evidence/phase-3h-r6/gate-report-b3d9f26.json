@@ -1,0 +1,1405 @@
+{
+  "environment_notice": {
+    "notion": [],
+    "python": []
+  },
+  "gates": [
+    {
+      "evidence": {
+        "changed": [],
+        "dropped_variables": [
+          "AI_AGENT",
+          "APPLICATION_INSIGHTS_NO_STATSBEAT",
+          "CLAUDECODE",
+          "CLAUDE_AGENT_SDK_VERSION",
+          "CLAUDE_CODE_CHILD_SESSION",
+          "CLAUDE_CODE_EMIT_STARTUP_TIMING",
+          "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+          "CLAUDE_CODE_ENABLE_TASKS",
+          "CLAUDE_CODE_ENTRYPOINT",
+          "CLAUDE_CODE_EXECPATH",
+          "CLAUDE_CODE_MESSAGING_SOCKET",
+          "CLAUDE_CODE_MESSAGING_TOKEN",
+          "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT",
+          "CLAUDE_CODE_SESSION_ATTENDED",
+          "CLAUDE_CODE_SESSION_ID",
+          "CLAUDE_CODE_STARTUP_FAILURE_RESULTS",
+          "CLAUDE_EFFORT",
+          "CLAUDE_PID",
+          "COMMAND_MODE",
+          "COPILOT_OTEL_FILE_EXPORTER_PATH",
+          "COREPACK_ENABLE_AUTO_PIN",
+          "CPATH",
+          "ELECTRON_RUN_AS_NODE",
+          "FPATH",
+          "GIT_EDITOR",
+          "HOMEBREW_CELLAR",
+          "HOMEBREW_PREFIX",
+          "HOMEBREW_REPOSITORY",
+          "INFOPATH",
+          "LIBRARY_PATH",
+          "MACH_PORT_RENDEZVOUS_PEER_VALDATION",
+          "MANPATH",
+          "MCP_CONNECTION_NONBLOCKING",
+          "MallocNanoZone",
+          "NoDefaultCurrentDirectoryInExePath",
+          "OLDPWD",
+          "OSLogRateLimit",
+          "PWD",
+          "SDKROOT",
+          "SHELL",
+          "SHLVL",
+          "SSH_AUTH_SOCK",
+          "VSCODE_CODE_CACHE_PATH",
+          "VSCODE_CRASH_REPORTER_PROCESS_TYPE",
+          "VSCODE_CWD",
+          "VSCODE_ESM_ENTRYPOINT",
+          "VSCODE_HANDLES_UNCAUGHT_ERRORS",
+          "VSCODE_IPC_HOOK",
+          "VSCODE_NLS_CONFIG",
+          "VSCODE_NODE_COMPILE_CACHE_KIND",
+          "VSCODE_NODE_COMPILE_CACHE_ROOT",
+          "VSCODE_PID",
+          "XPC_FLAGS",
+          "XPC_SERVICE_NAME",
+          "_",
+          "__CFBundleIdentifier",
+          "__CF_USER_TEXT_ENCODING"
+        ],
+        "inherited_path_would_differ": {},
+        "paths": [
+          "src",
+          "tools",
+          "requirements",
+          "scripts",
+          "pyproject.toml",
+          "config"
+        ],
+        "python_environment": [
+          "HOME",
+          "LANG",
+          "LOGNAME",
+          "PATH",
+          "TMPDIR",
+          "USER"
+        ],
+        "python_environment_dropped": [
+          "AI_AGENT",
+          "APPLICATION_INSIGHTS_NO_STATSBEAT",
+          "CLAUDECODE",
+          "CLAUDE_AGENT_SDK_VERSION",
+          "CLAUDE_CODE_CHILD_SESSION",
+          "CLAUDE_CODE_EMIT_STARTUP_TIMING",
+          "CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING",
+          "CLAUDE_CODE_ENABLE_TASKS",
+          "CLAUDE_CODE_ENTRYPOINT",
+          "CLAUDE_CODE_EXECPATH",
+          "CLAUDE_CODE_MESSAGING_SOCKET",
+          "CLAUDE_CODE_MESSAGING_TOKEN",
+          "CLAUDE_CODE_QUESTION_PREVIEW_FORMAT",
+          "CLAUDE_CODE_SESSION_ATTENDED",
+          "CLAUDE_CODE_SESSION_ID",
+          "CLAUDE_CODE_STARTUP_FAILURE_RESULTS",
+          "CLAUDE_EFFORT",
+          "CLAUDE_PID",
+          "COMMAND_MODE",
+          "COPILOT_OTEL_FILE_EXPORTER_PATH",
+          "COREPACK_ENABLE_AUTO_PIN",
+          "CPATH",
+          "ELECTRON_RUN_AS_NODE",
+          "FPATH",
+          "GIT_EDITOR",
+          "HOMEBREW_CELLAR",
+          "HOMEBREW_PREFIX",
+          "HOMEBREW_REPOSITORY",
+          "INFOPATH",
+          "LIBRARY_PATH",
+          "MACH_PORT_RENDEZVOUS_PEER_VALDATION",
+          "MANPATH",
+          "MCP_CONNECTION_NONBLOCKING",
+          "MallocNanoZone",
+          "NoDefaultCurrentDirectoryInExePath",
+          "OLDPWD",
+          "OSLogRateLimit",
+          "PWD",
+          "SDKROOT",
+          "SHELL",
+          "SHLVL",
+          "SSH_AUTH_SOCK",
+          "VSCODE_CODE_CACHE_PATH",
+          "VSCODE_CRASH_REPORTER_PROCESS_TYPE",
+          "VSCODE_CWD",
+          "VSCODE_ESM_ENTRYPOINT",
+          "VSCODE_HANDLES_UNCAUGHT_ERRORS",
+          "VSCODE_IPC_HOOK",
+          "VSCODE_NLS_CONFIG",
+          "VSCODE_NODE_COMPILE_CACHE_KIND",
+          "VSCODE_NODE_COMPILE_CACHE_ROOT",
+          "VSCODE_PID",
+          "XPC_FLAGS",
+          "XPC_SERVICE_NAME",
+          "_",
+          "__CFBundleIdentifier",
+          "__CF_USER_TEXT_ENCODING"
+        ],
+        "tool_environment": [
+          "HOME",
+          "LANG",
+          "LOGNAME",
+          "PATH",
+          "TMPDIR",
+          "USER"
+        ],
+        "tools": {
+          "find": {
+            "directories": {
+              "/usr/bin": "0o755"
+            },
+            "mode": "0o755",
+            "owner_uid": 0,
+            "path": "/usr/bin/find",
+            "realpath": "/usr/bin/find",
+            "sha256": "503b3a8abd7d9bd2a9ec036bcade4a64e10edbedf8517bb451fe4e923273255b"
+          },
+          "gh": {
+            "directories": {
+              "/opt/homebrew/Cellar/gh/2.96.0/bin": "0o755",
+              "/opt/homebrew/bin": "0o775"
+            },
+            "mode": "0o555",
+            "owner_uid": 501,
+            "path": "/opt/homebrew/bin/gh",
+            "realpath": "/opt/homebrew/Cellar/gh/2.96.0/bin/gh",
+            "sha256": "02d2d4a85241c6a8c0b77ebb1ec76fc723caf7fb128e00915b306b968847cba1",
+            "version": [
+              "gh version 2.96.0 (2026-07-02)"
+            ]
+          },
+          "git": {
+            "directories": {
+              "/usr/bin": "0o755"
+            },
+            "mode": "0o755",
+            "owner_uid": 0,
+            "path": "/usr/bin/git",
+            "realpath": "/usr/bin/git",
+            "sha256": "a961f78075d8e7621ef4f5d764c64ef8a41bf66c0a98ab5cb6ca39b85ce31c93",
+            "version": [
+              "git version 2.50.1 (Apple Git-155)"
+            ]
+          },
+          "shasum": {
+            "directories": {
+              "/usr/bin": "0o755"
+            },
+            "mode": "0o755",
+            "owner_uid": 0,
+            "path": "/usr/bin/shasum",
+            "realpath": "/usr/bin/shasum",
+            "sha256": "0812595f981a26f813d98dc380af14d4af427626c9339eda29eb849ae13de1e3"
+          },
+          "sort": {
+            "directories": {
+              "/usr/bin": "0o755"
+            },
+            "mode": "0o755",
+            "owner_uid": 0,
+            "path": "/usr/bin/sort",
+            "realpath": "/usr/bin/sort",
+            "sha256": "d3fc034bf3184d57ba18017e7b2941652fba370e9992428c232e15d2cab81741"
+          },
+          "xargs": {
+            "directories": {
+              "/usr/bin": "0o755"
+            },
+            "mode": "0o755",
+            "owner_uid": 0,
+            "path": "/usr/bin/xargs",
+            "realpath": "/usr/bin/xargs",
+            "sha256": "fe25901feb673cca012eedb600a8fa0cfac796fdc0cb9fa49e7448cd358fb6b8"
+          }
+        }
+      },
+      "gate": "step0",
+      "name": "clean tree",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "ARCHIVE_SHA256": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4",
+        "artifact": {
+          "device": 16777232,
+          "inode": 51932305,
+          "mtime_ns": 1794705889117034833,
+          "path": "<archive-dir>/cpython-3.14.10+20261026-aarch64-apple-darwin-install_only.tar.gz",
+          "sha256": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4",
+          "size": 26891793
+        },
+        "expected": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4",
+        "name": "cpython-3.14.10+20261026-aarch64-apple-darwin-install_only.tar.gz",
+        "sha256": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4"
+      },
+      "gate": "1",
+      "name": "archive SHA-256",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "digest": "sha256:30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4"
+      },
+      "gate": "2",
+      "name": "release asset digest",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "attestations": 1,
+        "signers": [
+          "https://github.com/astral-sh/python-build-standalone/.github/workflows/release.yml@refs/heads/main"
+        ],
+        "subject_matches": true,
+        "verified_copy_sha256_after": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4",
+        "verified_copy_sha256_before": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4"
+      },
+      "gate": "3",
+      "name": "provenance",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "archive_members": 1701,
+        "archive_unchanged_at_end": true,
+        "archived_pyc": 3,
+        "artifact": {
+          "device": 16777232,
+          "inode": 51932305,
+          "mtime_ns": 1794705889117034833,
+          "path": "<archive-dir>/cpython-3.14.10+20261026-aarch64-apple-darwin-install_only.tar.gz",
+          "sha256": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4",
+          "size": 26891793
+        },
+        "cache_dirs": 52,
+        "different": [],
+        "generated_pyc": 362,
+        "identity": true,
+        "installed_group_writable_files": 0,
+        "installed_world_writable_files": [],
+        "missing": [],
+        "recompilation": {
+          "classification": {
+            "BYTE_IDENTICAL": 361,
+            "MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF": 4,
+            "MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF": 0,
+            "REJECTED": 0,
+            "STRUCTURAL_MISMATCH": 0,
+            "total": 365
+          },
+          "extracted_files_verified": 1692,
+          "identical": 361,
+          "interpreter": {
+            "cache_tag": "cpython-314",
+            "errors": [],
+            "implementation": "CPython",
+            "magic": "2b0e0d0a",
+            "version": "3.14.10"
+          },
+          "jobs": 365,
+          "mismatches": [
+            {
+              "classification": "MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF",
+              "conditions": {
+                "dfile": "~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/python/lib/python3.14/argparse.py",
+                "invalidation_mode": "TIMESTAMP",
+                "optimize": 0
+              },
+              "difference": {
+                "bytes": [
+                  [
+                    9068,
+                    "da",
+                    "7a"
+                  ],
+                  [
+                    9223,
+                    "7c",
+                    "7b"
+                  ],
+                  [
+                    9228,
+                    "7d",
+                    "7c"
+                  ],
+                  [
+                    9233,
+                    "7e",
+                    "7d"
+                  ],
+                  [
+                    10033,
+                    "7e",
+                    "7d"
+                  ],
+                  [
+                    10046,
+                    "7d",
+                    "7c"
+                  ],
+                  [
+                    10051,
+                    "7c",
+                    "7b"
+                  ],
+                  [
+                    10084,
+                    "7e",
+                    "7d"
+                  ],
+                  [
+                    10193,
+                    "7e",
+                    "7d"
+                  ],
+                  [
+                    10554,
+                    "7c",
+                    "7b"
+                  ],
+                  [
+                    10559,
+                    "7e",
+                    "7d"
+                  ],
+                  [
+                    10569,
+                    "7d",
+                    "7c"
+                  ],
+                  [
+                    10606,
+                    "8f",
+                    "8e"
+                  ],
+                  [
+                    10641,
+                    "72",
+                    "da"
+                  ],
+                  [
+                    10642,
+                    "7a",
+                    "16"
+                  ],
+                  [
+                    10643,
+                    "00",
+                    "48"
+                  ],
+                  [
+                    10644,
+                    "00",
+                    "65"
+                  ],
+                  [
+                    10645,
+                    "00",
+                    "6c"
+                  ],
+                  [
+                    10646,
+                    "de",
+                    "70"
+                  ],
+                  [
+                    10647,
+                    "00",
+                    "46"
+                  ]
+                ],
+                "differing_bytes": 79810,
+                "flag_ref_bit_only": false,
+                "header": false,
+                "lengths": [
+                  113647,
+                  113701
+                ],
+                "offset": 9068,
+                "range": [
+                  9068,
+                  9069
+                ]
+              },
+              "flags": 0,
+              "installed_sha256": "456c9a04733335ac851b27c181b164ebf53fb802467cc8c4aafef2fb073bcc9f",
+              "pyc": "python/lib/python3.14/__pycache__/argparse.cpython-314.pyc",
+              "reason": "header identical; the trees differ only in the interned flag (Z / z) of the strings approved by Decision 04",
+              "recompiled_sha256": "6424f466271f4e87ecdc371ffcc500bdf7af16af487f43756e8443618d303669",
+              "structure": {
+                "approved_interning": {
+                  "ok": true,
+                  "rest_identical": true,
+                  "targets": [
+                    {
+                      "installed_tag": "Z",
+                      "path": "<module>.co_consts[27].co_consts[7].co_consts[0]",
+                      "recompiled_tag": "z",
+                      "value": "HelpFormatter._Section"
+                    },
+                    {
+                      "installed_tag": "Z",
+                      "path": "<module>.co_consts[55].co_consts[2].co_consts[0]",
+                      "recompiled_tag": "z",
+                      "value": "_SubParsersAction._ChoicesPseudoAction"
+                    }
+                  ]
+                },
+                "differences": [
+                  {
+                    "installed": {
+                      "children": 0,
+                      "scalars": [
+                        "HelpFormatter._Section"
+                      ],
+                      "tag": "Z"
+                    },
+                    "kind": "tag",
+                    "path": "<module>.co_consts[27].co_consts[7].co_consts[0]",
+                    "recompiled": {
+                      "children": 0,
+                      "scalars": [
+                        "HelpFormatter._Section"
+                      ],
+                      "tag": "z"
+                    }
+                  },
+                  {
+                    "installed": {
+                      "children": 0,
+                      "scalars": [
+                        "_SubParsersAction._ChoicesPseudoAction"
+                      ],
+                      "tag": "Z"
+                    },
+                    "kind": "tag",
+                    "path": "<module>.co_consts[55].co_consts[2].co_consts[0]",
+                    "recompiled": {
+                      "children": 0,
+                      "scalars": [
+                        "_SubParsersAction._ChoicesPseudoAction"
+                      ],
+                      "tag": "z"
+                    }
+                  }
+                ],
+                "equal_without_interned_flag": true,
+                "equivalent": false,
+                "header_identical": true,
+                "installed": {
+                  "flag_refs": 943,
+                  "max_depth": 10,
+                  "objects": 4833,
+                  "tags": {
+                    ")": 447,
+                    ":": 4,
+                    "F": 21,
+                    "N": 108,
+                    "T": 12,
+                    "Z": 704,
+                    "a": 6,
+                    "c": 179,
+                    "g": 1,
+                    "i": 31,
+                    "r": 2636,
+                    "s": 561,
+                    "z": 123
+                  },
+                  "type_refs": 2636
+                },
+                "parsed": true,
+                "recompiled": {
+                  "flag_refs": 943,
+                  "max_depth": 10,
+                  "objects": 4833,
+                  "tags": {
+                    ")": 447,
+                    ":": 4,
+                    "F": 21,
+                    "N": 108,
+                    "T": 12,
+                    "Z": 704,
+                    "a": 6,
+                    "c": 179,
+                    "g": 1,
+                    "i": 31,
+                    "r": 2634,
+                    "s": 561,
+                    "z": 125
+                  },
+                  "type_refs": 2634
+                }
+              }
+            },
+            {
+              "classification": "MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF",
+              "conditions": {
+                "dfile": "~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/python/lib/python3.14/inspect.py",
+                "invalidation_mode": "TIMESTAMP",
+                "optimize": 0
+              },
+              "difference": {
+                "bytes": [
+                  [
+                    91054,
+                    "da",
+                    "7a"
+                  ],
+                  [
+                    93106,
+                    "2b",
+                    "2a"
+                  ],
+                  [
+                    93111,
+                    "2c",
+                    "2b"
+                  ],
+                  [
+                    93475,
+                    "22",
+                    "21"
+                  ],
+                  [
+                    93480,
+                    "27",
+                    "26"
+                  ],
+                  [
+                    93485,
+                    "31",
+                    "30"
+                  ],
+                  [
+                    93541,
+                    "72",
+                    "da"
+                  ],
+                  [
+                    93542,
+                    "1d",
+                    "2c"
+                  ],
+                  [
+                    93543,
+                    "03",
+                    "5f"
+                  ],
+                  [
+                    93544,
+                    "00",
+                    "73"
+                  ],
+                  [
+                    93545,
+                    "00",
+                    "69"
+                  ],
+                  [
+                    93546,
+                    "a0",
+                    "67"
+                  ],
+                  [
+                    93547,
+                    "08",
+                    "6e"
+                  ],
+                  [
+                    93548,
+                    "00",
+                    "61"
+                  ],
+                  [
+                    93549,
+                    "00",
+                    "74"
+                  ],
+                  [
+                    93550,
+                    "73",
+                    "75"
+                  ],
+                  [
+                    93551,
+                    "19",
+                    "72"
+                  ],
+                  [
+                    93552,
+                    "00",
+                    "65"
+                  ],
+                  [
+                    93553,
+                    "00",
+                    "5f"
+                  ],
+                  [
+                    93554,
+                    "00",
+                    "66"
+                  ]
+                ],
+                "differing_bytes": 36924,
+                "flag_ref_bit_only": false,
+                "header": false,
+                "lengths": [
+                  140060,
+                  140101
+                ],
+                "offset": 91054,
+                "range": [
+                  91054,
+                  91055
+                ]
+              },
+              "flags": 0,
+              "installed_sha256": "6e934df79a444dc62ca886c4a5e7b04b769dc5358a30e94bd5c58d4f8c772b32",
+              "pyc": "python/lib/python3.14/__pycache__/inspect.cpython-314.pyc",
+              "reason": "header identical; the trees differ only in the interned flag (Z / z) of the strings approved by Decision 04",
+              "recompiled_sha256": "3c1566d68362a9d88f09dd264cf65bfd92a020c719844e4a69bc59f933deab91",
+              "structure": {
+                "approved_interning": {
+                  "ok": true,
+                  "rest_identical": true,
+                  "targets": [
+                    {
+                      "installed_tag": "Z",
+                      "path": "<module>.co_consts[228].co_consts[9].co_consts[0]",
+                      "recompiled_tag": "z",
+                      "value": "_signature_fromstr.<locals>.RewriteSymbolics"
+                    }
+                  ]
+                },
+                "differences": [
+                  {
+                    "installed": {
+                      "children": 0,
+                      "scalars": [
+                        "_signature_fromstr.<locals>.RewriteSymbolics"
+                      ],
+                      "tag": "Z"
+                    },
+                    "kind": "tag",
+                    "path": "<module>.co_consts[228].co_consts[9].co_consts[0]",
+                    "recompiled": {
+                      "children": 0,
+                      "scalars": [
+                        "_signature_fromstr.<locals>.RewriteSymbolics"
+                      ],
+                      "tag": "z"
+                    }
+                  }
+                ],
+                "equal_without_interned_flag": true,
+                "equivalent": false,
+                "header_identical": true,
+                "installed": {
+                  "flag_refs": 1127,
+                  "max_depth": 9,
+                  "objects": 4859,
+                  "tags": {
+                    "(": 1,
+                    ")": 454,
+                    ":": 5,
+                    "F": 21,
+                    "N": 80,
+                    "T": 17,
+                    "Z": 889,
+                    "a": 30,
+                    "c": 175,
+                    "i": 21,
+                    "r": 2448,
+                    "s": 548,
+                    "z": 170
+                  },
+                  "type_refs": 2448
+                },
+                "parsed": true,
+                "recompiled": {
+                  "flag_refs": 1127,
+                  "max_depth": 9,
+                  "objects": 4859,
+                  "tags": {
+                    "(": 1,
+                    ")": 454,
+                    ":": 5,
+                    "F": 21,
+                    "N": 80,
+                    "T": 17,
+                    "Z": 889,
+                    "a": 30,
+                    "c": 175,
+                    "i": 21,
+                    "r": 2447,
+                    "s": 548,
+                    "z": 171
+                  },
+                  "type_refs": 2447
+                }
+              }
+            },
+            {
+              "classification": "MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF",
+              "conditions": {
+                "dfile": "~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/python/lib/python3.14/typing.py",
+                "invalidation_mode": "TIMESTAMP",
+                "optimize": 0
+              },
+              "difference": {
+                "bytes": [
+                  [
+                    145760,
+                    "da",
+                    "7a"
+                  ],
+                  [
+                    146250,
+                    "53",
+                    "52"
+                  ],
+                  [
+                    146273,
+                    "72",
+                    "da"
+                  ],
+                  [
+                    146274,
+                    "50",
+                    "26"
+                  ],
+                  [
+                    146275,
+                    "04",
+                    "4e"
+                  ],
+                  [
+                    146276,
+                    "00",
+                    "65"
+                  ],
+                  [
+                    146277,
+                    "00",
+                    "77"
+                  ],
+                  [
+                    146278,
+                    "92",
+                    "54"
+                  ],
+                  [
+                    146279,
+                    "0d",
+                    "79"
+                  ],
+                  [
+                    146280,
+                    "00",
+                    "70"
+                  ],
+                  [
+                    146281,
+                    "00",
+                    "65"
+                  ],
+                  [
+                    146282,
+                    "73",
+                    "2e"
+                  ],
+                  [
+                    146283,
+                    "0f",
+                    "5f"
+                  ],
+                  [
+                    146284,
+                    "00",
+                    "5f"
+                  ],
+                  [
+                    146285,
+                    "00",
+                    "6d"
+                  ],
+                  [
+                    146286,
+                    "00",
+                    "72"
+                  ],
+                  [
+                    146287,
+                    "f9",
+                    "6f"
+                  ],
+                  [
+                    146288,
+                    "87",
+                    "5f"
+                  ],
+                  [
+                    146289,
+                    "00",
+                    "65"
+                  ],
+                  [
+                    146290,
+                    "80",
+                    "6e"
+                  ]
+                ],
+                "differing_bytes": 21745,
+                "flag_ref_bit_only": false,
+                "header": false,
+                "lengths": [
+                  171882,
+                  171917
+                ],
+                "offset": 145760,
+                "range": [
+                  145760,
+                  145761
+                ]
+              },
+              "flags": 0,
+              "installed_sha256": "83aba4fe3e19880f888a057b72c1bcb3da75b0ad9ff3d657daa76fe157e63573",
+              "pyc": "python/lib/python3.14/__pycache__/typing.cpython-314.pyc",
+              "reason": "header identical; the trees differ only in the interned flag (Z / z) of the strings approved by Decision 04",
+              "recompiled_sha256": "cf0b4f55949245f91035c25c5101b60f76f8cc732a6fb0c76faa77b76bcd1aa2",
+              "structure": {
+                "approved_interning": {
+                  "ok": true,
+                  "rest_identical": true,
+                  "targets": [
+                    {
+                      "installed_tag": "Z",
+                      "path": "<module>.co_consts[295].co_consts[4].co_consts[0].co_consts[0]",
+                      "recompiled_tag": "z",
+                      "value": "NewType.__mro_entries__.<locals>.Dummy"
+                    }
+                  ]
+                },
+                "differences": [
+                  {
+                    "installed": {
+                      "children": 0,
+                      "scalars": [
+                        "NewType.__mro_entries__.<locals>.Dummy"
+                      ],
+                      "tag": "Z"
+                    },
+                    "kind": "tag",
+                    "path": "<module>.co_consts[295].co_consts[4].co_consts[0].co_consts[0]",
+                    "recompiled": {
+                      "children": 0,
+                      "scalars": [
+                        "NewType.__mro_entries__.<locals>.Dummy"
+                      ],
+                      "tag": "z"
+                    }
+                  }
+                ],
+                "equal_without_interned_flag": true,
+                "equivalent": false,
+                "header_identical": true,
+                "installed": {
+                  "flag_refs": 1326,
+                  "max_depth": 11,
+                  "objects": 7292,
+                  "tags": {
+                    "(": 1,
+                    ")": 689,
+                    ".": 8,
+                    ":": 1,
+                    ">": 12,
+                    "F": 18,
+                    "N": 100,
+                    "T": 27,
+                    "Z": 862,
+                    "a": 52,
+                    "c": 336,
+                    "i": 45,
+                    "r": 3998,
+                    "s": 986,
+                    "z": 157
+                  },
+                  "type_refs": 3998
+                },
+                "parsed": true,
+                "recompiled": {
+                  "flag_refs": 1326,
+                  "max_depth": 11,
+                  "objects": 7292,
+                  "tags": {
+                    "(": 1,
+                    ")": 689,
+                    ".": 8,
+                    ":": 1,
+                    ">": 12,
+                    "F": 18,
+                    "N": 100,
+                    "T": 27,
+                    "Z": 862,
+                    "a": 52,
+                    "c": 336,
+                    "i": 45,
+                    "r": 3997,
+                    "s": 986,
+                    "z": 158
+                  },
+                  "type_refs": 3997
+                }
+              }
+            },
+            {
+              "classification": "MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF",
+              "conditions": {
+                "dfile": "~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/python/lib/python3.14/weakref.py",
+                "invalidation_mode": "TIMESTAMP",
+                "optimize": 0
+              },
+              "difference": {
+                "bytes": [
+                  [
+                    21142,
+                    "da",
+                    "7a"
+                  ],
+                  [
+                    21264,
+                    "72",
+                    "da"
+                  ],
+                  [
+                    21265,
+                    "03",
+                    "0e"
+                  ],
+                  [
+                    21266,
+                    "01",
+                    "66"
+                  ],
+                  [
+                    21267,
+                    "00",
+                    "69"
+                  ],
+                  [
+                    21268,
+                    "00",
+                    "6e"
+                  ],
+                  [
+                    21269,
+                    "d1",
+                    "61"
+                  ],
+                  [
+                    21270,
+                    "01",
+                    "6c"
+                  ],
+                  [
+                    21271,
+                    "00",
+                    "69"
+                  ],
+                  [
+                    21272,
+                    "00",
+                    "7a"
+                  ],
+                  [
+                    21273,
+                    "73",
+                    "65"
+                  ],
+                  [
+                    21274,
+                    "07",
+                    "2e"
+                  ],
+                  [
+                    21275,
+                    "00",
+                    "5f"
+                  ],
+                  [
+                    21276,
+                    "00",
+                    "49"
+                  ],
+                  [
+                    21277,
+                    "00",
+                    "6e"
+                  ],
+                  [
+                    21278,
+                    "86",
+                    "66"
+                  ],
+                  [
+                    21279,
+                    "00",
+                    "6f"
+                  ],
+                  [
+                    21280,
+                    "d8",
+                    "d1"
+                  ],
+                  [
+                    21281,
+                    "14",
+                    "01"
+                  ],
+                  [
+                    21282,
+                    "4c",
+                    "00"
+                  ]
+                ],
+                "differing_bytes": 4710,
+                "flag_ref_bit_only": false,
+                "header": false,
+                "lengths": [
+                  27707,
+                  27718
+                ],
+                "offset": 21142,
+                "range": [
+                  21142,
+                  21143
+                ]
+              },
+              "flags": 0,
+              "installed_sha256": "209a12ba13956f14df6f1935608f01439a464b202acd6a6bf5720a26dc7e1a33",
+              "pyc": "python/lib/python3.14/__pycache__/weakref.cpython-314.pyc",
+              "reason": "header identical; the trees differ only in the interned flag (Z / z) of the strings approved by Decision 04",
+              "recompiled_sha256": "43d18f88d6500815a408942dec31e9d7b3abdadfe75977677e59298d708ed5ab",
+              "structure": {
+                "approved_interning": {
+                  "ok": true,
+                  "rest_identical": true,
+                  "targets": [
+                    {
+                      "installed_tag": "Z",
+                      "path": "<module>.co_consts[13].co_consts[4].co_consts[0]",
+                      "recompiled_tag": "z",
+                      "value": "finalize._Info"
+                    }
+                  ]
+                },
+                "differences": [
+                  {
+                    "installed": {
+                      "children": 0,
+                      "scalars": [
+                        "finalize._Info"
+                      ],
+                      "tag": "Z"
+                    },
+                    "kind": "tag",
+                    "path": "<module>.co_consts[13].co_consts[4].co_consts[0]",
+                    "recompiled": {
+                      "children": 0,
+                      "scalars": [
+                        "finalize._Info"
+                      ],
+                      "tag": "z"
+                    }
+                  }
+                ],
+                "equal_without_interned_flag": true,
+                "equivalent": false,
+                "header_identical": true,
+                "installed": {
+                  "flag_refs": 331,
+                  "max_depth": 9,
+                  "objects": 1409,
+                  "tags": {
+                    ")": 139,
+                    "F": 4,
+                    "N": 18,
+                    "T": 4,
+                    "Z": 218,
+                    "a": 6,
+                    "c": 70,
+                    "i": 6,
+                    "r": 715,
+                    "s": 217,
+                    "z": 12
+                  },
+                  "type_refs": 715
+                },
+                "parsed": true,
+                "recompiled": {
+                  "flag_refs": 331,
+                  "max_depth": 9,
+                  "objects": 1409,
+                  "tags": {
+                    ")": 139,
+                    "F": 4,
+                    "N": 18,
+                    "T": 4,
+                    "Z": 218,
+                    "a": 6,
+                    "c": 70,
+                    "i": 6,
+                    "r": 714,
+                    "s": 217,
+                    "z": 13
+                  },
+                  "type_refs": 714
+                }
+              }
+            }
+          ],
+          "probe": {
+            "network": "denied",
+            "read_home": "denied",
+            "write_outside": "denied",
+            "write_work": "allowed"
+          },
+          "reader": {
+            "conformance": {
+              "checks": {
+                "extra_refs_equivalent": true,
+                "fields_base": true,
+                "fields_extra_refs": true,
+                "fields_renamed": true,
+                "fields_variant": true,
+                "layout_differs": true,
+                "renamed_different": true,
+                "type_refs_present": true,
+                "types_covered": true,
+                "variant_different": true
+              },
+              "sha256": {
+                "base": "947ae985d4473d317e10224570a1f580decdb9aad1f3f62c9e654256e2a21a1d",
+                "base_extra_refs": "44eaefb6e80f74896fe9184396619da11b707bd7341e25c8d5ac4723bcc6c1ea",
+                "renamed": "2fe2301b5b00b769bd4a92bb56d85ea0ce64645d08d87351cd61d5437681cf4b",
+                "variant": "9ce0adf8b6acce15157366ab094c8ffb8c01848947fb857013a09e4750da68c5"
+              },
+              "stats": {
+                "base": {
+                  "flag_refs": 69,
+                  "max_depth": 9,
+                  "objects": 168,
+                  "tags": {
+                    ")": 22,
+                    ".": 1,
+                    ":": 1,
+                    ">": 1,
+                    "A": 1,
+                    "F": 2,
+                    "N": 5,
+                    "T": 1,
+                    "Z": 52,
+                    "a": 1,
+                    "c": 7,
+                    "g": 2,
+                    "i": 5,
+                    "l": 2,
+                    "r": 37,
+                    "s": 24,
+                    "u": 1,
+                    "y": 1,
+                    "z": 2
+                  },
+                  "type_refs": 37
+                },
+                "base_extra_refs": {
+                  "flag_refs": 88,
+                  "max_depth": 9,
+                  "objects": 168,
+                  "tags": {
+                    ")": 22,
+                    ".": 1,
+                    ":": 1,
+                    ">": 1,
+                    "A": 1,
+                    "F": 2,
+                    "N": 5,
+                    "T": 1,
+                    "Z": 52,
+                    "a": 1,
+                    "c": 7,
+                    "g": 2,
+                    "i": 5,
+                    "l": 2,
+                    "r": 37,
+                    "s": 24,
+                    "u": 1,
+                    "y": 1,
+                    "z": 2
+                  },
+                  "type_refs": 37
+                },
+                "renamed": {
+                  "flag_refs": 69,
+                  "max_depth": 9,
+                  "objects": 168,
+                  "tags": {
+                    ")": 22,
+                    ".": 1,
+                    ":": 1,
+                    ">": 1,
+                    "A": 1,
+                    "F": 2,
+                    "N": 5,
+                    "T": 1,
+                    "Z": 52,
+                    "a": 1,
+                    "c": 7,
+                    "g": 2,
+                    "i": 5,
+                    "l": 2,
+                    "r": 37,
+                    "s": 24,
+                    "u": 1,
+                    "y": 1,
+                    "z": 2
+                  },
+                  "type_refs": 37
+                },
+                "variant": {
+                  "flag_refs": 69,
+                  "max_depth": 9,
+                  "objects": 168,
+                  "tags": {
+                    ")": 22,
+                    ".": 1,
+                    ":": 1,
+                    ">": 1,
+                    "A": 1,
+                    "F": 2,
+                    "N": 5,
+                    "T": 1,
+                    "Z": 52,
+                    "a": 1,
+                    "c": 7,
+                    "g": 2,
+                    "i": 5,
+                    "l": 2,
+                    "r": 37,
+                    "s": 24,
+                    "u": 1,
+                    "y": 1,
+                    "z": 2
+                  },
+                  "type_refs": 37
+                }
+              },
+              "status": "PASS"
+            },
+            "format": {
+              "magic": "2b0e0d0a",
+              "marshal_version": 5,
+              "pyc_magic_number": 3627,
+              "python": "3.14.10",
+              "source": "CPython v3.14.10: Python/marshal.c, Objects/codeobject.c"
+            },
+            "limits": {
+              "container": 1000000,
+              "depth": 100,
+              "height": 150,
+              "input_bytes": 8388608,
+              "long_digits": 2000,
+              "objects": 1000000,
+              "refs": 1000000,
+              "string": 8388608
+            }
+          }
+        },
+        "regular_entries": 1698,
+        "unexpected": []
+      },
+      "gate": "4",
+      "name": "local Python runtime",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "executable_prefix_base": [
+          "<repo>/.venv-py314-r5/bin/python",
+          "<repo>/.venv-py314-r5",
+          "~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/python"
+        ],
+        "runtime": "CPython 3.14.10 arm64",
+        "venv_python": {
+          "kind": "copy",
+          "ok": true,
+          "pyvenv_home": "~/.local/share/mtg-notion-manager/runtimes/cpython-3.14.10+20261026/python/bin",
+          "runtime_python3_14_sha256": "4ea27c03ca77725ab30d944ca832f310aee8a8be20ff48ae984f7faaf556567f",
+          "sha256": "4ea27c03ca77725ab30d944ca832f310aee8a8be20ff48ae984f7faaf556567f"
+        }
+      },
+      "gate": "5",
+      "name": "venv resolution",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "exit": 0,
+        "output": [
+          "ok: CPython 3.14.10 at <repo>/.venv-py314-r5/bin/python; distributions match the lock; pip check passed",
+          "ok: --help of the CLI and its 12 commands rendered"
+        ],
+        "pth_files": {
+          "lib/python3.14/site-packages/_editable_impl_mtg_notion_manager.pth": "5addff3b5d5263046a2af99a1041f9fa977e8c89c30d7200dd8b883be1740631",
+          "lib/python3.14/site-packages/_editable_impl_wp_claim_exit_generation_workspace.pth": "9082aba79966adfa7b3112a41a742cea8d197ae9b38e92dabba956901d117500"
+        }
+      },
+      "gate": "6-7",
+      "name": "lock consistency and pip check",
+      "status": "PASS"
+    },
+    {
+      "evidence": {
+        "fingerprint": "c5e0c2be7730366ea961e699524232522383890d3d86f92eb2647cc851ee5087",
+        "freeze": "54d878d575ac887517cd30433dec08e1c4b03cb9862999b54ae498617680e7de",
+        "version": "Python 3.9.6"
+      },
+      "gate": "8",
+      "name": "legacy environment",
+      "status": "PASS"
+    }
+  ],
+  "metadata": {
+    "archive": {
+      "device": 16777232,
+      "inode": 51932305,
+      "mtime_ns": 1794705889117034833,
+      "path": "<archive-dir>/cpython-3.14.10+20261026-aarch64-apple-darwin-install_only.tar.gz",
+      "sha256": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4",
+      "size": 26891793
+    },
+    "commit": "b3d9f26011b4d301de1c6feb315340efee3ea592",
+    "finished_at": "2026-11-15T02:16:56.241088Z",
+    "script_sha256": "d77a1745152d84bf8d405c7aa9bc21195c76b06e4f5c402208f1618725545d93",
+    "started_at": "2026-11-15T02:16:40.713459Z",
+    "verifier_python": "3.9.6"
+  },
+  "rollback_readiness": {
+    "checks": {
+      "cli_help_under_audit_hook": true,
+      "interpreter": true,
+      "launcher": true,
+      "shebang_is_legacy_python": true,
+      "version": "Python 3.9.6"
+    },
+    "status": "PASS"
+  }
+}

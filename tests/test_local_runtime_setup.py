@@ -266,7 +266,9 @@ sys.exit(0 if problems else 3)
 def test_check_cli_refuses_and_reports_an_env_read(tmp_path: Path) -> None:
     dummy = tmp_path / ".env"
     dummy.write_text("NOTION_API_KEY=test-dummy-not-a-real-secret\n", encoding="utf-8")
-    result = subprocess.run([sys.executable, "-I", "-c", _CHILD, str(CHECK), str(dummy)],
+    # -B: -I ignores PYTHONDONTWRITEBYTECODE, and the child must not write caches into the
+    # environment running the tests (Phase 3H-R6 F01).
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", _CHILD, str(CHECK), str(dummy)],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             check=False, timeout=60)
     assert result.returncode == 0, result.stdout
