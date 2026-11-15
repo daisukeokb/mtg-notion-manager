@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 from pathlib import Path
@@ -316,7 +317,13 @@ def test_tools_come_from_trusted_directories_not_from_path(
     assert result.status == gate.PASS, result.evidence
     real_trusted = os.path.realpath(trusted)
     assert ctx.tools["git"] == os.path.join(real_trusted, "git")  # the checked real path
-    assert result.evidence["inherited_path_would_differ"]["git"] == str(evil)
+    # What PATH would have run is only recorded. On a noexec tmp (the CI container)
+    # shutil.which skips the planted file, so compare with what it really finds here.
+    would_run = shutil.which("git")
+    if would_run is not None and os.path.realpath(would_run) != ctx.tools["git"]:
+        assert result.evidence["inherited_path_would_differ"]["git"] == would_run
+    else:
+        assert "git" not in result.evidence["inherited_path_would_differ"]
     assert result.evidence["tools"]["git"]["sha256"] == gate.sha256_file(trusted / "git")
     assert all(c[0].startswith(real_trusted) for c in run.commands)
     assert ctx.tool_environment["PATH"] == str(trusted)
