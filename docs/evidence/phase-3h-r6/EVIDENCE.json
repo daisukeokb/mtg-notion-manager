@@ -1,0 +1,164 @@
+{
+  "phase": "3H-R6 Production Cutover Readiness Verification",
+  "decisions": [
+    "Decision 01",
+    "Decision 02",
+    "Decision 03",
+    "Decision 04",
+    "Decision 05",
+    "Decision 06"
+  ],
+  "status_at_recording": "PASS / READY_FOR_FINAL_HUMAN_ACCEPTANCE (merge and production cutover NOT AUTHORIZED)",
+  "verified_commit": "b3d9f26011b4d301de1c6feb315340efee3ea592",
+  "recorded_in": "the commit that adds this file; it changes docs/evidence/ only, so the verified scripts and Step 0 paths are those of verified_commit",
+  "verifier": {
+    "path": "scripts/verify_cutover_gate.py",
+    "sha256": "d77a1745152d84bf8d405c7aa9bc21195c76b06e4f5c402208f1618725545d93"
+  },
+  "archive": {
+    "name": "cpython-3.14.10+20261026-aarch64-apple-darwin-install_only.tar.gz",
+    "sha256": "30a18bcb9ab75e485b4bf4e5d783dde165571e7e42c56dff47a2d2c5345183a4",
+    "size": 26891793
+  },
+  "formal_gate_run": {
+    "started_at": "2026-11-15T02:16:40.713459Z",
+    "finished_at": "2026-11-15T02:16:56.241088Z",
+    "exit_status": 0,
+    "report_file": "gate-report-b3d9f26.json",
+    "report_sha256": "fe5cd47b7ef43a672e010462039419d0c0a7ffd92602920947e1956f6c893a6d",
+    "report_note": "exported with `verify_cutover_gate.py --export-evidence`: home, repository and archive directories anonymized (~, <repo>, <archive-dir>); environment variables appear as names only",
+    "gates": {
+      "step0": "PASS",
+      "1": "PASS",
+      "2": "PASS",
+      "3": "PASS",
+      "4": "PASS",
+      "5": "PASS",
+      "6-7": "PASS",
+      "8": "PASS"
+    },
+    "rollback_readiness": "PASS",
+    "gate4_pyc_classification": {
+      "BYTE_IDENTICAL": 361,
+      "MARSHAL_EQUIVALENT_APPROVED_INTERNING_DIFF": 4,
+      "MARSHAL_EQUIVALENT_REF_LAYOUT_DIFF": 0,
+      "REJECTED": 0,
+      "STRUCTURAL_MISMATCH": 0,
+      "total": 365
+    },
+    "gate4_reader_conformance": "PASS",
+    "gate8_legacy": {
+      "fingerprint": "c5e0c2be7730366ea961e699524232522383890d3d86f92eb2647cc851ee5087",
+      "freeze": "54d878d575ac887517cd30433dec08e1c4b03cb9862999b54ae498617680e7de",
+      "version": "Python 3.9.6"
+    }
+  },
+  "ci": [
+    {
+      "commit": "b3d9f26011b4d301de1c6feb315340efee3ea592",
+      "run_id": 43667486186,
+      "conclusion": "success",
+      "jobs": "test, lint, type-check, generation-workspace: 4/4",
+      "tests": "1850 passed, 2 skipped (network-isolated container); generation workspace 261 passed; credential guard ok in 4 jobs"
+    },
+    {
+      "commit": "fbc9f0f0c298e01f0f72234d58e776fbb0a746c0",
+      "run_id": 43666832513,
+      "conclusion": "success",
+      "jobs": "4/4"
+    },
+    {
+      "commit": "8d5aa86dd79a3f04f536923916fb5c9189048886",
+      "run_id": 43663665579,
+      "conclusion": "success",
+      "jobs": "4/4"
+    }
+  ],
+  "ci_note": "the run for the commit that adds this file is recorded on PR #51",
+  "local_regression_at_verified_commit": {
+    "python_3_14": "1850 passed, 2 skipped (no repo-root .env; no local manifest)",
+    "python_3_9": "1848 passed, 4 skipped (the same 2, and 2 tests needing 3.14)",
+    "generation_workspace": "261 passed",
+    "ruff_mypy_static_guard": "clean",
+    "credential_guard_local": "FAIL on a host setting: credential.helper in Apple Command Line Tools' built-in gitconfig (not in the repository; the clone's local config has none)",
+    "conditions": "git clone at the commit, no .env, env -i, PYTHONDONTWRITEBYTECODE=1, PYTHONPYCACHEPREFIX outside the repository, -I -B -p no:cacheprovider",
+    "intermittent": "one Python 3.9 full run at fbc9f0f had 1 failure whose test name was not captured; three re-runs and the run at the verified commit passed. Not identified; not claimed to be the known timing test."
+  },
+  "preservation": {
+    "method": "a snapshot (type, mode, size, mtime, sha256 of every entry, symlinks not followed) before and after, compared byte for byte",
+    "window": "2026-11-15T01:24Z (first snapshot of the day) through the formal run and the full regression at the verified commit",
+    "entries": {
+      "runtime": 2278,
+      ".venv-py314-r5": 5409,
+      ".venv": 3607
+    },
+    "result": "unchanged",
+    "snapshot_file_sha256_prefix": {
+      "runtime": "ddf528c31638ad0e",
+      ".venv-py314-r5": "6b0e694644d3a493",
+      ".venv": "51821874865d53d2"
+    },
+    "independent_checks": [
+      "gate 4 compares the runtime with the verified archive",
+      "gate 8 compares .venv with the Phase 3H-R5 baseline (fingerprint c5e0c2be..., freeze 54d878d5...)"
+    ],
+    "limitation": "the snapshots taken at the start of R6 were lost (see governance_exceptions); a byte-for-byte comparison with them is no longer possible"
+  },
+  "independent_audits": [
+    {
+      "scope": "Decision 03 marshal reader",
+      "verdict": "no false-PASS path"
+    },
+    {
+      "scope": "Decision 04 interning rule",
+      "verdict": "PASS"
+    },
+    {
+      "scope": "R6 branch security audit (897c709)",
+      "verdict": "PASS",
+      "note": "its findings became Decision 05"
+    },
+    {
+      "scope": "Decision 05 remediation (92fcb15)",
+      "verdict": "PASS, 0 critical, 0 major",
+      "note": "m1-m6 fixed in 166c2d7"
+    },
+    {
+      "scope": "final head (8c6f726 and the 8d5aa86 addendum)",
+      "verdict": "PASS, 0 critical, 0 major",
+      "note": "minor n1-n8 in the PR risk ledger"
+    },
+    {
+      "scope": "Decision 06 final head",
+      "verdict": "recorded on PR #51"
+    }
+  ],
+  "governance_exceptions": [
+    {
+      "id": "F01",
+      "status": "REMEDIATED / HISTORICAL EVIDENCE PARTIALLY LOST",
+      "what": "a local Python 3.14 regression wrote 38 pytest assertion-rewrite caches into .venv-py314-r5 (Decision 02 constraint); removed with approval (Decision 05) after verification; prevention in place",
+      "lost": "the target list (sha256 6375444b...) and the deletion log, kept in a temporary scratch directory; they were reviewed by an independent auditor before they were lost and are not reconstructed"
+    },
+    {
+      "id": "evidence-loss-2026-11-15",
+      "what": "the temporary scratch directory was emptied when the session restarted: the R6-start snapshots, the F01 evidence and earlier gate reports were lost; nothing was reconstructed. From R6-F06 on, evidence is committed here"
+    },
+    {
+      "id": "own-defects",
+      "what": "a formal run at f2ebd93 failed gate 5 (a pre-check assumed a symlinked venv; .venv-py314-r5 was made with --copies), fixed in 92fcb15; a CI test assumed an executable tmp, fixed in 8d5aa86"
+    },
+    {
+      "id": "ci-flake",
+      "what": "CI at 8c6f726 also failed the pre-existing timing-dependent test tests/test_cli_error_contract.py::test_apply_price_link_dedupe_error_json_dry_run_matches_human_output"
+    }
+  ],
+  "production_access": 0,
+  "storage": {
+    "location": "git repository daisukeokb/mtg-notion-manager, docs/evidence/phase-3h-r6/ (branch fix/phase-3h-r6-production-cutover-readiness, PR #51)",
+    "visibility": "public repository: readable by anyone; writable by repository collaborators only",
+    "retention": "permanent in git history while the commit is reachable (merged to main or the branch kept); not subject to an artifact expiry",
+    "why_not_actions_artifact": "an Actions artifact of a public repository is equally readable, expires after at most 90 days, and would need a change of the reviewed CI workflow",
+    "content_rules": "no secrets, no environment values, user paths anonymized"
+  }
+}
