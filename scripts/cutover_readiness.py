@@ -52,6 +52,7 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -270,6 +271,42 @@ def compare_tree(name: str, expected: dict[str, str], tree: Tree) -> list[str]:
     return problems
 
 
+def fold(name: str) -> str:
+    """How a case-insensitive, normalization-insensitive volume (macOS APFS by default) sees a
+    name: every name check compares folded names, so a differently spelled file that the
+    interpreter would still open under its fixed name cannot pass unnoticed."""
+    return unicodedata.normalize("NFD", name).casefold()
+
+
+#: Path components with a meaning to getpath / site.py; any other spelling that folds to the
+#: same name fails.
+SPECIAL_NAMES = ("bin", "lib", "site-packages", "lib-dynload", "pyvenv.cfg", "pybuilddir.txt",
+                 "os.py", "os.pyc", "__pycache__")
+
+
+def name_problems(name: str, tree: dict[str, str], major_minor: str) -> list[str]:
+    """Collisions under folding, special names in another spelling, and lib/python* entries
+    other than lib/python<major.minor>."""
+    problems = []
+    folded: dict[str, str] = {}
+    canonical = {fold(n): n for n in SPECIAL_NAMES}
+    expected = f"python{major_minor}"
+    for key in sorted(tree):
+        if fold(key) in folded:
+            problems.append(f"{name}: names collide when case or Unicode form is ignored: "
+                            f"{folded[fold(key)]!r} / {key!r}")
+        folded[fold(key)] = key
+        parts = key.split("/")
+        for part in parts:
+            if fold(part) in canonical and part != canonical[fold(part)]:
+                problems.append(f"{name}: special name in another spelling: {key!r}")
+                break
+        if len(parts) > 1 and fold(parts[0]) == "lib" and fold(parts[1]).startswith("python") \
+                and parts[1] != expected:
+            problems.append(f"{name}: unexpected lib/python directory: {key!r}")
+    return problems
+
+
 def _inside(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
@@ -429,12 +466,12 @@ def startup_hooks(directories: list[Path]) -> list[str]:
         if not directory.is_dir():
             continue
         for entry in sorted(os.listdir(directory)):
-            if entry.split(".", 1)[0] in STARTUP_HOOKS:
+            if fold(entry.split(".", 1)[0]) in STARTUP_HOOKS:
                 found.append(str(directory / entry))
         cache = directory / "__pycache__"
         if cache.is_dir():
             found += [str(cache / e) for e in sorted(os.listdir(cache))
-                      if e.split(".", 1)[0] in STARTUP_HOOKS]
+                      if fold(e.split(".", 1)[0]) in STARTUP_HOOKS]
     return found
 
 
@@ -544,8 +581,8 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
     # ._pth files replace sys.path entirely (checked by getpath before home and venv);
     # a second pyvenv.cfg next to the interpreter is read by site.venv() first.
     replacing = sorted(f"{name}:{k}" for name in TREES for k in manifest["trees"][name]
-                       if k.endswith("._pth")) + \
-        (["venv:bin/pyvenv.cfg"] if "bin/pyvenv.cfg" in manifest["trees"]["venv"] else [])
+                       if fold(k).endswith("._pth")) + \
+        [f"venv:{k}" for k in manifest["trees"]["venv"] if fold(k) == "bin/pyvenv.cfg"]
     if replacing:
         return stop("runtime_version", FAIL, f"sys.path replacing files: {replacing}")
     if not _SHA256.fullmatch(runtime_tree.get(base_python, "")):
@@ -558,10 +595,14 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
     if not _SHA256.fullmatch(runtime_tree.get(landmark, "")):
         return stop("runtime_version", FAIL, f"the runtime inventory has no {landmark}")
     shadowing = sorted(k for k in runtime_tree
-                       if k.startswith(("bin/lib/", "bin/Lib/", "bin/Modules/"))
-                       or k in ("bin/pybuilddir.txt", "bin/os.py", "bin/os.pyc"))
+                       if fold(k).startswith(("bin/lib/", "bin/modules/"))
+                       or fold(k) in ("bin/pybuilddir.txt", "bin/os.py", "bin/os.pyc"))
     if shadowing:
         return stop("runtime_version", FAIL, f"stdlib landmarks under bin: {shadowing}")
+    spelled = [problem for name in TREES
+               for problem in name_problems(name, manifest["trees"][name], major_minor)]
+    if spelled:
+        return stop("runtime_version", FAIL, "; ".join(spelled[:20]))
     checks.append(Check("runtime_version", PASS, version))
 
     walked: dict[str, Tree] = {}
@@ -589,7 +630,7 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
     pth_count = 0
     for site in sites:
         for entry in sorted(os.listdir(site)):
-            if not entry.endswith(".pth"):
+            if not fold(entry).endswith(".pth"):
                 continue
             pth_count += 1
             try:

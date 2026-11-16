@@ -385,6 +385,52 @@ def test_interpreter_must_be_bin_python_major_minor(fx: Fixture) -> None:
     assert check.name == "runtime_version" and "must be bin/python3.14" in check.detail
 
 
+@pytest.mark.parametrize("relative, expected", [
+    ("bin/PYTHON3.14._PTH", "venv:bin/PYTHON3.14._PTH"),
+    ("bin/PyVenv.cfg", "venv:bin/PyVenv.cfg"),
+])
+def test_replacing_files_in_another_case_are_refused(fx: Fixture, relative: str,
+                                                     expected: str) -> None:
+    """A case-insensitive volume opens these under the fixed lower-case names."""
+    (fx.venv / relative).write_text("/Users/attacker/lib\n", encoding="utf-8")
+    fx.rebuild()
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and expected in check.detail
+
+
+def test_site_packages_in_another_case_is_refused(fx: Fixture) -> None:
+    fx.site.rename(fx.site.parent / "Site-Packages")
+    fx.rebuild()
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and "special name in another spelling" \
+        in check.detail
+
+
+def test_startup_hook_in_another_case_is_refused(fx: Fixture) -> None:
+    (fx.app / "SiteCustomize.py").write_text("import os\n", encoding="utf-8")
+    fx.rebuild()
+    assert _failed(fx.verify()).name == "startup_hooks"
+
+
+@pytest.mark.parametrize("keys, reason", [
+    (["a/X.py", "a/x.py"], "collide"),
+    (["a/\u00e9.py", "a/e\u0301.py"], "collide"),  # NFC / NFD
+    (["lib/python3.14/Lib-Dynload/x.so"], "special name in another spelling"),
+    (["Bin/python3.14"], "special name in another spelling"),
+    (["lib/python3.14/site-packages/x/__PYCACHE__/y.pyc"], "special name in another spelling"),
+    (["lib/Python3.14/site-packages/evil.pth"], "unexpected lib/python directory"),
+    (["lib/python3.15/os.py"], "unexpected lib/python directory"),
+])
+def test_name_problems(keys: list[str], reason: str) -> None:
+    problems = cr.name_problems("venv", dict.fromkeys(keys, "0" * 64), "3.14")
+    assert problems and reason in problems[0]
+
+
+def test_name_problems_accepts_the_canonical_layout(fx: Fixture) -> None:
+    for name in ("runtime", "venv", "app"):
+        assert cr.name_problems(name, fx.manifest["trees"][name], "3.14") == []
+
+
 def test_missing_lib_dynload_is_refused(fx: Fixture) -> None:
     dynload = fx.stdlib / "lib-dynload"
     for child in dynload.iterdir():
@@ -498,10 +544,11 @@ def test_unexpected_startup_hook_even_when_pinned(fx: Fixture, hook: str, where:
 
 
 def test_zip_on_sys_path_is_refused(fx: Fixture) -> None:
+    """Refused by the lib/python name rule first (and by the zip check behind it)."""
     (fx.runtime / "lib" / "python314.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
     fx.rebuild()
     check = _failed(fx.verify())
-    assert check.name == "startup_hooks" and "zip on sys.path" in check.detail
+    assert check.name == "runtime_version" and "lib/python314.zip" in check.detail
 
 
 def test_malicious_pth_is_rejected_and_never_executed(fx: Fixture) -> None:

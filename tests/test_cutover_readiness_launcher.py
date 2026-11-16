@@ -270,7 +270,7 @@ def test_module_has_no_execution_or_network_code() -> None:
         elif isinstance(node, ast.ImportFrom):
             imported.add((node.module or "").split(".")[0])
     assert imported <= {"__future__", "argparse", "ast", "hashlib", "json", "os", "re", "stat",
-                        "sys", "dataclasses", "pathlib", "typing"}, imported
+                        "sys", "unicodedata", "dataclasses", "pathlib", "typing"}, imported
     forbidden = {"system", "popen", "posix_spawn", "posix_spawnp", "fork", "forkpty",
                  "startfile", "kill", "killpg"}
     dynamic = {"getattr", "__import__", "eval", "exec", "compile", "globals", "locals", "vars",
