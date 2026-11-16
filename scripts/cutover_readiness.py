@@ -81,7 +81,7 @@ SYMLINK = "symlink:"
 #: Inherited variables that must not be present when the launcher plans a launch, and that
 #: the bootstrap check reports as injected. Refused, not dropped: a contaminated shell is a
 #: reason to stop.
-FORBIDDEN_PREFIXES = ("NOTION_", "PYTHON", "DYLD_", "LD_", "PIP_")
+FORBIDDEN_PREFIXES = ("NOTION_", "PYTHON", "DYLD_", "LD_", "PIP_", "__PYVENV_LAUNCHER__")
 #: The same allowlist as scripts/verify_cutover_gate.py PYTHON_ENVIRONMENT_KEEP (tested).
 ENVIRONMENT_KEEP = ("HOME", "USER", "LOGNAME", "TMPDIR", "TZ", "LANG", "LC_ALL", "LC_CTYPE",
                     "LC_COLLATE", "LC_MESSAGES")
@@ -320,8 +320,9 @@ def _validate_manifest(manifest: Any) -> dict[str, Any]:
     if not isinstance(manifest["python_version"], str):
         raise Rejected("manifest python_version must be a string")
     for key in ("runtime_root", "venv", "app_root"):
-        if not isinstance(manifest[key], str) or not os.path.isabs(manifest[key]):
-            raise Rejected(f"manifest {key} must be an absolute path")
+        if not isinstance(manifest[key], str) or not os.path.isabs(manifest[key]) \
+                or manifest[key] != os.path.normpath(manifest[key]) or "//" in manifest[key]:
+            raise Rejected(f"manifest {key} must be a normalized absolute path")
     interpreter = manifest["interpreter"]
     if not (isinstance(interpreter, dict) and set(interpreter) == {"path", "sha256"}
             and _relative_ok(interpreter["path"]) and isinstance(interpreter["sha256"], str)
@@ -528,12 +529,25 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
     major_minor = ".".join(version.split(".")[:2])
     runtime_bin = os.path.normpath(os.path.join(manifest["runtime_root"], "bin"))
     base_python = f"bin/python{major_minor}"
-    if os.path.normpath(values.get("home", "")) != runtime_bin:
+    # Exact strings: getpath uses home as written and walks up from it lexically, so
+    # "/tmp/../<runtime>/bin" would search /tmp although it normalizes to the runtime's bin.
+    if os.path.realpath(manifest["runtime_root"]) != manifest["runtime_root"]:
+        return stop("runtime_version", FAIL, "runtime_root is reached through a symlink")
+    if values.get("home") != runtime_bin:
         return stop("runtime_version", FAIL, "pyvenv.cfg home is not the verified runtime's bin")
-    if "executable" in values and os.path.normpath(values["executable"]) != \
+    if "executable" in values and values["executable"] != \
             os.path.join(runtime_bin, f"python{major_minor}"):
         return stop("runtime_version", FAIL, "pyvenv.cfg executable is not the verified runtime's")
+    if manifest["interpreter"]["path"] != base_python:
+        return stop("runtime_version", FAIL, f"the interpreter must be {base_python} of the venv")
     runtime_tree = manifest["trees"]["runtime"]
+    # ._pth files replace sys.path entirely (checked by getpath before home and venv);
+    # a second pyvenv.cfg next to the interpreter is read by site.venv() first.
+    replacing = sorted(f"{name}:{k}" for name in TREES for k in manifest["trees"][name]
+                       if k.endswith("._pth")) + \
+        (["venv:bin/pyvenv.cfg"] if "bin/pyvenv.cfg" in manifest["trees"]["venv"] else [])
+    if replacing:
+        return stop("runtime_version", FAIL, f"sys.path replacing files: {replacing}")
     if not _SHA256.fullmatch(runtime_tree.get(base_python, "")):
         return stop("runtime_version", FAIL, f"the runtime inventory has no {base_python}")
     # getpath searches upward from the interpreter's directory for the stdlib landmark

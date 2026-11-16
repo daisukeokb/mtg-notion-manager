@@ -33,7 +33,7 @@
 
 検査はすべて、検査対象のPython本体を起動する前に、別のinterpreter(macOSのsystem Python)で行う。検査対象のinterpreterで自分自身を検査する循環は無い。ただし検査器自身の信頼は、system Python(Apple署名)と、mainにcommitされた検査scriptに依存し、**mainはreviewの強制なしに変更できる(G-1、Blocker B-G1)**。したがって検査器の信頼はB-G1の解消(または受け入れ)に依存する。実行前に、使う検査scriptのsha256を承認記録の値と照合する。
 
-起動時のcodeの検査範囲: `-I` は `sitecustomize`・`usercustomize` を無効にしない(無効にするのは `-S`)。検査は、`pyvenv.cfg` の `home` が検証したruntimeの `bin` であること(標準libraryはそこから探される)、tree内のsymlinkがtree内の通常fileだけを指すこと、計画した `sys.path` の全directory(標準library、`lib-dynload`、site-packages、各 `.pth` のpath行)がsymlinkを経由しない実directoryで、起動hookが無いこと(manifestに載っていてもFAIL)を確認する。`.pth` の `import` 行、treeの外を指す `.pth` のpath、標準libraryのzip(`python314.zip`)はFAILにする。`sys.path` はsite.pyの規則から算出したもので、interpreterを起動して観測したものではない。
+起動時のcodeの検査範囲: `-I` は `sitecustomize`・`usercustomize` を無効にしない(無効にするのは `-S`)。検査は、`pyvenv.cfg` を厳格に解析し(`\n` 以外の改行・制御文字・重複key・大文字のkeyはFAIL)、`home` が検証したruntimeの `bin` と文字列として完全に一致すること(標準libraryはそこから探される。`..` 等で正規化すると一致するだけのpathはFAIL)、runtimeの一覧に標準libraryの目印 `lib/python3.14/os.py` があり、`bin` の下に目印(`bin/lib/`・`bin/Modules/`・`bin/pybuilddir.txt` 等)が無く、`._pth` と `venv/bin/pyvenv.cfg` が無いこと、tree内のsymlinkがtree内の通常fileだけを指すこと、計画した `sys.path` の全directory(標準library、`lib-dynload`、site-packages、各 `.pth` のpath行)がsymlinkを経由しない実directoryで、起動hookが無いこと(manifestに載っていてもFAIL)を確認する。`.pth` の `import` 行、treeの外を指す `.pth` のpath、標準libraryのzip(`python314.zip`)はFAILにする。`sys.path` はsite.pyの規則から算出したもので、interpreterを起動して観測したものではない。
 
 ## 5. Backup readiness
 

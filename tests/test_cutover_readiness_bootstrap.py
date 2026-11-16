@@ -206,7 +206,7 @@ def test_unexpected_python_path(fx: Fixture, python: str) -> None:
 
 @pytest.mark.parametrize("name", ["PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
                                   "DYLD_INSERT_LIBRARIES", "LD_PRELOAD", "NOTION_API_KEY",
-                                  "NOTION_TOKEN", "PIP_INDEX_URL"])
+                                  "NOTION_TOKEN", "PIP_INDEX_URL", "__PYVENV_LAUNCHER__"])
 def test_unexpected_environment_variable(fx: Fixture, name: str) -> None:
     check = _failed(fx.verify(environ={**CLEAN_ENV, name: "synthetic-planted-value"}))
     assert check.name == "environment" and name in check.detail
@@ -306,6 +306,7 @@ def test_stdlib_landmark_is_required(fx: Fixture) -> None:
 
 
 @pytest.mark.parametrize("relative", ["bin/lib/python3.14/os.py", "bin/pybuilddir.txt",
+                                      "bin/Modules/Setup.local",
                                       "bin/lib/python3.14/lib-dynload/x.so", "bin/os.py"])
 def test_stdlib_landmark_under_bin_is_refused(fx: Fixture, relative: str) -> None:
     path = fx.runtime / relative
@@ -314,6 +315,74 @@ def test_stdlib_landmark_under_bin_is_refused(fx: Fixture, relative: str) -> Non
     fx.rebuild()
     check = _failed(fx.verify())
     assert check.name == "runtime_version" and "stdlib landmarks under bin" in check.detail
+
+
+def _replace_home(fx: Fixture, home: str) -> None:
+    text = (fx.venv / "pyvenv.cfg").read_text(encoding="utf-8")
+    lines = [line for line in text.splitlines() if not line.startswith("home")]
+    _cfg(fx, "\n".join([f"home = {home}", *lines]) + "\n")
+
+
+@pytest.mark.parametrize("home", ["/tmp/../{rt}/bin", "{rt}/x/../bin", "{rt}//bin", "{rt}/bin/",
+                                  "{rt}/./bin"])
+def test_home_must_be_the_exact_string(fx: Fixture, home: str) -> None:
+    """getpath uses home as written and walks up lexically: a path that only normalizes to
+    the runtime's bin is refused."""
+    _replace_home(fx, home.format(rt=fx.runtime))
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and "home is not the verified runtime's bin" \
+        in check.detail
+
+
+def test_executable_must_be_the_exact_string(fx: Fixture) -> None:
+    with open(fx.venv / "pyvenv.cfg", "a", encoding="utf-8") as handle:
+        handle.write(f"executable = /tmp/..{fx.runtime}/bin/python3.14\n")
+    fx.rebuild()
+    assert "executable is not the verified runtime's" in _failed(fx.verify()).detail
+
+
+def test_runtime_root_reached_through_a_symlink(fx: Fixture) -> None:
+    link = fx.root / "runtime-link"
+    link.symlink_to(fx.runtime, target_is_directory=True)
+    _replace_home(fx, f"{link}/bin")
+    fx.rebuild(runtime_root=str(link))
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and "through a symlink" in check.detail
+
+
+@pytest.mark.parametrize("key", ["runtime_root", "venv", "app_root"])
+def test_manifest_roots_must_be_normalized(fx: Fixture, key: str) -> None:
+    fx.write_manifest(**{key: fx.manifest[key] + "/x/.."})
+    assert _failed(fx.verify()).name == "manifest_schema"
+
+
+@pytest.mark.parametrize("where, relative", [
+    ("venv", "bin/python3.14._pth"), ("runtime", "lib/libpython3.14._pth"),
+    ("runtime", "bin/python3.14._pth"), ("app", "x._pth")])
+def test_pth_replacement_files_are_refused(fx: Fixture, where: str, relative: str) -> None:
+    root = {"venv": fx.venv, "runtime": fx.runtime, "app": fx.app}[where]
+    (root / relative).write_text("/Users/attacker/lib\n", encoding="utf-8")
+    fx.rebuild()
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and f"{where}:{relative}" in check.detail
+
+
+def test_second_pyvenv_cfg_next_to_the_interpreter_is_refused(fx: Fixture) -> None:
+    (fx.venv / "bin" / "pyvenv.cfg").write_text(
+        (fx.venv / "pyvenv.cfg").read_text(encoding="utf-8"), encoding="utf-8")
+    fx.rebuild()
+    assert "venv:bin/pyvenv.cfg" in _failed(fx.verify()).detail
+
+
+def test_interpreter_must_be_bin_python_major_minor(fx: Fixture) -> None:
+    (fx.venv / "python3.14").write_bytes((fx.venv / "bin" / "python3.14").read_bytes())
+    fx.rebuild()
+    sha = fx.manifest["trees"]["venv"]["python3.14"]
+    fx.write_manifest(interpreter={"path": "python3.14", "sha256": sha})
+    result = cr.verify_bootstrap(fx.manifest_path, fx.manifest_sha, str(fx.venv / "python3.14"),
+                                 CLEAN_ENV)
+    check = _failed(result)
+    assert check.name == "runtime_version" and "must be bin/python3.14" in check.detail
 
 
 def test_missing_lib_dynload_is_refused(fx: Fixture) -> None:
