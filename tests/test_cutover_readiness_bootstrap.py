@@ -268,6 +268,64 @@ def test_runtime_inventory_must_hold_the_base_interpreter(fx: Fixture) -> None:
     assert "the runtime inventory has no bin/python3.14" in _failed(fx.verify()).detail
 
 
+def _cfg(fx: Fixture, text: str) -> None:
+    (fx.venv / "pyvenv.cfg").write_bytes(text.encode("utf-8"))
+    fx.rebuild()
+
+
+@pytest.mark.parametrize("prefix, reason", [
+    ("home = /attacker/bin\n", "duplicate key home"),          # getpath takes the first
+    ("Home = /attacker/bin\n", "key is not lower case"),       # getpath ignores case
+    ("x = 1\x0chome = /attacker/bin\n", "unexpected control character"),
+    ("x = 1\rhome = /attacker/bin\n", "unexpected control character"),
+    ("x = 1\x85home = /attacker/bin\n", "unexpected control character"),
+    ("just a line\n", "not key = value"),
+])
+def test_pyvenv_cfg_is_parsed_strictly(fx: Fixture, prefix: str, reason: str) -> None:
+    _cfg(fx, prefix + (fx.venv / "pyvenv.cfg").read_text(encoding="utf-8"))
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and reason in check.detail
+
+
+def test_pyvenv_cfg_with_crlf_is_accepted(fx: Fixture) -> None:
+    text = (fx.venv / "pyvenv.cfg").read_text(encoding="utf-8")
+    _cfg(fx, text.replace("\n", "\r\n"))
+    assert fx.verify().status == cr.PASS
+
+
+def test_pyvenv_cfg_not_utf8(fx: Fixture) -> None:
+    (fx.venv / "pyvenv.cfg").write_bytes(b"home = \xff\n")
+    fx.rebuild()
+    assert "not UTF-8" in _failed(fx.verify()).detail
+
+
+def test_stdlib_landmark_is_required(fx: Fixture) -> None:
+    (fx.stdlib / "os.py").unlink()
+    fx.rebuild()
+    assert "the runtime inventory has no lib/python3.14/os.py" in _failed(fx.verify()).detail
+
+
+@pytest.mark.parametrize("relative", ["bin/lib/python3.14/os.py", "bin/pybuilddir.txt",
+                                      "bin/lib/python3.14/lib-dynload/x.so", "bin/os.py"])
+def test_stdlib_landmark_under_bin_is_refused(fx: Fixture, relative: str) -> None:
+    path = fx.runtime / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"# shadowing landmark\n")
+    fx.rebuild()
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and "stdlib landmarks under bin" in check.detail
+
+
+def test_missing_lib_dynload_is_refused(fx: Fixture) -> None:
+    dynload = fx.stdlib / "lib-dynload"
+    for child in dynload.iterdir():
+        child.unlink()
+    dynload.rmdir()
+    fx.rebuild()
+    check = _failed(fx.verify())
+    assert check.name == "startup_hooks" and "sys.path directories missing" in check.detail
+
+
 def test_system_site_packages_are_refused(fx: Fixture) -> None:
     _pyvenv(fx, "3.14.10", system="true")
     fx.rebuild()
@@ -435,8 +493,9 @@ def test_symlinked_sys_path_directory_fails_even_if_the_walk_accepted_it(
     """Defence in depth: if walk_tree ever recorded a directory link instead of refusing it,
     the sys.path check still refuses a directory reached through it."""
     elsewhere = fx.root / "elsewhere"
-    fx.stdlib.rename(elsewhere)
-    fx.stdlib.symlink_to(elsewhere, target_is_directory=True)
+    dynload = fx.stdlib / "lib-dynload"
+    dynload.rename(elsewhere)
+    dynload.symlink_to(elsewhere, target_is_directory=True)
 
     def lenient(root: Path) -> Any:
         entries, identities = {}, {".": cr._identity(os.lstat(root))}

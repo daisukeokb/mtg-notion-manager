@@ -210,7 +210,9 @@ def test_option_tables_match_the_click_commands() -> None:
         assert values == cr.VALUE_OPTIONS[name], name
         assert flags == cr.FLAG_OPTIONS[name], name
         assert all(o.startswith("--") for o in values | flags), name
-        # parse_invocation assumes each value option takes exactly one token
+        # parse_invocation assumes each value option takes exactly one token, and counting
+        # options are in neither table
+        assert not any(getattr(option, "count", False) for option in options), name
         for option in options:
             if not option.is_flag:
                 assert option.nargs == 1 and not getattr(option, "_flag_needs_value", False), \

@@ -380,12 +380,30 @@ def check_provenance(provenance: dict[str, Any], evidence_root: Path) -> Check:
                                      "every gate PASS")
 
 
+_PYVENV_FORBIDDEN = re.compile("[\r\x00\x0b\x0c\x1c-\x1f\x85\u2028\u2029]")
+
+
 def _parse_pyvenv_cfg(text: str) -> dict[str, str]:
+    """A stricter parser than CPython's getpath (which takes the first ``home`` line and
+    matches keys case-insensitively): only ``\n`` (or ``\r\n``) ends a line, every non-blank
+    line is ``key = value``, keys are lower case and appear once. Rejected otherwise, so the
+    two parsers cannot read different values from the same file."""
     values: dict[str, str] = {}
-    for line in text.splitlines():
-        if "=" in line:
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip()
+    for number, line in enumerate(text.split("\n"), 1):
+        if line.endswith("\r"):
+            line = line[:-1]
+        if _PYVENV_FORBIDDEN.search(line):
+            raise Rejected(f"pyvenv.cfg line {number}: unexpected control character")
+        if not line.strip():
+            continue
+        if "=" not in line:
+            raise Rejected(f"pyvenv.cfg line {number}: not key = value")
+        key, value = (part.strip() for part in line.split("=", 1))
+        if key != key.lower() or not key:
+            raise Rejected(f"pyvenv.cfg line {number}: key is not lower case: {key!r}")
+        if key in values:
+            raise Rejected(f"pyvenv.cfg line {number}: duplicate key {key}")
+        values[key] = value
     return values
 
 
@@ -491,7 +509,12 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
         cfg = read_pinned(venv / "pyvenv.cfg", CONFIG_LIMIT, keep=True)
     except Rejected as exc:
         return stop("runtime_version", FAIL, str(exc))
-    values = _parse_pyvenv_cfg(cfg.data.decode("utf-8", "replace"))
+    try:
+        values = _parse_pyvenv_cfg(cfg.data.decode("utf-8"))
+    except UnicodeDecodeError:
+        return stop("runtime_version", FAIL, "pyvenv.cfg is not UTF-8")
+    except Rejected as exc:
+        return stop("runtime_version", FAIL, str(exc))
     version = values.get("version_info") or values.get("version")
     if version not in KNOWN_VERSIONS or version != manifest["python_version"]:
         return stop("runtime_version", FAIL, f"unknown runtime version: {version}")
@@ -510,8 +533,21 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
     if "executable" in values and os.path.normpath(values["executable"]) != \
             os.path.join(runtime_bin, f"python{major_minor}"):
         return stop("runtime_version", FAIL, "pyvenv.cfg executable is not the verified runtime's")
-    if not _SHA256.fullmatch(manifest["trees"]["runtime"].get(base_python, "")):
+    runtime_tree = manifest["trees"]["runtime"]
+    if not _SHA256.fullmatch(runtime_tree.get(base_python, "")):
         return stop("runtime_version", FAIL, f"the runtime inventory has no {base_python}")
+    # getpath searches upward from the interpreter's directory for the stdlib landmark
+    # lib/pythonX.Y/os.py (prefix) and lib/pythonX.Y/lib-dynload (exec_prefix); a build
+    # directory is detected by bin/pybuilddir.txt. The landmarks must be exactly the runtime
+    # root's, and nothing in bin may be an earlier match.
+    landmark = f"lib/python{major_minor}/os.py"
+    if not _SHA256.fullmatch(runtime_tree.get(landmark, "")):
+        return stop("runtime_version", FAIL, f"the runtime inventory has no {landmark}")
+    shadowing = sorted(k for k in runtime_tree
+                       if k.startswith(("bin/lib/", "bin/Lib/", "bin/Modules/"))
+                       or k in ("bin/pybuilddir.txt", "bin/os.py", "bin/os.pyc"))
+    if shadowing:
+        return stop("runtime_version", FAIL, f"stdlib landmarks under bin: {shadowing}")
     checks.append(Check("runtime_version", PASS, version))
 
     walked: dict[str, Tree] = {}
@@ -563,10 +599,12 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
     checks.append(Check("pth_files", PASS,
                         f"{pth_count} .pth files (pinned by the inventory), no executable line"))
     tree_roots = list(roots.values())
-    linked = [str(d) for d in directories if d.exists() and not real_directory_in(d, tree_roots)]
+    # The stdlib and lib-dynload must exist (getpath would otherwise search above the
+    # runtime root); every directory must be real and inside a tree.
+    linked = [str(d) for d in directories if not real_directory_in(d, tree_roots)]
     if linked:
-        return stop("startup_hooks", FAIL, f"sys.path directories reached through a symlink "
-                                           f"or outside the trees: {linked}")
+        return stop("startup_hooks", FAIL, f"sys.path directories missing, reached through a "
+                                           f"symlink or outside the trees: {linked}")
     hooks = startup_hooks(directories)
     if hooks:
         return stop("startup_hooks", FAIL, f"unexpected startup hook: {hooks}")
