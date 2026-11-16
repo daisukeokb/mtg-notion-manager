@@ -7,10 +7,13 @@ them launches anything:
   is started, check the runtime, the venv and the application source against a runtime
   manifest whose own sha256 must come from an independent, human-approved record. The
   manifest is a complete inventory of the three trees: every file is hashed, every symlink
-  target compared, and any entry the manifest does not list fails. Every directory that will
-  be on ``sys.path`` (the stdlib, ``lib-dynload``, site-packages, and each ``.pth`` path line)
-  is scanned for ``sitecustomize`` / ``usercustomize`` (``-I`` does not disable them); a
-  ``.pth`` path outside the three trees, an unknown runtime version, an unexpected interpreter
+  target compared (a symlink must resolve to a regular file inside its tree), and any entry
+  the manifest does not list fails. ``pyvenv.cfg`` ``home`` must be the verified runtime's
+  ``bin`` (getpath finds the stdlib from it). Every directory that will be on ``sys.path``
+  (the stdlib, ``lib-dynload``, site-packages, and each ``.pth`` path line) must be a real
+  directory inside a tree and is scanned for ``sitecustomize`` / ``usercustomize`` (``-I``
+  does not disable them); a ``.pth`` import line, a ``.pth`` path outside the three trees, an
+  unknown runtime version, an unexpected interpreter
   path, injected environment variables and any change of the trees during the run (they are
   walked again at the end) fail. A missing provenance record or a missing expected manifest
   hash is UNVERIFIED, never PASS: a matching sha256 alone does not make a third-party build
@@ -235,6 +238,13 @@ def walk_tree(root: Path) -> Tree:
             if stat.S_ISDIR(info.st_mode):
                 continue
             if stat.S_ISLNK(info.st_mode):
+                # Only links to a regular file inside the same tree: a link to a directory
+                # (or out of the tree) would let unwalked content onto sys.path.
+                target = os.path.realpath(path)
+                if not _inside(Path(target), Path(os.path.realpath(root))) \
+                        or not os.path.isfile(target) or os.path.isdir(target):
+                    raise Rejected(f"symlink to a directory, outside the tree or dangling: "
+                                   f"{path}")
                 entries[relative] = SYMLINK + os.readlink(path)
             elif stat.S_ISREG(info.st_mode):
                 pinned = read_pinned(path)
@@ -266,6 +276,16 @@ def _inside(path: Path, root: Path) -> bool:
     except ValueError:
         return False
     return True
+
+
+def real_directory_in(path: Path, roots: list[Path]) -> bool:
+    """path is an existing directory inside one of the roots, reached without any symlink
+    below that root (symlinks above a root are allowed: the root path is what was pinned)."""
+    for root in roots:
+        if _inside(path, root):
+            expected = os.path.join(os.path.realpath(root), str(path.relative_to(root)))
+            return os.path.isdir(path) and os.path.realpath(path) == os.path.normpath(expected)
+    return False
 
 
 # --- D-1: bootstrap trust boundary -------------------------------------------------------
@@ -351,7 +371,8 @@ def check_provenance(provenance: dict[str, Any], evidence_root: Path) -> Check:
         gates = record["formal_gate_run"]["gates"]
     except (KeyError, TypeError):
         return Check("provenance", FAIL, "attestation evidence has no archive or gate record")
-    if recorded != archive or not gates or any(v != PASS for v in gates.values()):
+    if recorded != archive or not isinstance(gates, dict) or not gates \
+            or any(v != PASS for v in gates.values()):
         return Check("provenance", FAIL, "attestation evidence does not record this archive "
                                          "with every gate PASS")
     return Check("provenance", PASS, f"human-asserted attestation; evidence {evidence} "
@@ -377,6 +398,9 @@ def site_packages(root: Path) -> list[Path]:
 
 
 STARTUP_HOOKS = ("sitecustomize", "usercustomize")
+#: The keys venv writes into pyvenv.cfg (``command`` and ``prompt`` are informational).
+PYVENV_KEYS = frozenset({"home", "include-system-site-packages", "version", "version_info",
+                         "executable", "command", "prompt"})
 
 
 def startup_hooks(directories: list[Path]) -> list[str]:
@@ -473,6 +497,21 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
         return stop("runtime_version", FAIL, f"unknown runtime version: {version}")
     if values.get("include-system-site-packages", "false").lower() != "false":
         return stop("runtime_version", FAIL, "the venv includes the system site-packages")
+    # getpath finds the stdlib from `home`: it must be the verified runtime's bin directory,
+    # holding that runtime's interpreter, or the stdlib would load from an unchecked place.
+    unknown_keys = sorted(set(values) - PYVENV_KEYS)
+    if unknown_keys:
+        return stop("runtime_version", FAIL, f"unexpected pyvenv.cfg keys: {unknown_keys}")
+    major_minor = ".".join(version.split(".")[:2])
+    runtime_bin = os.path.normpath(os.path.join(manifest["runtime_root"], "bin"))
+    base_python = f"bin/python{major_minor}"
+    if os.path.normpath(values.get("home", "")) != runtime_bin:
+        return stop("runtime_version", FAIL, "pyvenv.cfg home is not the verified runtime's bin")
+    if "executable" in values and os.path.normpath(values["executable"]) != \
+            os.path.join(runtime_bin, f"python{major_minor}"):
+        return stop("runtime_version", FAIL, "pyvenv.cfg executable is not the verified runtime's")
+    if not _SHA256.fullmatch(manifest["trees"]["runtime"].get(base_python, "")):
+        return stop("runtime_version", FAIL, f"the runtime inventory has no {base_python}")
     checks.append(Check("runtime_version", PASS, version))
 
     walked: dict[str, Tree] = {}
@@ -491,14 +530,12 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
 
     # The directories on the planned sys.path: stdlib, lib-dynload, site-packages, and the
     # path lines of every .pth (site.py processes .pth files only in site directories).
-    major_minor = ".".join(version.split(".")[:2])
     stdlib = runtime / "lib" / f"python{major_minor}"
     zipped = runtime / "lib" / f"python{major_minor.replace('.', '')}.zip"
     if os.path.lexists(zipped):
         return stop("startup_hooks", FAIL, f"a zip on sys.path is not inspected: {zipped}")
     sites = site_packages(venv) + site_packages(runtime)
     directories = [stdlib, stdlib / "lib-dynload", *sites]
-    executable = 0
     pth_count = 0
     for site in sites:
         for entry in sorted(os.listdir(site)):
@@ -510,7 +547,10 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
             except Rejected as exc:
                 problems.append(str(exc))
                 continue
-            executable += executable_pth_lines(data)
+            if executable_pth_lines(data):
+                # An import line runs before sitecustomize and can install import hooks that
+                # load code from anywhere: none is accepted (the 3.14 venv has none).
+                problems.append(f"{entry}: executable (import) lines are not accepted")
             for path in pth_paths(site, data):
                 if not any(_inside(path, root) for root in roots.values()):
                     problems.append(f"{entry}: path outside the verified trees: {path}")
@@ -521,9 +561,12 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
     if problems:
         return stop("pth_files", FAIL, "; ".join(problems))
     checks.append(Check("pth_files", PASS,
-                        f"{pth_count} .pth files (pinned by the inventory), {executable} "
-                        "executable lines (they still run at interpreter start-up; accepted "
-                        "limitation)"))
+                        f"{pth_count} .pth files (pinned by the inventory), no executable line"))
+    tree_roots = list(roots.values())
+    linked = [str(d) for d in directories if d.exists() and not real_directory_in(d, tree_roots)]
+    if linked:
+        return stop("startup_hooks", FAIL, f"sys.path directories reached through a symlink "
+                                           f"or outside the trees: {linked}")
     hooks = startup_hooks(directories)
     if hooks:
         return stop("startup_hooks", FAIL, f"unexpected startup hook: {hooks}")
@@ -547,6 +590,14 @@ def verify_bootstrap(manifest_path: Path, expected_manifest_sha256: str | None,
             changed.append(f"{name}: {differ[:20]}")
     if not _same_file(manifest_path, manifest_file):
         changed.append("the manifest")
+    provenance = manifest["provenance"]
+    if [c.status for c in checks if c.name == "provenance"] == [PASS]:
+        try:
+            again_evidence = read_pinned(evidence_root / provenance["evidence"], CONFIG_LIMIT * 16)
+            if again_evidence.sha256 != provenance["evidence_sha256"]:
+                changed.append("the attestation evidence")
+        except Rejected:
+            changed.append("the attestation evidence")
     if changed:
         return stop("toctou", FAIL, f"changed after it was verified: {changed}")
     checks.append(Check("toctou", PASS, "all trees and the manifest unchanged at the end"))

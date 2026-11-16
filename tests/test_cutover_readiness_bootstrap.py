@@ -69,7 +69,6 @@ class Fixture:
                                        "include-system-site-packages = false\n"
                                        "version = 3.14.10\n").encode(),
             self.site / "_editable_impl_mtg_notion_manager.pth": str(self.app).encode(),
-            self.site / "distutils-precedence.pth": b"import os; var = 'SETUPTOOLS'\n",
             self.site / "dep" / "__init__.py": b"VALUE = 1\n",
             self.site / "dotenv" / "main.py": DOTENV_MAIN,
             self.site / "python_dotenv-1.2.1.dist-info" / "METADATA": b"Name: python-dotenv\n",
@@ -131,7 +130,7 @@ def test_untampered_fixture_passes(fx: Fixture) -> None:
     assert names == ["manifest_integrity", "manifest_schema", "provenance", "interpreter_path",
                      "interpreter_integrity", "runtime_version", "tree_inventory", "pth_files",
                      "startup_hooks", "environment", "toctou"]
-    assert "1 executable lines" in result.checks[names.index("pth_files")].detail
+    assert "no executable line" in result.checks[names.index("pth_files")].detail
     assert "human-asserted" in result.checks[names.index("provenance")].detail
     # stdlib, lib-dynload, 2 site-packages and the app root added by the editable .pth
     assert "none in 5 sys.path directories" in result.checks[names.index("startup_hooks")].detail
@@ -240,6 +239,35 @@ def test_manifest_version_must_match_the_venv(fx: Fixture) -> None:
     assert _failed(fx.verify()).name == "runtime_version"
 
 
+@pytest.mark.parametrize("line, reason", [
+    ("home = /usr/local/bin", "home is not the verified runtime's bin"),
+    ("executable = /usr/local/bin/python3.14", "executable is not the verified runtime's"),
+    ("base-prefix = /elsewhere", "unexpected pyvenv.cfg keys: ['base-prefix']"),
+])
+def test_pyvenv_cfg_must_point_at_the_verified_runtime(fx: Fixture, line: str,
+                                                       reason: str) -> None:
+    text = (fx.venv / "pyvenv.cfg").read_text(encoding="utf-8")
+    if line.startswith("home"):
+        text = "\n".join(x for x in text.splitlines() if not x.startswith("home")) + "\n"
+    (fx.venv / "pyvenv.cfg").write_text(text + line + "\n", encoding="utf-8")
+    fx.rebuild()
+    check = _failed(fx.verify())
+    assert check.name == "runtime_version" and reason in check.detail
+
+
+def test_pyvenv_executable_of_the_runtime_is_accepted(fx: Fixture) -> None:
+    with open(fx.venv / "pyvenv.cfg", "a", encoding="utf-8") as handle:
+        handle.write(f"executable = {fx.runtime}/bin/python3.14\ncommand = x -m venv y\n")
+    fx.rebuild()
+    assert fx.verify().status == cr.PASS
+
+
+def test_runtime_inventory_must_hold_the_base_interpreter(fx: Fixture) -> None:
+    (fx.runtime / "bin" / "python3.14").unlink()
+    fx.rebuild()
+    assert "the runtime inventory has no bin/python3.14" in _failed(fx.verify()).detail
+
+
 def test_system_site_packages_are_refused(fx: Fixture) -> None:
     _pyvenv(fx, "3.14.10", system="true")
     fx.rebuild()
@@ -248,7 +276,7 @@ def test_system_site_packages_are_refused(fx: Fixture) -> None:
 
 def test_pyvenv_cfg_change_is_caught_by_the_inventory(fx: Fixture) -> None:
     with open(fx.venv / "pyvenv.cfg", "a", encoding="utf-8") as handle:
-        handle.write("extra = 1\n")
+        handle.write("command = changed\n")
     check = _failed(fx.verify())
     assert check.name == "tree_inventory" and "venv: hash or link mismatch: ['pyvenv.cfg']" \
         in check.detail
@@ -293,7 +321,7 @@ def test_modified_application_source(fx: Fixture) -> None:
 def test_symlink_target_change(fx: Fixture) -> None:
     link = fx.venv / "bin" / "python"
     link.unlink()
-    link.symlink_to("/usr/bin/python3")
+    link.symlink_to("../pyvenv.cfg")  # still a file inside the tree, another target
     assert "venv: hash or link mismatch: ['bin/python']" in _failed(fx.verify()).detail
 
 
@@ -372,12 +400,72 @@ def test_pth_path_that_does_not_exist(fx: Fixture) -> None:
     assert "not an existing directory" in _failed(fx.verify()).detail
 
 
-def test_pinned_import_pth_is_counted_not_hidden(fx: Fixture) -> None:
-    (fx.site / "zz-import.pth").write_text("import os\nimport\tsys\n", encoding="utf-8")
+@pytest.mark.parametrize("text", ["import os\n", "/x\nimport\tsys\n",
+                                  "import os; var = 'SETUPTOOLS_USE_DISTUTILS'\n"])
+def test_pinned_import_pth_is_refused(fx: Fixture, text: str) -> None:
+    """An import line runs before sitecustomize and could install an import hook."""
+    (fx.site / "zz-import.pth").write_text(text, encoding="utf-8")
     fx.rebuild()
-    result = fx.verify()
-    assert result.status == cr.PASS
-    assert "3 executable lines" in [c for c in result.checks if c.name == "pth_files"][0].detail
+    check = _failed(fx.verify())
+    assert check.name == "pth_files" and "executable (import) lines" in check.detail
+
+
+@pytest.mark.parametrize("where", ["stdlib", "site"])
+def test_symlinked_directory_in_a_tree(fx: Fixture, where: str) -> None:
+    """A directory of sys.path replaced by a link to unwalked content elsewhere."""
+    directory = fx.stdlib if where == "stdlib" else fx.site
+    elsewhere = fx.root / "elsewhere"
+    directory.rename(elsewhere)
+    directory.symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(cr.Rejected):
+        fx.rebuild()  # a manifest cannot even record it
+    check = _failed(fx.verify())
+    assert check.name == "tree_inventory" and "symlink to a directory" in check.detail
+
+
+@pytest.mark.parametrize("target", ["/etc/hosts", "absent-file"])
+def test_symlink_outside_the_tree_or_dangling(fx: Fixture, target: str) -> None:
+    (fx.site / "zz-link.py").symlink_to(target)
+    check = _failed(fx.verify())
+    assert "symlink to a directory, outside the tree or dangling" in check.detail
+
+
+def test_symlinked_sys_path_directory_fails_even_if_the_walk_accepted_it(
+        fx: Fixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defence in depth: if walk_tree ever recorded a directory link instead of refusing it,
+    the sys.path check still refuses a directory reached through it."""
+    elsewhere = fx.root / "elsewhere"
+    fx.stdlib.rename(elsewhere)
+    fx.stdlib.symlink_to(elsewhere, target_is_directory=True)
+
+    def lenient(root: Path) -> Any:
+        entries, identities = {}, {".": cr._identity(os.lstat(root))}
+        for directory, dirnames, filenames in os.walk(root):
+            for name in dirnames + filenames:
+                path = Path(directory) / name
+                relative = str(path.relative_to(root))
+                identities[relative] = cr._identity(os.lstat(path))
+                if path.is_symlink():
+                    entries[relative] = cr.SYMLINK + os.readlink(path)
+                elif path.is_file():
+                    entries[relative] = cr.read_pinned(path).sha256
+        return cr.Tree(entries, identities)
+
+    monkeypatch.setattr(cr, "walk_tree", lenient)
+    fx.rebuild()
+    check = _failed(fx.verify())
+    assert check.name == "startup_hooks" and "reached through a symlink" in check.detail
+
+
+def test_real_directory_in(tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    (root / "a").mkdir(parents=True)
+    (tmp_path / "out").mkdir()
+    (root / "link").symlink_to(tmp_path / "out", target_is_directory=True)
+    assert cr.real_directory_in(root / "a", [root])
+    assert not cr.real_directory_in(root / "link", [root])
+    assert not cr.real_directory_in(tmp_path / "out", [root])
+    assert not cr.real_directory_in(root / "missing", [root])
 
 
 # --- provenance -------------------------------------------------------------------------
@@ -423,6 +511,8 @@ def test_provenance_evidence_missing(fx: Fixture) -> None:
     {"archive": {"sha256": "@"}, "formal_gate_run": {"gates": {"1": "PASS", "4": "FAIL"}}},
     {"archive": {"sha256": "@"}, "formal_gate_run": {"gates": {}}},
     {"archive": "x"},
+    {"archive": {"sha256": "@"}, "formal_gate_run": {"gates": ["PASS"]}},
+    {"archive": {"sha256": "@"}, "formal_gate_run": {"gates": "PASS"}},
 ])
 def test_provenance_evidence_must_record_the_archive_with_all_gates_pass(
         fx: Fixture, tmp_path: Path, record: dict[str, Any]) -> None:
@@ -491,6 +581,27 @@ def test_manifest_replaced_during_the_run(fx: Fixture, monkeypatch: pytest.Monke
     monkeypatch.setattr(cr, "injected_variables", check_then_replace)
     check = _failed(fx.verify())
     assert check.name == "toctou" and "the manifest" in check.detail
+
+
+def test_evidence_changed_during_the_run(fx: Fixture, tmp_path: Path,
+                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    root = tmp_path / "evidence-root"
+    (root / "e").mkdir(parents=True)
+    evidence = root / "e" / "EVIDENCE.json"
+    evidence.write_bytes((REPO_ROOT / EVIDENCE).read_bytes())
+    fx.provenance.update(evidence="e/EVIDENCE.json")
+    fx.rebuild()
+    real = cr.injected_variables
+
+    def check_then_edit(environ: dict[str, str]) -> list[str]:
+        evidence.write_bytes(evidence.read_bytes() + b" ")
+        return real(environ)
+
+    monkeypatch.setattr(cr, "injected_variables", check_then_edit)
+    result = cr.verify_bootstrap(fx.manifest_path, fx.manifest_sha, fx.python, CLEAN_ENV,
+                                 evidence_root=root)
+    check = _failed(result)
+    assert check.name == "toctou" and "attestation evidence" in check.detail
 
 
 def test_toctou_change_during_read(fx: Fixture, monkeypatch: pytest.MonkeyPatch) -> None:
