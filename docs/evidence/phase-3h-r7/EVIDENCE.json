@@ -1,0 +1,104 @@
+{
+  "phase": "3H-R7 Production Cutover Authorization Readiness",
+  "status_at_recording": "BLOCKED / NOT_READY (cutover blockers B-G1, B-D1, B-C23, B-RB unresolved). PR open; MERGE NOT AUTHORIZED; PRODUCTION CUTOVER NOT AUTHORIZED",
+  "base_main": "09b651fd99295799871fc692448e27502cc3e948",
+  "verified_commit": "1251bbd9d74eae93c45248422d1a8812ff720de0",
+  "recorded_in": "the commit that adds this file; it changes docs/evidence/ only, so the verified code and tests are those of verified_commit",
+  "files_at_verified_commit": {
+    "scripts/cutover_readiness.py": "e03c7982f00f09c87e6b3b762bf51cca07cd392adb64481fcd297a8207648db7",
+    "tests/test_cutover_readiness_bootstrap.py": "50cd4c5a316719447ffa4aa5af3a9dd617232c77af6300f4ab96af9c407629ea",
+    "tests/test_cutover_readiness_launcher.py": "b185e426035c865c6e6e77d836a86a8651a5827bb4ef8741ba0e9323c794d4f3",
+    "tests/test_cutover_readiness_rollback.py": "775b06a4069951ada0e70ed14dd36c89a4acda5650eb5672d1f4d9092c3e4dcc"
+  },
+  "change_scope": "git diff --stat 09b651f 1251bbd: 9 files changed, 2887 insertions(+), 0 deletions; empty for src, .github, ci, conftest.py, pyproject.toml, requirements, scripts/verify_cutover_gate.py",
+  "phase0_baseline_2026_11_15": {
+    "origin_main": "09b651fd99295799871fc692448e27502cc3e948 (git rev-parse origin/main and git ls-remote)",
+    "local_main": "1c1565303283ade79d7c8ca5dbbd13dc5cb05447, behind origin/main by 19, ahead 0 (not synced: not instructed)",
+    "pr_51": "MERGED, merge commit 09b651f, head 0c4cccd, mergedAt 2026-11-15T04:03:46Z",
+    "main_ci": "run 43675088324 (push, headSha 09b651f) completed / success",
+    "r6_branch": "local and remote 0c4cccd, reachable from origin/main, 0 commits not in main; kept",
+    "settings_json_diff_sha256": "6bfe5dda4322e414b90dab6b30f481db06ef604fbab5eecf0fbabe86e1e08249 (content not displayed)"
+  },
+  "local_regression": {
+    "conditions": "git init + git fetch --depth=1 of the commit into a scratch clone (no .env), env -i HOME PATH=/usr/bin:/bin LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 PYTHONPYCACHEPREFIX=<scratch>, python -I -B -m pytest -p no:cacheprovider -q; ruff check --no-cache .; mypy --no-incremental --cache-dir=/dev/null src",
+    "interpreters": {"python_3_14": "CPython 3.14.10 (.venv-py314-r5)", "python_3_9": "CPython 3.9.6 (.venv)"},
+    "runs": [
+      {"commit": "794dfa1", "started": "2026-11-15T13:32:27Z", "finished": "2026-11-15T13:34:37Z", "python_3_14": "1988 passed, 2 skipped (exit 0)", "python_3_9": "1986 passed, 4 skipped (exit 0)", "generation_workspace": "261 passed", "ruff": "clean", "mypy": "clean"},
+      {"commit": "96ad8bc", "started": "2026-11-15T13:56:12Z", "finished": "2026-11-15T13:58:29Z", "python_3_14": "2057 passed, 2 skipped (exit 0)", "python_3_9": "2055 passed, 4 skipped (exit 0)", "generation_workspace": "261 passed", "ruff": "clean", "mypy": "clean"},
+      {"commit": "af20d5e", "started": "2026-11-16T10:22:12Z", "finished": "2026-11-16T10:24:31Z", "python_3_14": "1 failed, 2072 passed, 2 skipped (exit 1): tests/test_cli_error_contract.py::test_plan_title_updates_eligible_error_json_flag_unchanged; the two outputs differ only in a report file name timestamped one second apart (192221 / 192222), the known timing-dependent test (R5-RR8). Three re-runs of tests/test_cli_error_contract.py in the same clone: 132 passed each (supplementary; the full run stays recorded as failed)", "python_3_9": "2071 passed, 4 skipped (exit 0)", "generation_workspace": "261 passed", "ruff": "clean", "mypy": "clean"},
+      {"commit": "c68c160", "started": "2026-11-16T10:41:33Z", "finished": "2026-11-16T10:43:50Z", "python_3_14": "2087 passed, 2 skipped (exit 0)", "python_3_9": "2085 passed, 4 skipped (exit 0)", "generation_workspace": "261 passed", "ruff": "clean", "mypy": "clean"},
+      {"commit": "f4b3eaa", "started": "2026-11-16T10:50:12Z", "finished": "2026-11-16T10:52:26Z", "python_3_14": "2105 passed, 2 skipped (exit 0)", "python_3_9": "2103 passed, 4 skipped (exit 0)", "generation_workspace": "261 passed", "ruff": "clean", "mypy": "clean"},
+      {"commit": "1251bbd", "started": "2026-11-16T10:56:32Z", "finished": "2026-11-16T10:58:57Z", "python_3_14": "2117 passed, 2 skipped (exit 0)", "python_3_9": "2115 passed, 4 skipped (exit 0)", "generation_workspace": "261 passed", "ruff": "clean", "mypy": "clean"}
+    ],
+    "r7_tests_at_verified_commit": "260 (tests/test_cutover_readiness_*.py), passed on 3.14 and 3.9",
+    "not_run_locally": "Layer B container tests and red checks (no Docker on the host); they run in CI",
+    "ci_note": "the CI run of the PR head is recorded on the PR"
+  },
+  "mutation_checks": "each defence was disabled in a scratch copy (never in the repository) and the R7 tests re-run; every mutant was killed after test additions. Two survivors were found and closed: the unknown-version check (test added) and the defence-in-depth sys.path check (test added). One mutant was mis-specified (syntax error) and re-done.",
+  "independent_audits": {
+    "independence_limit": "every auditor was the same AI model in a separate context of the same operating session (R7-5)",
+    "rounds": [
+      {"head": "54b75aa", "verdict": "FAIL", "major": ["M-1 startup hooks outside site-packages and unlisted files not checked", "M-2 command_may_mutate misread `--deck-name --dry-run`"], "fixed_in": "96ad8bc"},
+      {"head": "96ad8bc", "verdict": "FAIL", "major": ["N-1 directory symlinks trusted", "N-2 pyvenv.cfg home not tied to the runtime"], "fixed_in": "af20d5e"},
+      {"head": "af20d5e", "verdict": "FAIL", "major": ["NEW-1 pyvenv.cfg parsed unlike getpath; stdlib landmarks not required"], "fixed_in": "c68c160", "scope_note": "this auditor also listed and read files in the real .venv-py314-r5 and runtime (read-only), beyond the git-only reading asked; later auditors were told not to"},
+      {"head": "c68c160", "verdict": "FAIL", "major": ["N4-1 home compared after lexical normpath", "N4-2 ._pth not refused"], "fixed_in": "f4b3eaa"},
+      {"head": "f4b3eaa", "verdict": "FAIL", "major": ["NEW-A case-sensitive name checks on a case-insensitive volume"], "fixed_in": "1251bbd"},
+      {"head": "1251bbd", "verdict": "PASS", "major": [], "info": ["possible fail-closed FAILs on other layouts", "fold is not the full canonical caseless form (over-folds: fail closed)", "hook names in another case over-detected (fail closed)", "BOM in .pth fails closed"]}
+    ],
+    "memory_note": "parts of the getpath / site.py model rest on the auditors' memory of CPython, not on its 3.14 source; every rule derived from it refuses (R7-2)"
+  },
+  "real_tree_read_only_checks": {
+    "what": "with /usr/bin/python3 -I -B, the committed walk_tree and name_problems on the real runtime and .venv-py314-r5 (reading only; no interpreter of the runtime run; no manifest written)",
+    "runtime": "walk_tree accepted, 2063 entries, 0 name problems, 0 ._pth, lib/python3.14/os.py present",
+    "venv_py314": "walk_tree accepted, 4913 entries, 0 name problems, 0 ._pth",
+    "pyvenv_cfg": "keys home, include-system-site-packages, version, executable, command; home and executable equal the runtime's bin and interpreter as exact strings; runtime_root equals its realpath",
+    "pth": ".venv-py314-r5 has 2 .pth files with 0 import lines; one points to tools/generation_workspace (outside an app_root of src/: fails closed, R7-8)"
+  },
+  "github_governance_read_only_2026_11_15": {
+    "ruleset": "Protect main (active, refs/heads/main), bypass_actors [], current_user_can_bypass never",
+    "rules": "deletion, non_fast_forward, pull_request (required_approving_review_count 0, dismiss_stale_reviews_on_push false, require_code_owner_review false, require_last_push_approval false, required_review_thread_resolution true), required_status_checks test / lint / type-check (strict)",
+    "classic_branch_protection": "404 Branch not protected",
+    "codeowners": "none",
+    "collaborators": "1 (admin)",
+    "workflow_permissions": "default read, can_approve_pull_request_reviews false",
+    "result": "G7 FAIL: review is not technically enforced (cutover blocker B-G1)"
+  },
+  "preservation": {
+    "method": "snapshot (type, mode, size, mtime, sha256 of every entry, symlinks not followed) before and after, compared byte for byte",
+    "window": "2026-11-15, before the first R7 test run (exact time not recorded) to 2026-11-16T10:59:07Z (after the last)",
+    "entries": {"runtime": 2278, ".venv-py314-r5": 5409, ".venv": 3607},
+    "snapshot_file_sha256_prefix": {"runtime": "ddf528c31638ad0e", ".venv-py314-r5": "6b0e694644d3a493", ".venv": "51821874865d53d2"},
+    "result": "unchanged; also identical to the first snapshots of 2026-11-15 taken during R6 (same prefixes as docs/evidence/phase-3h-r6/EVIDENCE.json)"
+  },
+  "governance_exceptions": [
+    {"id": "settings-json-diff", "what": "Phase 0 listed `git diff -- .claude/settings.json`; it was run piped to sha256 so the content was not displayed (earlier instruction: no need to display it)"},
+    {"id": "stray-tool-calls", "what": "three tool calls aimed at wrong paths outside the repository (two Edit, one Write) failed (file not found / permission denied); nothing was created or changed (checked)"},
+    {"id": "first-regression-attempt", "what": "the first background regression at 794dfa1 ran nothing (exit 127, a shell word-splitting error); it was re-run with a script and only the re-run is reported"},
+    {"id": "auditor-scope", "what": "the third audit round read the real .venv-py314-r5 and runtime directly (read-only)"},
+    {"id": "timing-flake", "what": "af20d5e Python 3.14 full run: 1 failure (known timing test); recorded as failed"}
+  ],
+  "production_access": 0,
+  "production_secrets_used": 0,
+  "storage": "this public repository, docs/evidence/phase-3h-r7/; no secrets, no environment values, no personal paths",
+  "final_sha_audit": {
+    "recorded": "2026-11-18, appended; the keys above are unchanged from 970e297",
+    "target": "970e297d574213b2cd547400b4c10c011ba2237c (adds this file only; parent 1251bbd)",
+    "date": "2026-11-17",
+    "auditor": "the same AI model in a separate context (R7-5); git-only reading (git show / diff / log / ls-tree / grep, python3 -I for JSON and AST counting); no working-tree reads beyond git, no .env, no venv or runtime, no network, no tests run",
+    "verdict": "PASS",
+    "findings": [
+      {"id": "D-1", "severity": "minor", "what": "R7_RESIDUAL_RISK_REGISTER.md 'Timing tests' row said every R7 full run passed, contradicting local_regression.runs (af20d5e Python 3.14: 1 failed)", "status": "corrected in the closure commit: the failure is recorded, kept apart from later passing runs; the earlier sentence is withdrawn in the row itself"},
+      {"id": "D-2", "severity": "info", "what": "no repository record of G2 = UNVERIFIED or G10 = BLOCKED (they were stated only in the PR body)", "status": "corrected in the closure commit: docs/phase-3h-r7/R7_BLOCKER_RESOLUTION_PLAN.md records G1 to G10, blockers, H1 to H9 and the authorization evidence list"},
+      {"id": "info", "severity": "info", "what": "970e297 changes only this file; the four sha256 values under files_at_verified_commit match; scripts/cutover_readiness.py is identical at 1251bbd and 970e297 and EXECUTION_ENABLED = False is never reassigned; change_scope confirmed; static count of R7 tests = 260; no secrets, Notion identifiers, e-mail addresses or personal paths; no gate overstated"}
+    ],
+    "not_checkable_by_git_reading": "local regression results, mutation checks, read-only checks of the real trees, live GitHub settings, CI; checked for internal consistency only"
+  },
+  "evidence_integrity_closure": {
+    "date": "2026-11-18",
+    "authorization": "human approval in the operating session for the Evidence Integrity Closure directive (repository edits, commit and normal push to the R7 feature branch); not a merge or cutover authorization",
+    "baseline": "HEAD = origin feature branch = PR #52 head 970e297, PR #52 OPEN and not merged, origin/main 09b651f, .claude/settings.json diff sha256 6bfe5dda... unchanged",
+    "files": ["docs/phase-3h-r7/R7_RESIDUAL_RISK_REGISTER.md (Timing tests row)", "docs/phase-3h-r7/R7_BLOCKER_RESOLUTION_PLAN.md (new)", "docs/evidence/phase-3h-r7/EVIDENCE.json (final_sha_audit and evidence_integrity_closure appended)"],
+    "gates_unchanged": "G2 UNVERIFIED, G7 FAIL, G10 BLOCKED; R7 = BLOCKED / NOT_READY",
+    "audit_of_this_commit": "the independent audit of the head that contains this entry, and that head's CI, are reported in the operating report of this closure, not here: writing them into this file would change the audited SHA"
+  }
+}
