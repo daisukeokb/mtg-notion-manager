@@ -79,5 +79,26 @@
   ],
   "production_access": 0,
   "production_secrets_used": 0,
-  "storage": "this public repository, docs/evidence/phase-3h-r7/; no secrets, no environment values, no personal paths"
+  "storage": "this public repository, docs/evidence/phase-3h-r7/; no secrets, no environment values, no personal paths",
+  "final_sha_audit": {
+    "recorded": "2026-11-18, appended; the keys above are unchanged from 970e297",
+    "target": "970e297d574213b2cd547400b4c10c011ba2237c (adds this file only; parent 1251bbd)",
+    "date": "2026-11-17",
+    "auditor": "the same AI model in a separate context (R7-5); git-only reading (git show / diff / log / ls-tree / grep, python3 -I for JSON and AST counting); no working-tree reads beyond git, no .env, no venv or runtime, no network, no tests run",
+    "verdict": "PASS",
+    "findings": [
+      {"id": "D-1", "severity": "minor", "what": "R7_RESIDUAL_RISK_REGISTER.md 'Timing tests' row said every R7 full run passed, contradicting local_regression.runs (af20d5e Python 3.14: 1 failed)", "status": "corrected in the closure commit: the failure is recorded, kept apart from later passing runs; the earlier sentence is withdrawn in the row itself"},
+      {"id": "D-2", "severity": "info", "what": "no repository record of G2 = UNVERIFIED or G10 = BLOCKED (they were stated only in the PR body)", "status": "corrected in the closure commit: docs/phase-3h-r7/R7_BLOCKER_RESOLUTION_PLAN.md records G1 to G10, blockers, H1 to H9 and the authorization evidence list"},
+      {"id": "info", "severity": "info", "what": "970e297 changes only this file; the four sha256 values under files_at_verified_commit match; scripts/cutover_readiness.py is identical at 1251bbd and 970e297 and EXECUTION_ENABLED = False is never reassigned; change_scope confirmed; static count of R7 tests = 260; no secrets, Notion identifiers, e-mail addresses or personal paths; no gate overstated"}
+    ],
+    "not_checkable_by_git_reading": "local regression results, mutation checks, read-only checks of the real trees, live GitHub settings, CI; checked for internal consistency only"
+  },
+  "evidence_integrity_closure": {
+    "date": "2026-11-18",
+    "authorization": "human approval in the operating session for the Evidence Integrity Closure directive (repository edits, commit and normal push to the R7 feature branch); not a merge or cutover authorization",
+    "baseline": "HEAD = origin feature branch = PR #52 head 970e297, PR #52 OPEN and not merged, origin/main 09b651f, .claude/settings.json diff sha256 6bfe5dda... unchanged",
+    "files": ["docs/phase-3h-r7/R7_RESIDUAL_RISK_REGISTER.md (Timing tests row)", "docs/phase-3h-r7/R7_BLOCKER_RESOLUTION_PLAN.md (new)", "docs/evidence/phase-3h-r7/EVIDENCE.json (final_sha_audit and evidence_integrity_closure appended)"],
+    "gates_unchanged": "G2 UNVERIFIED, G7 FAIL, G10 BLOCKED; R7 = BLOCKED / NOT_READY",
+    "audit_of_this_commit": "the independent audit of the head that contains this entry, and that head's CI, are reported in the operating report of this closure, not here: writing them into this file would change the audited SHA"
+  }
 }
