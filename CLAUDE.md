@@ -40,6 +40,8 @@ Notion APIは2025-09-03以降のバージョン(data source対応)を使うこ�
 - 統率者は `<main-deck>` の最初の1行(例: `1 Bello, Bard of the Brambles [cardid]`)。末尾の `[...]` は除去する。
 - 色は同ページ上部の `<figcaption>Animated Army (Red-Green)</figcaption>` のようにデッキ名と対で書かれている。deck-titleと突き合わせて取得。
 - 1記事に複数の `<deck-list>` が存在する場合(新製品発表記事はほぼ全てこの形式)は非対応としてエラーにする。
+- **set属性のない日本語版記事(実測、2026-11『スター・トレック』記事)**: `<deck-list product="..." deck-title="惑星連邦宇宙艦隊">` のように `set` 属性も `figcaption` もない。この場合に限り、発売セットは記事タイトル(h1/title)の『』内(`mapping.py` の `WIZARDS_JA_SET_TITLE_MAP` で完全一致解決)、色は目次の `惑星連邦宇宙艦隊（青赤白）` から取得する。`main-deck` の行は枚数1のとき枚数が省略される(基本土地のみ `5 Island [id]`)。
+- 同記事の `main-deck` は英語名のみで、日本語名はページのデッキリスト部品がContentful(locale=ja、`magicCard`)から描画時に取得する。他セット版の誤記が混在するため、そのデッキの `product` IDを `foundInProducts` に含むエントリに限定して使うこと。
 
 ### mtg-jp.com
 - デッキ名は `<h4>「デッキ名」</h4>` (日本語カギ括弧)。

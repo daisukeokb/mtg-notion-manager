@@ -94,6 +94,60 @@ class TestWizardsOfficialFetcher:
         assert names == ["Animated Army"]
 
 
+class TestWizardsJapaneseArticleWithoutSetAttribute:
+    """set属性・figcaptionのない日本語版Wizards記事(2026-11『スター・トレック』)。"""
+
+    URL = "https://magic.wizards.com/ja/news/announcements/star-trek-commander-decklists"
+
+    def test_set_from_title_and_colors_from_table_of_contents(self) -> None:
+        html = _read_fixture("wizards_ja_no_set_attr.html")
+        result = WizardsOfficialFetcher().parse(html, self.URL, deck_name="惑星連邦宇宙艦隊")
+
+        assert result.name == "惑星連邦宇宙艦隊"
+        assert result.commander == "Jean-Luc Picard, Luminary"
+        assert result.set_raw == "マジック：ザ・ギャザリング | スター・トレック™"
+        assert result.colors_raw == ["青", "赤", "白"]
+
+    def test_second_deck_uses_its_own_colors(self) -> None:
+        html = _read_fixture("wizards_ja_no_set_attr.html")
+        result = WizardsOfficialFetcher().parse(html, self.URL, deck_name="我々はボーグ")
+
+        assert result.commander == "The Borg Queen"
+        assert result.colors_raw == ["白", "青", "黒"]
+
+    def test_set_attribute_still_takes_precedence(self) -> None:
+        html = _read_fixture("wizards_ja_no_set_attr.html").replace(
+            'deck-title="我々はボーグ"', 'deck-title="我々はボーグ" set="TRK"'
+        )
+        result = WizardsOfficialFetcher().parse(html, self.URL, deck_name="我々はボーグ")
+
+        assert result.set_raw == "TRK"
+
+    def test_missing_title_and_set_attribute_raises(self) -> None:
+        html = _read_fixture("wizards_ja_no_set_attr.html").replace("『", "").replace("』", "")
+        with pytest.raises(ParseError):
+            WizardsOfficialFetcher().parse(html, self.URL, deck_name="惑星連邦宇宙艦隊")
+
+    def test_missing_colors_raises(self) -> None:
+        html = _read_fixture("wizards_ja_no_set_attr.html").replace("（青赤白）", "")
+        with pytest.raises(ParseError):
+            WizardsOfficialFetcher().parse(html, self.URL, deck_name="惑星連邦宇宙艦隊")
+
+    def test_conflicting_colors_raise(self) -> None:
+        html = _read_fixture("wizards_ja_no_set_attr.html").replace(
+            "<ul>", "<ul><li>惑星連邦宇宙艦隊（赤緑）</li>", 1
+        )
+        with pytest.raises(ParseError):
+            WizardsOfficialFetcher().parse(html, self.URL, deck_name="惑星連邦宇宙艦隊")
+
+    def test_non_color_text_in_parentheses_is_ignored(self) -> None:
+        html = _read_fixture("wizards_ja_no_set_attr.html").replace(
+            "（青赤白）", "（新規カード32枚）"
+        )
+        with pytest.raises(ParseError):
+            WizardsOfficialFetcher().parse(html, self.URL, deck_name="惑星連邦宇宙艦隊")
+
+
 class TestMtgJpFetcher:
     def test_matches_mtgjp_domain(self) -> None:
         fetcher = MtgJpFetcher()

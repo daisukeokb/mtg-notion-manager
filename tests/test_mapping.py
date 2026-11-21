@@ -20,6 +20,14 @@ class TestNormalizeSetName:
         with pytest.raises(MappingError):
             normalize_set_name("ZZZ")
 
+    def test_japanese_wizards_article_title_is_mapped(self) -> None:
+        title = "マジック：ザ・ギャザリング | スター・トレック™"
+        assert normalize_set_name(title) == "スター・トレック"
+
+    def test_title_mapping_requires_exact_match(self) -> None:
+        with pytest.raises(MappingError):
+            normalize_set_name("マジック：ザ・ギャザリング | スター・トレック")  # ™なし
+
 
 class TestNormalizeColors:
     def test_japanese_tokens_pass_through(self) -> None:

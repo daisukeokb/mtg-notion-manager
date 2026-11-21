@@ -28,8 +28,17 @@ VALID_SET_NAMES: frozenset[str] = frozenset(
         "タルキール：龍嵐録",
         "イニストラード：真紅の契り",
         "イクサラン：失われし洞窟",
+        "スター・トレック",
     }
 )
+
+# 2026-11-21 に「スター・トレック」をユーザー承認のうえNotion側へ追加。
+
+# set 属性のない日本語版Wizards記事のタイトル『』内表記 → Notionの発売セット名。
+# 記事タイトルの表記をそのまま(完全一致で)キーにする。
+WIZARDS_JA_SET_TITLE_MAP: dict[str, str] = {
+    "マジック：ザ・ギャザリング | スター・トレック™": "スター・トレック",  # 実測(2026-11 記事)
+}
 
 # Notion「MTG統率者DB」>「色」の既存選択肢。
 VALID_COLORS: frozenset[str] = frozenset({"白", "青", "黒", "赤", "緑", "無色"})
@@ -73,6 +82,7 @@ def normalize_set_name(raw: str) -> str:
     以下の順で解決を試みる:
     1. 既にNotionの選択肢名と完全一致する(mtg-jp.comの記事タイトル由来)
     2. Wizards公式の3文字セットコードとして解決できる
+    3. set 属性のない日本語版Wizards記事のタイトル表記として解決できる
 
     どちらでも解決できない場合は MappingError を送出する。
     """
@@ -86,6 +96,15 @@ def normalize_set_name(raw: str) -> str:
         if mapped not in VALID_SET_NAMES:
             raise MappingError(
                 f"セットコード '{code}' のマッピング先 '{mapped}' が"
+                " Notionの発売セット選択肢に存在しません。mapping.py を確認してください。"
+            )
+        return mapped
+
+    if candidate in WIZARDS_JA_SET_TITLE_MAP:
+        mapped = WIZARDS_JA_SET_TITLE_MAP[candidate]
+        if mapped not in VALID_SET_NAMES:
+            raise MappingError(
+                f"記事タイトル '{candidate}' のマッピング先 '{mapped}' が"
                 " Notionの発売セット選択肢に存在しません。mapping.py を確認してください。"
             )
         return mapped
