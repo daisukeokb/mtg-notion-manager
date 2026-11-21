@@ -8,6 +8,11 @@ execute_import_cards() が実際の書き込みを行う。
 - 各カードの状態判定(create/relation_update/unchanged)は毎回Notionの現在値を
   読み直して決めるため、同じコマンドを再実行しても重複作成・重複リレーションは起きない。
 - 1件の失敗が他のカードの処理を止めない(1件ずつ記録し、続行する)。
+- 既存カードへのリレーション追記は、計画時のスナップショットではなく書き込み直前に
+  Notionから読み直した現在値へ追記する(採用デッキはPATCHで全件置換されるため)。
+- 1回の実行で複数デッキを適用する場合(import-article)、RunWriteState で
+  この実行中に作成したカードを追跡し、後続デッキの同一カードの create は
+  作成済みページへの relation_update に読み替える(同一カードの重複作成防止)。
 """
 
 from __future__ import annotations
@@ -21,10 +26,13 @@ from mtg_notion_manager.models import (
     BLOCKED_CREATION_ACTIONS,
     CardDecision,
     DeckCard,
+    ExistingCard,
     ParsedDeckList,
+    VerifiedNewCard,
 )
 from mtg_notion_manager.notion.card_repository import CardRepository
 from mtg_notion_manager.notion.client import AMBIGUOUS_WRITE_STATUS_CODES
+from mtg_notion_manager.parsers.card_names import normalize_card_name
 from mtg_notion_manager.parsers.decklist import parse_decklist, validate_deck_count
 from mtg_notion_manager.services.card_resolution import (
     ConfirmedCardMapping,
@@ -139,6 +147,60 @@ class ImportCardsResult:
         return [r for r in self.results if r.action == "failed"]
 
 
+@dataclass
+class RunWriteState:
+    """1回の実行(import-article全体など、複数デッキにまたがる適用)で
+    作成したカードページを追跡する。
+
+    計画(build_import_cards_plan)はデッキごとに実行前のスナップショットから作られるため、
+    DBに無いカードを複数デッキが使う場合、各デッキの計画にそれぞれ create が入る。
+    execute_import_cards() はこの状態を参照し、既に作成済みのカードは新規作成せず
+    作成済みページへの relation_update に読み替える。
+
+    同一カードの判定はまず stable_key、次に正規化英語名→正規化日本語名
+    (CardRepository.find_match() と同じ優先順位。次回実行時の照合結果と一致させるため)。
+    作成結果が不明(UNKNOWN)に終わったカードは、後続デッキでも作成を試みない
+    (サーバー側で作成済みの可能性があり、再作成すると重複しうるため)。
+    """
+
+    created_by_key: dict[str, tuple[str, str]] = field(default_factory=dict)
+    created_by_name_en: dict[str, tuple[str, str]] = field(default_factory=dict)
+    created_by_name_ja: dict[str, tuple[str, str]] = field(default_factory=dict)
+    unknown_create_keys: set[str] = field(default_factory=set)
+    unknown_create_names_en: set[str] = field(default_factory=set)
+    unknown_create_names_ja: set[str] = field(default_factory=set)
+
+    def find_created(self, card: VerifiedNewCard) -> tuple[str, str] | None:
+        """作成済みなら (page_id, page_url) を返す。"""
+        if card.stable_key in self.created_by_key:
+            return self.created_by_key[card.stable_key]
+        if card.name_en and normalize_card_name(card.name_en) in self.created_by_name_en:
+            return self.created_by_name_en[normalize_card_name(card.name_en)]
+        if normalize_card_name(card.name_ja) in self.created_by_name_ja:
+            return self.created_by_name_ja[normalize_card_name(card.name_ja)]
+        return None
+
+    def is_create_unknown(self, card: VerifiedNewCard) -> bool:
+        if card.stable_key in self.unknown_create_keys:
+            return True
+        if card.name_en and normalize_card_name(card.name_en) in self.unknown_create_names_en:
+            return True
+        return normalize_card_name(card.name_ja) in self.unknown_create_names_ja
+
+    def record_created(self, card: VerifiedNewCard, page_id: str, page_url: str) -> None:
+        entry = (page_id, page_url)
+        self.created_by_key[card.stable_key] = entry
+        if card.name_en:
+            self.created_by_name_en.setdefault(normalize_card_name(card.name_en), entry)
+        self.created_by_name_ja.setdefault(normalize_card_name(card.name_ja), entry)
+
+    def record_create_unknown(self, card: VerifiedNewCard) -> None:
+        self.unknown_create_keys.add(card.stable_key)
+        if card.name_en:
+            self.unknown_create_names_en.add(normalize_card_name(card.name_en))
+        self.unknown_create_names_ja.add(normalize_card_name(card.name_ja))
+
+
 class PartialImportAbortedError(UnverifiedNewCardError):
     """UnverifiedNewCardErrorによるバッチ中断時、それより前に完了していた
     CardApplyResult(成功・NotionAPIError由来のfailedを含む)を保持して運ぶ。
@@ -251,9 +313,15 @@ def _decide(
 
 
 def execute_import_cards(
-    plan: ImportCardsPlan, card_repo: CardRepository, note: str = ""
+    plan: ImportCardsPlan,
+    card_repo: CardRepository,
+    note: str = "",
+    run_state: RunWriteState | None = None,
 ) -> ImportCardsResult:
     """計画をNotionへ適用する。
+
+    run_state は複数デッキを1回の実行で適用する場合(import-article)に、全デッキで
+    同じインスタンスを渡す(RunWriteState参照)。省略時はこの呼び出し専用の状態を使う。
 
     曖昧一致など未解決の判定が1件でもあれば、何も書き込まずに例外を送出する
     (100枚の途中で不完全な状態になることを避けるための事前ゲート)。
@@ -266,10 +334,15 @@ def execute_import_cards(
             f"{details}"
         )
 
+    if run_state is None:
+        run_state = RunWriteState()
+
     results: list[CardApplyResult] = []
     for decision in plan.decisions:
         try:
-            result = _apply_one(decision, plan.deck_page_id, card_repo, note, plan.parsed)
+            result = _apply_one(
+                decision, plan.deck_page_id, card_repo, note, plan.parsed, run_state
+            )
         except UnverifiedNewCardError as exc:
             # 中断semantics自体は変更しない(このカード・以降のカードへは書き込まない)。
             # それより前に完了していた結果だけを、外部から回収可能なsnapshotとして運ぶ。
@@ -287,7 +360,16 @@ def _apply_one(
     card_repo: CardRepository,
     note: str,
     parsed: ParsedDeckList,
+    run_state: RunWriteState,
 ) -> CardApplyResult:
+    #: except節で、実際にどちらの書き込みを試みたかを判定するために使う
+    #: (create計画でも、作成済みカードへのrelation_updateに読み替える場合がある)。
+    attempted = (
+        FailedWriteOperation.CREATE
+        if decision.action == "create"
+        else FailedWriteOperation.RELATION_UPDATE
+    )
+    verified: VerifiedNewCard | None = None
     try:
         if decision.action == "create":
             # 書き込み境界の防御: resolution.verified_card が無い場合(例えば
@@ -307,23 +389,52 @@ def _apply_one(
                         " 新規作成できません(安全機構違反)。"
                     )
                 verified = resolution.verified_card
+
+            created = run_state.find_created(verified)
+            if created is not None:
+                # 同一実行内の先行デッキで作成済み: 重複作成せず、作成済みページへ
+                # このデッキのリレーションを追記する。
+                attempted = FailedWriteOperation.RELATION_UPDATE
+                return _apply_relation_update_fresh(
+                    decision, created[0], created[1], deck_page_id, card_repo
+                )
+            if run_state.is_create_unknown(verified):
+                # 先行デッキでの作成結果が不明。作成済みの可能性があるため、
+                # 再作成(重複の恐れ)もリレーション追記(対象不明)も行わない。
+                return CardApplyResult(
+                    card=decision.card,
+                    action="failed",
+                    error=(
+                        f"カード '{decision.card.display_name}' は同一実行内の先行デッキで"
+                        "作成結果が不明になったため、重複作成を避けて作成を見送りました"
+                        "(Notion側で作成済みか確認のうえ再実行してください)。"
+                    ),
+                    failed_operation=FailedWriteOperation.CREATE,
+                    failed_completion=WriteCompletion.KNOWN_FAILED,
+                )
+
             page = card_repo.create_card(verified, deck_page_id, note=note)
+            page_id = page.get("id")
+            page_url = page.get("url")
+            if page_id:
+                run_state.record_created(verified, page_id, page_url or "")
+            else:
+                run_state.record_create_unknown(verified)
             return CardApplyResult(
                 card=decision.card,
                 action="created",
-                page_id=page.get("id"),
-                page_url=page.get("url"),
+                page_id=page_id,
+                page_url=page_url,
             )
 
         if decision.action == "relation_update":
             assert decision.existing is not None
-            current_ids = card_repo.get_deck_relation_ids(decision.existing)
-            page = card_repo.apply_relation_update(decision.existing, deck_page_id, current_ids)
-            return CardApplyResult(
-                card=decision.card,
-                action="relation_updated",
-                page_id=page.get("id", decision.existing.page_id),
-                page_url=page.get("url", decision.existing.page_url),
+            return _apply_relation_update_fresh(
+                decision,
+                decision.existing.page_id,
+                decision.existing.page_url,
+                deck_page_id,
+                card_repo,
             )
 
         # unchanged: Notionへは何も送らない
@@ -334,23 +445,55 @@ def _apply_one(
             page_url=decision.existing.page_url if decision.existing else None,
         )
     except NotionAPIError as exc:
-        failed_operation = (
-            FailedWriteOperation.CREATE
-            if decision.action == "create"
-            else FailedWriteOperation.RELATION_UPDATE
-        )
         # create分岐でNotionへ送るのはcreate_card()のPOST /pages 1回だけのため、
         # ここに来たCREATEの失敗は必ずそのPOSTの失敗である。べき等でないcreateに限り、
         # 曖昧な5xxをUNKNOWNとして扱う専用の分類を使う(relation_updateは従来のまま)。
         completion = (
             _create_completion_from_notion_api_error(exc)
-            if failed_operation == FailedWriteOperation.CREATE
+            if attempted == FailedWriteOperation.CREATE
             else _completion_from_notion_api_error(exc)
         )
+        if (
+            attempted == FailedWriteOperation.CREATE
+            and verified is not None
+            and completion == WriteCompletion.UNKNOWN
+        ):
+            run_state.record_create_unknown(verified)
         return CardApplyResult(
             card=decision.card,
             action="failed",
             error=str(exc),
-            failed_operation=failed_operation,
+            failed_operation=attempted,
             failed_completion=completion,
         )
+
+
+def _apply_relation_update_fresh(
+    decision: CardDecision,
+    page_id: str,
+    page_url: str,
+    deck_page_id: str,
+    card_repo: CardRepository,
+) -> CardApplyResult:
+    """カードページの現在値を読み直し、その採用デッキへこのデッキを追記する。
+
+    計画時のスナップショット(decision.existing.properties)は使わない。
+    同一実行内の先行デッキが追加したリレーションを含まず、そのままPATCHすると
+    上書きで失われるため。読み直した結果、既に追記済み・所持済みであれば書き込まない。
+    """
+    current: ExistingCard = card_repo.refresh_card(page_id)
+    current_ids = card_repo.get_deck_relation_ids(current)
+    if deck_page_id in current_ids and card_repo.is_owned(current):
+        return CardApplyResult(
+            card=decision.card,
+            action="unchanged",
+            page_id=current.page_id,
+            page_url=current.page_url or page_url,
+        )
+    page = card_repo.apply_relation_update(current, deck_page_id, current_ids)
+    return CardApplyResult(
+        card=decision.card,
+        action="relation_updated",
+        page_id=page.get("id", current.page_id),
+        page_url=page.get("url", current.page_url or page_url),
+    )

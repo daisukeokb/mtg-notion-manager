@@ -44,6 +44,7 @@ class FakeCardRepository:
         self.loaded = False
         self.created: list[tuple[DeckCard, str, str]] = []
         self.relation_updates: list[tuple[str, str, list[str]]] = []
+        self.refresh_calls: list[str] = []
 
     def load(self) -> None:
         self.loaded = True
@@ -54,6 +55,11 @@ class FakeCardRepository:
 
     def get_deck_relation_ids(self, existing: ExistingCard) -> list[str]:
         return self.deck_relation_ids.get(existing.page_id, [])
+
+    def refresh_card(self, page_id: str) -> ExistingCard:
+        """本物は GET /pages/{id}。このfakeの現在値は deck_relation_ids/owned が持つ。"""
+        self.refresh_calls.append(page_id)
+        return ExistingCard(page_id=page_id, page_url=f"https://notion.so/{page_id}", properties={})
 
     def is_owned(self, existing: ExistingCard) -> bool:
         return self.owned.get(existing.page_id, False)

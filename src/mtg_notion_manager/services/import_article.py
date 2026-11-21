@@ -53,6 +53,7 @@ from mtg_notion_manager.services.import_cards import (
     BLOCKING_ACTIONS,
     ImportCardsPlan,
     ImportCardsResult,
+    RunWriteState,
     build_import_cards_plan,
     execute_import_cards,
 )
@@ -264,17 +265,26 @@ def execute_article_import(
 
     全件成功している場合でも、デッキごとに独立して例外を捕捉する
     (Notion API呼び出し自体の失敗は、他デッキの結果を失わせない)。
+
+    全デッキの計画は実行前の同一スナップショットから作られているため、全デッキで
+    1つの RunWriteState を共有する: 複数デッキが使う新規カードは最初のデッキでだけ
+    作成し、後続デッキは作成済みページへのリレーション追記に読み替える。また既存カードの
+    リレーション追記は書き込み直前に現在値を読み直すため、先行デッキが追加した
+    リレーションを上書きで失わない(import_cards.execute_import_cards()参照)。
     """
     if not plan.is_fully_applicable:
         return plan
 
+    run_state = RunWriteState()
     new_entries = []
     for entry in plan.entries:
         if entry.status != STATUS_READY or entry.cards_plan is None:
             new_entries.append(entry)
             continue
         try:
-            result = execute_import_cards(entry.cards_plan, card_repo, note=note)
+            result = execute_import_cards(
+                entry.cards_plan, card_repo, note=note, run_state=run_state
+            )
         except MtgNotionManagerError as exc:
             new_entries.append(
                 DeckArticleEntry(

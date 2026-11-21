@@ -100,6 +100,7 @@ class FakeCardRepository:
         self._loaded = False
         self.created: list[tuple[DeckCard, str, str]] = []
         self.relation_updates: list[tuple[str, str, list[str]]] = []
+        self.refresh_calls: list[str] = []
 
     def load(self) -> None:
         """本物のCardRepository.load()と同じく、初回のみ実際に取得する(冪等)。"""
@@ -114,6 +115,11 @@ class FakeCardRepository:
 
     def get_deck_relation_ids(self, existing: ExistingCard) -> list[str]:
         return self.deck_relation_ids.get(existing.page_id, [])
+
+    def refresh_card(self, page_id: str) -> ExistingCard:
+        """本物は GET /pages/{id}。このfakeの現在値は deck_relation_ids/owned が持つ。"""
+        self.refresh_calls.append(page_id)
+        return ExistingCard(page_id=page_id, page_url=f"https://notion.so/{page_id}", properties={})
 
     def is_owned(self, existing: ExistingCard) -> bool:
         return self.owned.get(existing.page_id, False)
@@ -627,3 +633,193 @@ class TestWriteArticleDeckLogs:
         data = json.loads(paths[0].read_text(encoding="utf-8"))
         assert data["delete_count"] == 0
         assert data["status"] == import_article.STATUS_ERROR
+
+
+# --- 同一実行内の複数デッキ間の書き込み整合性(2026-11-21 Star Trek記事で発生した不具合の回帰) ---
+#
+# 本物の NotionClient / CardRepository を使い、HTTP層だけを pytest-httpx の
+# コールバックでNotion風のインメモリDBに差し替える。こうすることで
+# 「load()時のスナップショット」と「Notion上の現在値」が実際に食い違う状況を再現できる
+# (dictを共有するfake repositoryでは、スナップショットの古さが隠れてしまうため)。
+
+import copy  # noqa: E402
+import re as _re  # noqa: E402
+
+import httpx  # noqa: E402
+from pytest_httpx import HTTPXMock  # noqa: E402
+
+from mtg_notion_manager.notion.card_repository import CardRepository  # noqa: E402
+from mtg_notion_manager.notion.client import NotionClient  # noqa: E402
+
+CARD_DS_ID = "card-ds-id"
+
+
+class InMemoryNotionCardDb:
+    """MTGカードDBだけを模したNotion APIのインメモリ実装(HTTPコールバック)。"""
+
+    def __init__(self) -> None:
+        self.pages: dict[str, dict] = {}
+        self.requests: list[tuple[str, str]] = []
+        self._seq = 0
+
+    def add_card(self, page_id: str, name: str, deck_ids: list[str], owned: bool = True) -> None:
+        self.pages[page_id] = {
+            "object": "page",
+            "id": page_id,
+            "url": f"https://notion.so/{page_id}",
+            "properties": {
+                "カード名": {"type": "title", "title": [{"plain_text": name}]},
+                "英語名": {"type": "rich_text", "rich_text": [{"plain_text": name}]},
+                "所持": {"type": "checkbox", "checkbox": owned},
+                "採用デッキ": {
+                    "id": "rel",
+                    "type": "relation",
+                    "relation": [{"id": d} for d in deck_ids],
+                    "has_more": False,
+                },
+            },
+        }
+
+    def deck_ids(self, page_id: str) -> list[str]:
+        return [r["id"] for r in self.pages[page_id]["properties"]["採用デッキ"]["relation"]]
+
+    def pages_named(self, name: str) -> list[str]:
+        return [
+            pid
+            for pid, page in self.pages.items()
+            if page["properties"]["カード名"]["title"][0]["plain_text"] == name
+        ]
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/v1")
+        self.requests.append((request.method, path))
+        body = json.loads(request.content) if request.content else {}
+
+        if request.method == "POST" and path == f"/data_sources/{CARD_DS_ID}/query":
+            return httpx.Response(
+                200,
+                json={"results": copy.deepcopy(list(self.pages.values())), "has_more": False},
+            )
+        if request.method == "POST" and path == "/pages":
+            self._seq += 1
+            page_id = f"created-{self._seq}"
+            props = body["properties"]
+            self.add_card(
+                page_id,
+                props["カード名"]["title"][0]["text"]["content"],
+                [r["id"] for r in props["採用デッキ"]["relation"]],
+                owned=props["所持"]["checkbox"],
+            )
+            return httpx.Response(200, json=copy.deepcopy(self.pages[page_id]))
+        match = _re.fullmatch(r"/pages/([^/]+)", path)
+        if match and request.method == "GET":
+            return httpx.Response(200, json=copy.deepcopy(self.pages[match.group(1)]))
+        if match and request.method == "PATCH":
+            page = self.pages[match.group(1)]
+            props = body["properties"]
+            if "採用デッキ" in props:
+                # Notionと同じく、relationはPATCHで全件置換される。
+                page["properties"]["採用デッキ"]["relation"] = [
+                    {"id": r["id"]} for r in props["採用デッキ"]["relation"]
+                ]
+            if "所持" in props:
+                page["properties"]["所持"]["checkbox"] = props["所持"]["checkbox"]
+            return httpx.Response(200, json=copy.deepcopy(page))
+        return httpx.Response(400, json={"message": f"unexpected {request.method} {path}"})
+
+
+def _run_two_deck_article(
+    monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock, db: InMemoryNotionCardDb, card_name: str
+) -> import_article.ArticleImportPlan:
+    decks = DECK_NAMES[:2]
+    parse_map = {name: _parsed(name, [_card(card_name, 100)]) for name in decks}
+    _patch_common(monkeypatch, decks, parse_map)
+    httpx_mock.add_callback(db, is_reusable=True)
+    writer = FakeWriter(_all_existing_decks(decks))
+    with NotionClient("secret_test") as client:
+        card_repo = CardRepository(client, CARD_DS_ID)
+        plan = import_article.build_article_import_plan(SOURCE_URL, writer, card_repo)
+        assert plan.is_fully_applicable
+        return import_article.execute_article_import(plan, card_repo)
+
+
+class TestCrossDeckWritesWithinOneRun:
+    @pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+    def test_new_card_shared_by_two_decks_is_created_once_and_linked_to_both(
+        self, monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+    ) -> None:
+        db = InMemoryNotionCardDb()
+
+        applied = _run_two_deck_article(monkeypatch, httpx_mock, db, "Temporal Tribulation")
+
+        created = db.pages_named("Temporal Tribulation")
+        assert len(created) == 1  # 重複作成しない
+        assert db.deck_ids(created[0]) == ["deck-0", "deck-1"]
+        assert sum(1 for m, p in db.requests if m == "POST" and p == "/pages") == 1
+        actions = [r.action for e in applied.entries for r in e.apply_result.results]
+        assert actions == ["created", "relation_updated"]
+        assert all(m != "DELETE" for m, _ in db.requests)
+
+    @pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+    def test_existing_card_shared_by_two_decks_keeps_both_relations(
+        self, monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+    ) -> None:
+        db = InMemoryNotionCardDb()
+        # 実行前から別デッキ(old-deck)へリレーション済みの既存カード
+        db.add_card("plains", "Plains", ["old-deck"])
+
+        applied = _run_two_deck_article(monkeypatch, httpx_mock, db, "Plains")
+
+        assert db.deck_ids("plains") == ["old-deck", "deck-0", "deck-1"]
+        assert db.pages_named("Plains") == ["plains"]
+        assert not any(m == "POST" and p == "/pages" for m, p in db.requests)
+        actions = [r.action for e in applied.entries for r in e.apply_result.results]
+        assert actions == ["relation_updated", "relation_updated"]
+        # 書き込み直前にページの現在値を読み直している
+        assert db.requests.count(("GET", "/pages/plains")) == 2
+
+    @pytest.mark.httpx_mock(assert_all_responses_were_requested=False)
+    def test_rerun_after_fix_is_idempotent(
+        self, monkeypatch: pytest.MonkeyPatch, httpx_mock: HTTPXMock
+    ) -> None:
+        db = InMemoryNotionCardDb()
+        def writes() -> list[tuple[str, str]]:
+            return [r for r in db.requests if r[0] in ("POST", "PATCH") and "query" not in r[1]]
+
+        _run_two_deck_article(monkeypatch, httpx_mock, db, "Temporal Tribulation")
+        writes_before = writes()
+
+        applied = _run_two_deck_article(monkeypatch, httpx_mock, db, "Temporal Tribulation")
+
+        assert writes() == writes_before  # 2回目は書き込み0件
+        assert len(db.pages_named("Temporal Tribulation")) == 1
+        actions = [r.action for e in applied.entries for r in e.apply_result.results]
+        assert actions == ["unchanged", "unchanged"]
+
+
+class TestUnknownCreateIsNotRetriedByLaterDeck:
+    def test_later_deck_does_not_create_after_unknown_create_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        decks = DECK_NAMES[:2]
+        parse_map = {name: _parsed(name, [_card("Shared New", 100)]) for name in decks}
+        _patch_common(monkeypatch, decks, parse_map)
+        writer = FakeWriter(_all_existing_decks(decks))
+        card_repo = FakeCardRepository()
+        attempts: list[str] = []
+
+        def create_with_timeout(card, deck_page_id: str, note: str = "") -> dict:
+            attempts.append(deck_page_id)
+            raise NotionAPIError("timed out") from httpx.TimeoutException("timed out")
+
+        card_repo.create_card = create_with_timeout  # type: ignore[method-assign]
+
+        plan = import_article.build_article_import_plan(SOURCE_URL, writer, card_repo)
+        applied = import_article.execute_article_import(plan, card_repo)
+
+        assert attempts == ["deck-0"]  # 後続デッキでは再作成を試みない
+        first, second = (e.apply_result.results[0] for e in applied.entries)
+        assert first.failed_completion == import_cards_module.WriteCompletion.UNKNOWN
+        assert second.action == "failed"
+        assert second.failed_operation == import_cards_module.FailedWriteOperation.CREATE
+        assert card_repo.relation_updates == []

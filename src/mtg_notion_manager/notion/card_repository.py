@@ -151,6 +151,17 @@ class CardRepository:
             existing.properties, existing.page_id, DECKS_RELATION_PROPERTY
         )
 
+    def refresh_card(self, page_id: str) -> ExistingCard:
+        """カードページの現在値をNotionから取得し直す(GET /pages/{id}、読み取りのみ)。
+
+        load()時点のスナップショット(ExistingCard.properties)は、同一実行内で
+        先行デッキが追加したリレーションを含まない。採用デッキはPATCHで全件置換
+        されるため、書き込み直前に必ず現在値を読み直してから追記する
+        (スナップショットのまま書くと先行デッキのリレーションを上書きで失う)。
+        load()の索引自体は更新しない(計画の判定は従来どおりスナップショット基準)。
+        """
+        return _to_existing_card(self._client.get_page(page_id))
+
     def is_owned(self, existing: ExistingCard) -> bool:
         prop = existing.properties.get(OWNED_PROPERTY, {})
         return bool(prop.get("checkbox"))
